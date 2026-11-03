@@ -6,6 +6,9 @@ dist/
 build/
 coverage/
 
+# TypeScript build metadata
+*.tsbuildinfo
+
 # Environment files
 .env
 .env.*

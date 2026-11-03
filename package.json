@@ -1,0 +1,44 @@
+{
+  "name": "talentlens-ai",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=24.11.0 <25"
+  },
+  "workspaces": [
+    "packages/shared",
+    "apps/api",
+    "apps/worker",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run build --workspace @talentlens/shared && concurrently --kill-others-on-fail --names web,api,worker --prefix-colors blue,green,magenta \"npm run dev:web\" \"npm run dev:api\" \"npm run dev:worker\"",
+    "dev:web": "npm run dev --workspace @talentlens/web",
+    "dev:api": "npm run dev --workspace @talentlens/api",
+    "dev:worker": "npm run dev --workspace @talentlens/worker",
+    "build": "npm run build --workspace @talentlens/shared && npm run build --workspace @talentlens/api && npm run build --workspace @talentlens/worker && npm run build --workspace @talentlens/web",
+    "typecheck": "npm run typecheck --workspace @talentlens/shared && npm run typecheck:tests --workspace @talentlens/shared && npm run typecheck --workspace @talentlens/api && npm run typecheck:tests --workspace @talentlens/api && npm run typecheck --workspace @talentlens/worker && npm run typecheck --workspace @talentlens/web",
+    "lint": "eslint .",
+    "test": "npm run build --workspace @talentlens/shared && npm run test --workspace @talentlens/shared && npm run test --workspace @talentlens/api",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@types/supertest": "^6.0.3",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "^16.5.0",
+    "prettier": "^3.6.2",
+    "supertest": "^7.1.4",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.3",
+    "vite": "^8.0.0",
+    "vitest": "^4.0.8"
+  }
+}
