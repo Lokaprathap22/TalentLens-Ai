@@ -3,8 +3,15 @@ import helmet from 'helmet';
 
 import { healthResponseSchema } from '@talentlens/shared';
 
-export function createApp(): Express {
+import { createDatabaseHealthChecker, type DatabaseHealthChecker } from './database/readiness.js';
+
+export interface AppDependencies {
+  databaseHealthChecker?: DatabaseHealthChecker;
+}
+
+export function createApp(dependencies: AppDependencies = {}): Express {
   const app = express();
+  const databaseHealthChecker = dependencies.databaseHealthChecker ?? createDatabaseHealthChecker();
 
   app.disable('x-powered-by');
   app.use(helmet());
@@ -18,6 +25,21 @@ export function createApp(): Express {
     });
 
     response.json(payload);
+  });
+
+  app.get('/api/v1/health/ready', async (_request, response) => {
+    try {
+      await databaseHealthChecker();
+      response.status(200).json({
+        status: 'ready',
+        database: 'connected',
+      });
+    } catch {
+      response.status(503).json({
+        status: 'not_ready',
+        database: 'unavailable',
+      });
+    }
   });
 
   return app;

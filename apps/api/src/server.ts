@@ -1,31 +1,19 @@
 import { createServer } from 'node:http';
 
+import { disconnectDatabase } from '@talentlens/database';
+
 import { createApp } from './app.js';
+import { loadEnvironment } from './config/env.js';
+import { createShutdownHandler } from './lifecycle.js';
 
-const port = Number.parseInt(process.env.API_PORT ?? '4000', 10);
-
-if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-  throw new Error('API_PORT must be an integer between 1 and 65535');
-}
-
+const environment = loadEnvironment();
 const server = createServer(createApp());
 
-server.listen(port, () => {
-  console.log(`TalentLens API listening on http://localhost:${port}`);
+server.listen(environment.apiPort, () => {
+  console.log(`TalentLens API listening on http://localhost:${environment.apiPort}`);
 });
 
-function shutdown(signal: string): void {
-  console.log(`Received ${signal}; shutting down API`);
-  server.close((error) => {
-    if (error) {
-      console.error('API shutdown failed', error);
-      process.exitCode = 1;
-      return;
-    }
+const shutdown = createShutdownHandler(server, disconnectDatabase);
 
-    process.exit(0);
-  });
-}
-
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));

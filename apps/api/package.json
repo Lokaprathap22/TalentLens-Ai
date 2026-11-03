@@ -11,7 +11,10 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
+    "@talentlens/database": "0.1.0",
     "@talentlens/shared": "0.1.0",
+    "argon2": "^0.45.2",
+    "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "helmet": "^8.1.0"
   },
