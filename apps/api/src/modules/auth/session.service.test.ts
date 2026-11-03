@@ -19,9 +19,6 @@ function createFakeRepository() {
   const repository: SessionRepository = {
     createForActiveUser: vi.fn(async (session: SessionCreation) => {
       sessions.set(session.tokenHash, {
-        id: `session-${sessions.size + 1}`,
-        userId: session.userId,
-        tokenHash: session.tokenHash,
         expiresAt: session.expiresAt,
         revokedAt: null,
         user: { ...user },

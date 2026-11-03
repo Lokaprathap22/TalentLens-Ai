@@ -4,9 +4,11 @@ import helmet from 'helmet';
 import { healthResponseSchema } from '@talentlens/shared';
 
 import { createDatabaseHealthChecker, type DatabaseHealthChecker } from './database/readiness.js';
+import { createAuthRouter, type AuthRouterDependencies } from './modules/auth/auth.routes.js';
 
 export interface AppDependencies {
   databaseHealthChecker?: DatabaseHealthChecker;
+  auth?: AuthRouterDependencies;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -16,6 +18,9 @@ export function createApp(dependencies: AppDependencies = {}): Express {
   app.disable('x-powered-by');
   app.use(helmet());
   app.use(express.json({ limit: '100kb' }));
+  if (dependencies.auth) {
+    app.use('/api/v1/auth', createAuthRouter(dependencies.auth));
+  }
 
   app.get('/api/v1/health', (_request, response) => {
     const payload = healthResponseSchema.parse({

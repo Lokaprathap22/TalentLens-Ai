@@ -16,6 +16,7 @@ describe('parseEnvironment', () => {
       nodeEnv: 'development',
       apiPort: 4000,
       databaseUrl: validDatabaseUrl,
+      appOrigin: 'http://localhost:5173',
     });
   });
 
@@ -24,11 +25,13 @@ describe('parseEnvironment', () => {
       parseEnvironment({
         NODE_ENV: 'production',
         API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
         DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
       }),
     ).toMatchObject({
       nodeEnv: 'production',
       apiPort: 443,
+      appOrigin: 'https://app.example.com',
     });
   });
 

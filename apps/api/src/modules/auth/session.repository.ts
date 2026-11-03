@@ -14,9 +14,6 @@ export interface SessionUser {
 }
 
 export interface SessionRecord {
-  id: string;
-  userId: string;
-  tokenHash: string;
   expiresAt: Date;
   revokedAt: Date | null;
   user: SessionUser;
@@ -66,9 +63,6 @@ export function createSessionRepository(
           tokenHash,
         },
         select: {
-          id: true,
-          userId: true,
-          tokenHash: true,
           expiresAt: true,
           revokedAt: true,
           user: {

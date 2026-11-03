@@ -8,6 +8,9 @@ const ARGON2_OPTIONS = {
   hashLength: 32,
 } as const;
 
+export const DUMMY_PASSWORD_HASH =
+  '$argon2id$v=19$m=19456,t=2,p=1$ig4950QVOJ4BAIBQ6V7ncg$2hfQ1iQXcs7hT+Rx8/fFDLAL/LQpguejU52olDCel+Q';
+
 export class PasswordHashingError extends Error {
   constructor() {
     super('Password hashing failed');

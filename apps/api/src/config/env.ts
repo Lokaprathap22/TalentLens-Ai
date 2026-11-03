@@ -24,11 +24,32 @@ const environmentSchema = z
       .refine((value) => value.startsWith('postgresql://') || value.startsWith('postgres://'), {
         message: 'DATABASE_URL must use the PostgreSQL protocol',
       }),
+    APP_ORIGIN: z
+      .string()
+      .url('APP_ORIGIN must be a valid URL')
+      .refine((value) => {
+        try {
+          return new URL(value).origin === value;
+        } catch {
+          return false;
+        }
+      }, 'APP_ORIGIN must not include a path, query, or fragment')
+      .optional(),
   })
-  .transform(({ NODE_ENV, API_PORT, DATABASE_URL }) => ({
+  .superRefine((value, context) => {
+    if (value.NODE_ENV === 'production' && !value.APP_ORIGIN) {
+      context.addIssue({
+        code: 'custom',
+        path: ['APP_ORIGIN'],
+        message: 'APP_ORIGIN is required in production',
+      });
+    }
+  })
+  .transform(({ NODE_ENV, API_PORT, DATABASE_URL, APP_ORIGIN }) => ({
     nodeEnv: NODE_ENV,
     apiPort: API_PORT,
     databaseUrl: DATABASE_URL,
+    appOrigin: APP_ORIGIN ?? 'http://localhost:5173',
   }));
 
 export type Environment = z.infer<typeof environmentSchema>;
