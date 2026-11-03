@@ -47,3 +47,6 @@ local-secrets/
 .vercel/
 .turbo/
 .cache/
+
+# Prisma generated client
+packages/database/src/generated/

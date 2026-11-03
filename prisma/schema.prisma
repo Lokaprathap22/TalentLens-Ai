@@ -1,0 +1,867 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../packages/database/src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  RECRUITER
+  CLIENT_HIRING_MANAGER
+  DELIVERY_HEAD
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum ClientStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum MembershipRole {
+  CLIENT_HIRING_MANAGER
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum RequisitionStatus {
+  DRAFT
+  OPEN
+  PAUSED
+  CLOSED
+  FILLED
+}
+
+enum ScorecardStatus {
+  DRAFT
+  APPROVED
+  ARCHIVED
+}
+
+enum CriterionCategory {
+  SKILL
+  EXPERIENCE
+  NOTICE
+  COMPENSATION
+  OTHER_JOB_RELATED
+}
+
+enum RequirementType {
+  MUST_HAVE
+  PREFERRED
+}
+
+enum CandidateRecordStatus {
+  ACTIVE
+  DELETION_PENDING
+  DELETED
+}
+
+enum IdentityStatus {
+  ACTIVE
+  REDACTED
+  DELETED
+}
+
+enum ResumeParseStatus {
+  PENDING
+  PROCESSING
+  PARSED
+  NEEDS_REVIEW
+  FAILED
+}
+
+enum FileType {
+  PDF
+  DOCX
+}
+
+enum ExtractionQualityStatus {
+  COMPLETE
+  NEEDS_REVIEW
+  FAILED
+}
+
+enum ProcessingBatchStatus {
+  CREATED
+  PROCESSING
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+enum ProcessingJobType {
+  VALIDATE_FILE
+  EXTRACT_TEXT
+  OCR
+  EXTRACT_PROFILE
+  DETECT_DUPLICATE
+  ASSESS_CANDIDATE
+}
+
+enum ProcessingJobStatus {
+  QUEUED
+  PROCESSING
+  SUCCEEDED
+  RETRYABLE_FAILURE
+  FAILED
+  CANCELLED
+}
+
+enum AssessmentStatus {
+  COMPLETE
+  NEEDS_REVIEW
+  FAILED
+}
+
+enum CriterionAssessmentStatus {
+  MATCH
+  PARTIAL
+  NOT_FOUND
+  UNCERTAIN
+  UNVERIFIED
+  NOT_ASSESSED
+}
+
+enum VerificationMethod {
+  EXACT_QUOTE
+  OFFSET_MATCH
+  PAGE_MATCH
+  MANUAL_REVIEW
+}
+
+enum ReviewDecision {
+  REVIEWED
+  NEEDS_REVIEW
+  CLOSED
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  CLIENT_SHORTLISTED
+  CLIENT_REJECTED
+  INTERVIEW_PROPOSED
+  WITHDRAWN
+}
+
+enum ClientDecisionType {
+  SHORTLIST
+  REJECT
+  PROPOSE_INTERVIEW
+}
+
+enum PipelineStage {
+  SOURCED
+  PARSING
+  PARSED
+  ASSESSED
+  RECRUITER_REVIEW
+  SUBMITTED_TO_CLIENT
+  CLIENT_SHORTLISTED
+  INTERVIEW_PROPOSED
+  INTERVIEW_SCHEDULED
+  OFFERED
+  JOINED
+  CLIENT_REJECTED
+  RECRUITER_CLOSED
+  CANDIDATE_WITHDREW
+  ON_HOLD
+  NEEDS_REVIEW
+}
+
+enum ConsentPurpose {
+  HIRING_USE
+}
+
+enum ConsentStatus {
+  ACTIVE
+  WITHDRAWN
+  EXPIRED
+  DELETED
+}
+
+enum ConsentCaptureMethod {
+  RECRUITER_RECORDED
+  CANDIDATE_PORTAL
+  IMPORTED
+}
+
+enum DeletionRequestStatus {
+  REQUESTED
+  PROCESSING
+  COMPLETED
+  PARTIALLY_BLOCKED
+  REJECTED
+}
+
+model Organization {
+  id             String   @id @default(uuid()) @db.Uuid
+  name           String
+  normalizedName String   @map("normalized_name")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  users                User[]
+  clients              Client[]
+  clientMemberships    ClientMembership[]
+  candidates           Candidate[]
+  requisitions         Requisition[]
+  resumes              ResumeDocument[]
+  processingBatches    ProcessingBatch[]
+  auditLogs            AuditLog[]
+  candidateAssessments CandidateAssessment[]
+  assessmentTexts      AssessmentText[]
+  documentExtractions  DocumentExtraction[]
+  candidateReviews     CandidateReview[]
+  candidateSubmissions CandidateSubmission[]
+  clientDecisions      ClientDecision[]
+  candidateConsents    CandidateConsent[]
+  deletionRequests     DeletionRequest[]
+  scorecardVersions    ScorecardVersion[]
+  pipelineEvents       PipelineEvent[]
+
+  @@unique([normalizedName])
+  @@map("organizations")
+}
+
+model User {
+  id              String     @id @default(uuid()) @db.Uuid
+  organizationId  String     @map("organization_id") @db.Uuid
+  email           String
+  normalizedEmail String     @map("normalized_email")
+  passwordHash    String?    @map("password_hash")
+  role            UserRole
+  status          UserStatus @default(INVITED)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  organization         Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  createdRequisitions  Requisition[]         @relation("RequisitionCreator")
+  assignedRequisitions Requisition[]         @relation("AssignedRecruiter")
+  approvedScorecards   ScorecardVersion[]    @relation("ScorecardApprover")
+  clientMemberships    ClientMembership[]
+  sessions             Session[]
+  uploadedResumes      ResumeDocument[]      @relation("ResumeUploader")
+  createdBatches       ProcessingBatch[]
+  reviews              CandidateReview[]
+  submittedCandidates  CandidateSubmission[]
+  clientDecisions      ClientDecision[]
+  pipelineEvents       PipelineEvent[]
+  capturedConsents     CandidateConsent[]    @relation("ConsentCapturer")
+  deletionRequests     DeletionRequest[]     @relation("DeletionRequester")
+  auditLogs            AuditLog[]
+
+  @@unique([organizationId, normalizedEmail])
+  @@unique([id, organizationId], map: "users_id_organization_id_key")
+  @@index([organizationId, status])
+  @@map("users")
+}
+
+model Client {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  name           String
+  normalizedName String       @map("normalized_name")
+  status         ClientStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  organization    Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  memberships     ClientMembership[]
+  requisitions    Requisition[]
+  submissions     CandidateSubmission[]
+  auditLogs       AuditLog[]
+  clientDecisions ClientDecision[]
+
+  @@unique([organizationId, normalizedName])
+  @@unique([id, organizationId], map: "clients_id_organization_id_key")
+  @@index([organizationId, status])
+  @@map("clients")
+}
+
+model ClientMembership {
+  id             String           @id @default(uuid()) @db.Uuid
+  clientId       String           @map("client_id") @db.Uuid
+  userId         String           @map("user_id") @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  role           MembershipRole
+  status         MembershipStatus @default(ACTIVE)
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  client       Client           @relation(fields: [clientId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  user         User             @relation(fields: [userId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  decisions    ClientDecision[]
+
+  @@unique([clientId, userId, organizationId], map: "client_memberships_client_user_org_key")
+  @@unique([clientId, userId], map: "client_memberships_client_user_key")
+  @@unique([id, clientId, userId, organizationId], map: "client_memberships_decision_key")
+  @@index([userId, status])
+  @@index([clientId, status])
+  @@map("client_memberships")
+}
+
+model Session {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("sessions")
+}
+
+model Requisition {
+  id                  String            @id @default(uuid()) @db.Uuid
+  organizationId      String            @map("organization_id") @db.Uuid
+  clientId            String            @map("client_id") @db.Uuid
+  title               String
+  jdText              String            @map("jd_text")
+  status              RequisitionStatus @default(DRAFT)
+  createdById         String            @map("created_by") @db.Uuid
+  assignedRecruiterId String?           @map("assigned_recruiter_id") @db.Uuid
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  organization      Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  client            Client                @relation(fields: [clientId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy         User                  @relation("RequisitionCreator", fields: [createdById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assignedRecruiter User?                 @relation("AssignedRecruiter", fields: [assignedRecruiterId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  scorecardVersions ScorecardVersion[]
+  batches           ProcessingBatch[]
+  assessments       CandidateAssessment[]
+  reviews           CandidateReview[]
+  submissions       CandidateSubmission[]
+  pipelineEvents    PipelineEvent[]
+  auditLogs         AuditLog[]
+
+  @@unique([id, organizationId], map: "requisitions_id_organization_id_key")
+  @@unique([id, clientId, organizationId], map: "requisitions_id_client_org_key")
+  @@index([clientId, status])
+  @@index([organizationId, status])
+  @@map("requisitions")
+}
+
+model ScorecardVersion {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  requisitionId  String          @map("requisition_id") @db.Uuid
+  version        Int
+  status         ScorecardStatus @default(DRAFT)
+  weightsJson    Json            @map("weights_json")
+  approvedById   String?         @map("approved_by") @db.Uuid
+  approvedAt     DateTime?       @map("approved_at")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  organization Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  requisition  Requisition           @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  approvedBy   User?                 @relation("ScorecardApprover", fields: [approvedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  criteria     ScorecardCriterion[]
+  assessments  CandidateAssessment[]
+
+  @@unique([requisitionId, version])
+  @@unique([id, requisitionId, organizationId], map: "scorecard_versions_source_key")
+  @@index([requisitionId, status])
+  @@map("scorecard_versions")
+}
+
+model ScorecardCriterion {
+  id                 String            @id @default(uuid()) @db.Uuid
+  scorecardVersionId String            @map("scorecard_version_id") @db.Uuid
+  key                String
+  label              String
+  category           CriterionCategory
+  requirementType    RequirementType
+  weight             Decimal           @db.Decimal(7, 4)
+  ruleJson           Json              @map("rule_json")
+  active             Boolean           @default(true)
+  displayOrder       Int               @map("display_order")
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+
+  scorecardVersion     ScorecardVersion      @relation(fields: [scorecardVersionId], references: [id], onDelete: Restrict)
+  criterionAssessments CriterionAssessment[]
+
+  @@unique([scorecardVersionId, key])
+  @@unique([id, scorecardVersionId], map: "scorecard_criteria_id_version_key")
+  @@index([scorecardVersionId, active, displayOrder])
+  @@map("scorecard_criteria")
+}
+
+model Candidate {
+  id             String                @id @default(uuid()) @db.Uuid
+  organizationId String                @map("organization_id") @db.Uuid
+  candidateCode  String                @map("candidate_code")
+  recordStatus   CandidateRecordStatus @default(ACTIVE) @map("record_status")
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+
+  organization     Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  identity         CandidateIdentity?
+  profiles         CandidateProfile[]
+  resumes          ResumeDocument[]
+  assessments      CandidateAssessment[]
+  reviews          CandidateReview[]
+  submissions      CandidateSubmission[]
+  pipelineEvents   PipelineEvent[]
+  consents         CandidateConsent[]
+  deletionRequests DeletionRequest[]
+  auditLogs        AuditLog[]
+
+  @@unique([organizationId, candidateCode])
+  @@unique([id, organizationId], map: "candidates_id_organization_id_key")
+  @@index([organizationId, recordStatus])
+  @@map("candidates")
+}
+
+model CandidateIdentity {
+  candidateId        String         @id @map("candidate_id") @db.Uuid
+  organizationId     String         @map("organization_id") @db.Uuid
+  fullNameEncrypted  String?        @map("full_name_encrypted")
+  emailEncrypted     String?        @map("email_encrypted")
+  phoneEncrypted     String?        @map("phone_encrypted")
+  contactFingerprint String?        @map("contact_fingerprint")
+  identityStatus     IdentityStatus @default(ACTIVE) @map("identity_status")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+
+  candidate Candidate @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([candidateId, organizationId], map: "candidate_identity_candidate_org_key")
+  @@index([contactFingerprint])
+  @@map("candidate_identity")
+}
+
+model CandidateProfile {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  candidateId     String   @map("candidate_id") @db.Uuid
+  currentRole     String?  @map("current_role")
+  experienceYears Decimal? @map("experience_years") @db.Decimal(6, 2)
+  location        String?
+  currentCtc      Decimal? @map("current_ctc") @db.Decimal(14, 2)
+  expectedCtc     Decimal? @map("expected_ctc") @db.Decimal(14, 2)
+  noticeDays      Int?     @map("notice_days")
+  summary         String?
+  profileVersion  Int      @map("profile_version")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  candidate Candidate        @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  skills    CandidateSkill[]
+
+  @@unique([candidateId, profileVersion])
+  @@unique([id, organizationId], map: "candidate_profiles_id_organization_key")
+  @@index([currentRole])
+  @@index([location])
+  @@map("candidate_profiles")
+}
+
+model CandidateSkill {
+  id                  String   @id @default(uuid()) @db.Uuid
+  organizationId      String   @map("organization_id") @db.Uuid
+  candidateProfileId  String   @map("candidate_profile_id") @db.Uuid
+  skillNameNormalized String   @map("skill_name_normalized")
+  evidenceReference   String?  @map("evidence_reference")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  candidateProfile CandidateProfile @relation(fields: [candidateProfileId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([candidateProfileId, skillNameNormalized])
+  @@index([skillNameNormalized])
+  @@map("candidate_skills")
+}
+
+model ResumeDocument {
+  id             String            @id @default(uuid()) @db.Uuid
+  organizationId String            @map("organization_id") @db.Uuid
+  candidateId    String            @map("candidate_id") @db.Uuid
+  objectKey      String            @map("object_key")
+  sha256         String
+  mimeType       String            @map("mime_type")
+  fileType       FileType          @map("file_type")
+  sizeBytes      BigInt            @map("size_bytes")
+  version        Int
+  parseStatus    ResumeParseStatus @default(PENDING) @map("parse_status")
+  uploadedById   String            @map("uploaded_by") @db.Uuid
+  uploadedAt     DateTime          @default(now()) @map("uploaded_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  organization         Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate            Candidate             @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  uploadedBy           User                  @relation("ResumeUploader", fields: [uploadedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  extractions          DocumentExtraction[]
+  assessmentTexts      AssessmentText[]
+  processingJobs       ProcessingJob[]
+  assessments          CandidateAssessment[]
+  reviews              CandidateReview[]
+  candidateSubmissions CandidateSubmission[]
+
+  @@unique([organizationId, sha256])
+  @@unique([candidateId, version])
+  @@unique([id, organizationId], map: "resume_documents_id_organization_id_key")
+  @@unique([id, candidateId, organizationId], map: "resume_documents_id_candidate_org_key")
+  @@index([candidateId, parseStatus])
+  @@map("resume_documents")
+}
+
+model DocumentExtraction {
+  id               String                  @id @default(uuid()) @db.Uuid
+  organizationId   String                  @map("organization_id") @db.Uuid
+  resumeDocumentId String                  @map("resume_document_id") @db.Uuid
+  version          Int
+  extractedText    String                  @map("extracted_text")
+  pageMapJson      Json                    @map("page_map_json")
+  parser           String
+  ocrUsed          Boolean                 @default(false) @map("ocr_used")
+  qualityStatus    ExtractionQualityStatus @map("quality_status")
+  createdAt        DateTime                @default(now()) @map("created_at")
+
+  organization    Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  resumeDocument  ResumeDocument        @relation(fields: [resumeDocumentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assessmentTexts AssessmentText[]
+  assessments     CandidateAssessment[]
+  evidence        EvidenceSnippet[]
+
+  @@unique([resumeDocumentId, version], map: "document_extractions_resume_version_key")
+  @@unique([id, resumeDocumentId, organizationId], map: "document_extractions_source_key")
+  @@index([qualityStatus])
+  @@map("document_extractions")
+}
+
+model AssessmentText {
+  id                   String   @id @default(uuid()) @db.Uuid
+  organizationId       String   @map("organization_id") @db.Uuid
+  documentExtractionId String   @map("document_extraction_id") @db.Uuid
+  resumeDocumentId     String   @map("resume_document_id") @db.Uuid
+  version              Int
+  redactedText         String   @map("redacted_text")
+  pageMapJson          Json     @map("page_map_json")
+  redactionMapJson     Json     @map("redaction_map_json")
+  redactorVersion      String   @map("redactor_version")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  organization       Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  documentExtraction DocumentExtraction    @relation(fields: [documentExtractionId, resumeDocumentId, organizationId], references: [id, resumeDocumentId, organizationId], onDelete: Restrict)
+  resumeDocument     ResumeDocument        @relation(fields: [resumeDocumentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assessments        CandidateAssessment[]
+  evidence           EvidenceSnippet[]
+
+  @@unique([resumeDocumentId, version], map: "assessment_texts_resume_version_key")
+  @@unique([id, resumeDocumentId, organizationId], map: "assessment_texts_source_key")
+  @@unique([id, resumeDocumentId, organizationId, documentExtractionId], map: "assessment_texts_exact_source_key")
+  @@index([resumeDocumentId, createdAt])
+  @@map("assessment_texts")
+}
+
+model ProcessingBatch {
+  id             String                @id @default(uuid()) @db.Uuid
+  organizationId String                @map("organization_id") @db.Uuid
+  requisitionId  String                @map("requisition_id") @db.Uuid
+  createdById    String                @map("created_by") @db.Uuid
+  totalFiles     Int                   @map("total_files")
+  status         ProcessingBatchStatus @default(CREATED)
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  requisition  Requisition     @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy    User            @relation(fields: [createdById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  jobs         ProcessingJob[]
+
+  @@unique([id, organizationId], map: "processing_batches_id_organization_id_key")
+  @@index([requisitionId, status])
+  @@map("processing_batches")
+}
+
+model ProcessingJob {
+  id               String              @id @default(uuid()) @db.Uuid
+  batchId          String              @map("batch_id") @db.Uuid
+  organizationId   String              @map("organization_id") @db.Uuid
+  resumeDocumentId String?             @map("resume_document_id") @db.Uuid
+  jobType          ProcessingJobType   @map("job_type")
+  status           ProcessingJobStatus @default(QUEUED)
+  attempts         Int                 @default(0)
+  lastErrorCode    String?             @map("last_error_code")
+  startedAt        DateTime?           @map("started_at")
+  finishedAt       DateTime?           @map("finished_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  batch          ProcessingBatch @relation(fields: [batchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  resumeDocument ResumeDocument? @relation(fields: [resumeDocumentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([batchId, resumeDocumentId, jobType], map: "processing_jobs_idempotency_key")
+  @@index([status, createdAt])
+  @@index([batchId, status])
+  @@map("processing_jobs")
+}
+
+model CandidateAssessment {
+  id                   String           @id @default(uuid()) @db.Uuid
+  organizationId       String           @map("organization_id") @db.Uuid
+  requisitionId        String           @map("requisition_id") @db.Uuid
+  candidateId          String           @map("candidate_id") @db.Uuid
+  resumeDocumentId     String           @map("resume_document_id") @db.Uuid
+  documentExtractionId String           @map("document_extraction_id") @db.Uuid
+  scorecardVersionId   String           @map("scorecard_version_id") @db.Uuid
+  assessmentTextId     String           @map("assessment_text_id") @db.Uuid
+  score                Decimal?         @db.Decimal(6, 2)
+  coverage             Decimal?         @db.Decimal(6, 2)
+  status               AssessmentStatus
+  formulaVersion       String           @map("formula_version")
+  modelMetadataJson    Json             @map("model_metadata_json")
+  createdAt            DateTime         @default(now()) @map("created_at")
+  updatedAt            DateTime         @updatedAt @map("updated_at")
+
+  organization         Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate            Candidate             @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition          Requisition           @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  resumeDocument       ResumeDocument        @relation(fields: [resumeDocumentId, candidateId, organizationId], references: [id, candidateId, organizationId], onDelete: Restrict)
+  documentExtraction   DocumentExtraction    @relation(fields: [documentExtractionId, resumeDocumentId, organizationId], references: [id, resumeDocumentId, organizationId], onDelete: Restrict)
+  scorecardVersion     ScorecardVersion      @relation(fields: [scorecardVersionId, requisitionId, organizationId], references: [id, requisitionId, organizationId], onDelete: Restrict)
+  assessmentText       AssessmentText        @relation(fields: [assessmentTextId, resumeDocumentId, organizationId, documentExtractionId], references: [id, resumeDocumentId, organizationId, documentExtractionId], onDelete: Restrict)
+  criterionAssessments CriterionAssessment[]
+  candidateSubmissions CandidateSubmission[]
+
+  @@unique([requisitionId, candidateId, resumeDocumentId, scorecardVersionId])
+  @@unique([id, candidateId, requisitionId, resumeDocumentId], map: "assessments_submission_trace_key")
+  @@unique([id, scorecardVersionId, resumeDocumentId, assessmentTextId, documentExtractionId, organizationId], map: "assessments_source_key")
+  @@index([requisitionId, score(sort: Desc)])
+  @@index([candidateId, createdAt])
+  @@map("candidate_assessments")
+}
+
+model CriterionAssessment {
+  id                   String                    @id @default(uuid()) @db.Uuid
+  organizationId       String                    @map("organization_id") @db.Uuid
+  assessmentId         String                    @map("assessment_id") @db.Uuid
+  criterionId          String                    @map("criterion_id") @db.Uuid
+  scorecardVersionId   String                    @map("scorecard_version_id") @db.Uuid
+  resumeDocumentId     String                    @map("resume_document_id") @db.Uuid
+  assessmentTextId     String                    @map("assessment_text_id") @db.Uuid
+  documentExtractionId String                    @map("document_extraction_id") @db.Uuid
+  status               CriterionAssessmentStatus
+  normalizedValue      Decimal?                  @map("normalized_value") @db.Decimal(5, 4)
+  explanation          String?
+  createdAt            DateTime                  @default(now()) @map("created_at")
+  updatedAt            DateTime                  @updatedAt @map("updated_at")
+
+  assessment CandidateAssessment @relation(fields: [assessmentId, scorecardVersionId, resumeDocumentId, assessmentTextId, documentExtractionId, organizationId], references: [id, scorecardVersionId, resumeDocumentId, assessmentTextId, documentExtractionId, organizationId], onDelete: Restrict)
+  criterion  ScorecardCriterion  @relation(fields: [criterionId, scorecardVersionId], references: [id, scorecardVersionId], onDelete: Restrict)
+  evidence   EvidenceSnippet[]
+
+  @@unique([assessmentId, criterionId])
+  @@unique([id, assessmentId, scorecardVersionId, resumeDocumentId, assessmentTextId, documentExtractionId, organizationId], map: "criterion_assessments_source_key")
+  @@index([criterionId, status])
+  @@map("criterion_assessments")
+}
+
+model EvidenceSnippet {
+  id                    String              @id @default(uuid()) @db.Uuid
+  organizationId        String              @map("organization_id") @db.Uuid
+  criterionAssessmentId String              @map("criterion_assessment_id") @db.Uuid
+  assessmentId          String              @map("assessment_id") @db.Uuid
+  scorecardVersionId    String              @map("scorecard_version_id") @db.Uuid
+  quote                 String
+  pageNumber            Int?                @map("page_number")
+  startOffset           Int?                @map("start_offset")
+  endOffset             Int?                @map("end_offset")
+  verified              Boolean             @default(false)
+  verificationMethod    VerificationMethod? @map("verification_method")
+  createdAt             DateTime            @default(now()) @map("created_at")
+
+  criterionAssessment  CriterionAssessment @relation(fields: [criterionAssessmentId, assessmentId, scorecardVersionId, resumeDocumentId, assessmentTextId, documentExtractionId, organizationId], references: [id, assessmentId, scorecardVersionId, resumeDocumentId, assessmentTextId, documentExtractionId, organizationId], onDelete: Restrict)
+  assessmentText       AssessmentText      @relation(fields: [assessmentTextId, resumeDocumentId, organizationId, documentExtractionId], references: [id, resumeDocumentId, organizationId, documentExtractionId], onDelete: Restrict)
+  assessmentTextId     String              @map("assessment_text_id") @db.Uuid
+  resumeDocumentId     String              @map("resume_document_id") @db.Uuid
+  documentExtraction   DocumentExtraction  @relation(fields: [documentExtractionId, resumeDocumentId, organizationId], references: [id, resumeDocumentId, organizationId], onDelete: Restrict)
+  documentExtractionId String              @map("document_extraction_id") @db.Uuid
+
+  @@index([criterionAssessmentId, verified])
+  @@map("evidence_snippets")
+}
+
+model CandidateReview {
+  id               String         @id @default(uuid()) @db.Uuid
+  organizationId   String         @map("organization_id") @db.Uuid
+  candidateId      String         @map("candidate_id") @db.Uuid
+  requisitionId    String         @map("requisition_id") @db.Uuid
+  resumeDocumentId String         @map("resume_document_id") @db.Uuid
+  reviewerId       String         @map("reviewer_id") @db.Uuid
+  reviewedAt       DateTime       @default(now()) @map("reviewed_at")
+  decision         ReviewDecision
+  notesInternal    String?        @map("notes_internal")
+
+  organization         Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate            Candidate             @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition          Requisition           @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  resumeDocument       ResumeDocument        @relation(fields: [resumeDocumentId, candidateId, organizationId], references: [id, candidateId, organizationId], onDelete: Restrict)
+  reviewer             User                  @relation(fields: [reviewerId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  candidateSubmissions CandidateSubmission[]
+
+  @@unique([id, candidateId, requisitionId, resumeDocumentId], map: "candidate_reviews_submission_trace_key")
+  @@index([candidateId, requisitionId, resumeDocumentId, reviewedAt])
+  @@map("candidate_reviews")
+}
+
+model CandidateSubmission {
+  id               String           @id @default(uuid()) @db.Uuid
+  organizationId   String           @map("organization_id") @db.Uuid
+  candidateId      String           @map("candidate_id") @db.Uuid
+  requisitionId    String           @map("requisition_id") @db.Uuid
+  clientId         String           @map("client_id") @db.Uuid
+  submittedById    String           @map("submitted_by") @db.Uuid
+  assessmentId     String           @map("assessment_id") @db.Uuid
+  reviewId         String           @map("review_id") @db.Uuid
+  resumeDocumentId String           @map("resume_document_id") @db.Uuid
+  status           SubmissionStatus @default(SUBMITTED)
+  submittedAt      DateTime         @default(now()) @map("submitted_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate      Candidate           @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition    Requisition         @relation(fields: [requisitionId, clientId, organizationId], references: [id, clientId, organizationId], onDelete: Restrict)
+  client         Client              @relation(fields: [clientId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  submittedBy    User                @relation(fields: [submittedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assessment     CandidateAssessment @relation(fields: [assessmentId, candidateId, requisitionId, resumeDocumentId], references: [id, candidateId, requisitionId, resumeDocumentId], onDelete: Restrict)
+  review         CandidateReview     @relation(fields: [reviewId, candidateId, requisitionId, resumeDocumentId], references: [id, candidateId, requisitionId, resumeDocumentId], onDelete: Restrict)
+  resumeDocument ResumeDocument      @relation(fields: [resumeDocumentId, candidateId, organizationId], references: [id, candidateId, organizationId], onDelete: Restrict)
+  decisions      ClientDecision[]
+  pipelineEvents PipelineEvent[]
+
+  @@unique([requisitionId, candidateId])
+  @@unique([id, clientId], map: "candidate_submissions_id_client_key")
+  @@unique([id, candidateId, requisitionId, organizationId], map: "candidate_submissions_pipeline_key")
+  @@index([clientId, requisitionId, status])
+  @@map("candidate_submissions")
+}
+
+model ClientDecision {
+  id             String             @id @default(uuid()) @db.Uuid
+  organizationId String             @map("organization_id") @db.Uuid
+  clientId       String             @map("client_id") @db.Uuid
+  submissionId   String             @map("submission_id") @db.Uuid
+  clientUserId   String             @map("client_user_id") @db.Uuid
+  membershipId   String             @map("membership_id") @db.Uuid
+  decision       ClientDecisionType
+  reason         String?
+  proposedAt     DateTime?          @map("proposed_at")
+  timezone       String?
+  createdAt      DateTime           @default(now()) @map("created_at")
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  client       Client              @relation(fields: [clientId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  submission   CandidateSubmission @relation(fields: [submissionId, clientId], references: [id, clientId], onDelete: Restrict)
+  clientUser   User                @relation(fields: [clientUserId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  membership   ClientMembership    @relation(fields: [membershipId, clientId, clientUserId, organizationId], references: [id, clientId, userId, organizationId], onDelete: Restrict)
+
+  @@index([submissionId, createdAt])
+  @@map("client_decisions")
+}
+
+model PipelineEvent {
+  id             String         @id @default(uuid()) @db.Uuid
+  organizationId String         @map("organization_id") @db.Uuid
+  requisitionId  String         @map("requisition_id") @db.Uuid
+  candidateId    String         @map("candidate_id") @db.Uuid
+  submissionId   String?        @map("submission_id") @db.Uuid
+  fromStage      PipelineStage? @map("from_stage")
+  toStage        PipelineStage  @map("to_stage")
+  actorId        String         @map("actor_id") @db.Uuid
+  reason         String?
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  requisition  Requisition          @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  candidate    Candidate            @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  submission   CandidateSubmission? @relation(fields: [submissionId, candidateId, requisitionId, organizationId], references: [id, candidateId, requisitionId, organizationId], onDelete: Restrict)
+  actor        User                 @relation(fields: [actorId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@index([requisitionId, candidateId, createdAt])
+  @@index([toStage, createdAt])
+  @@map("pipeline_events")
+}
+
+model CandidateConsent {
+  id             String               @id @default(uuid()) @db.Uuid
+  organizationId String               @map("organization_id") @db.Uuid
+  candidateId    String               @map("candidate_id") @db.Uuid
+  purpose        ConsentPurpose
+  status         ConsentStatus
+  policyVersion  String               @map("policy_version")
+  captureMethod  ConsentCaptureMethod @map("capture_method")
+  capturedAt     DateTime             @map("captured_at")
+  capturedById   String?              @map("captured_by") @db.Uuid
+  withdrawnAt    DateTime?            @map("withdrawn_at")
+  createdAt      DateTime             @default(now()) @map("created_at")
+  updatedAt      DateTime             @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate    Candidate    @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  capturedBy   User?        @relation("ConsentCapturer", fields: [capturedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@index([candidateId, purpose, status])
+  @@map("candidate_consents")
+}
+
+model DeletionRequest {
+  id             String                @id @default(uuid()) @db.Uuid
+  organizationId String                @map("organization_id") @db.Uuid
+  candidateId    String                @map("candidate_id") @db.Uuid
+  requestedAt    DateTime              @default(now()) @map("requested_at")
+  requestedById  String?               @map("requested_by") @db.Uuid
+  status         DeletionRequestStatus @default(REQUESTED)
+  processedAt    DateTime?             @map("processed_at")
+  resultSummary  String?               @map("result_summary")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate    Candidate    @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requestedBy  User?        @relation("DeletionRequester", fields: [requestedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@index([candidateId, status])
+  @@index([status, requestedAt])
+  @@map("deletion_requests")
+}
+
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  actorId        String?  @map("actor_id") @db.Uuid
+  action         String
+  resourceType   String   @map("resource_type")
+  resourceId     String?  @map("resource_id")
+  requisitionId  String?  @map("requisition_id") @db.Uuid
+  clientId       String?  @map("client_id") @db.Uuid
+  candidateId    String?  @map("candidate_id") @db.Uuid
+  metadataJson   Json     @map("metadata_json")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  actor        User?        @relation(fields: [actorId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition  Requisition? @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  client       Client?      @relation(fields: [clientId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  candidate    Candidate?   @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@index([resourceType, resourceId, createdAt])
+  @@index([organizationId, createdAt])
+  @@index([clientId, createdAt])
+  @@map("audit_logs")
+}
