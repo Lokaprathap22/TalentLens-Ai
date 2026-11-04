@@ -1,0 +1,207 @@
+@import '@fontsource-variable/inter/index.css';
+@import 'tailwindcss';
+
+/*
+ * TalentLens design tokens.
+ *
+ * Every colour, size, radius and shadow used by components is defined here once
+ * and consumed through Tailwind utilities (bg-surface, text-fg-muted, rounded-md…).
+ * Components must never hard-code colour values.
+ */
+@theme {
+  /* ── Typography ─────────────────────────────────────────────── */
+  --font-sans:
+    'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1rem;
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.25rem;
+  --text-base: 0.875rem;
+  --text-base--line-height: 1.375rem;
+  --text-lg: 1rem;
+  --text-lg--line-height: 1.5rem;
+  --text-xl: 1.125rem;
+  --text-xl--line-height: 1.625rem;
+  --text-2xl: 1.375rem;
+  --text-2xl--line-height: 1.75rem;
+  --text-2xl--letter-spacing: -0.015em;
+  --text-3xl: 1.75rem;
+  --text-3xl--line-height: 2.125rem;
+  --text-3xl--letter-spacing: -0.02em;
+
+  /* ── Neutral foundation ─────────────────────────────────────── */
+  --color-canvas: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f1f3f6;
+  --color-surface-sunken: #e9ecf0;
+  --color-border: #e3e6eb;
+  --color-border-strong: #cfd4dc;
+  --color-fg: #0f1720;
+  --color-fg-muted: #46505e;
+  --color-fg-subtle: #5f6b7a;
+  --color-fg-disabled: #98a2b0;
+  --color-overlay: rgb(15 23 32 / 0.5);
+
+  /* ── Brand accent (deep teal: the "lens") ───────────────────── */
+  --color-accent: #0f766e;
+  --color-accent-hover: #0c5f59;
+  --color-accent-active: #0a4e49;
+  --color-accent-soft: #e6f5f2;
+  --color-accent-soft-hover: #d3ede8;
+  --color-accent-border: #9bd6cc;
+  --color-accent-fg: #0b5c56;
+  --color-on-accent: #ffffff;
+  --color-focus: #0f766e;
+
+  /* ── Sidebar (ink) ──────────────────────────────────────────── */
+  --color-sidebar: #0c1b1d;
+  --color-sidebar-hover: #14282a;
+  --color-sidebar-active: #1a3234;
+  --color-sidebar-border: #1d3335;
+  --color-sidebar-fg: #bccbca;
+  --color-sidebar-fg-strong: #ffffff;
+  --color-sidebar-muted: #7f9795;
+  --color-sidebar-indicator: #2dd4bf;
+
+  /* ── Semantic status ────────────────────────────────────────── */
+  --color-success: #067647;
+  --color-success-soft: #ecfdf3;
+  --color-success-border: #abefc6;
+  --color-success-solid: #17b26a;
+  --color-warning: #a84308;
+  --color-warning-soft: #fffaeb;
+  --color-warning-border: #fedf89;
+  --color-warning-solid: #f79009;
+  --color-danger: #b42318;
+  --color-danger-soft: #fef3f2;
+  --color-danger-border: #fecdca;
+  --color-danger-solid: #f04438;
+  --color-info: #175cd3;
+  --color-info-soft: #eff8ff;
+  --color-info-border: #b2ddff;
+  --color-info-solid: #2e90fa;
+
+  /* Single-hue ramp used for ordered pipeline stages */
+  --color-ramp-1: #cdeee8;
+  --color-ramp-2: #9adbd0;
+  --color-ramp-3: #5fc2b3;
+  --color-ramp-4: #2fa595;
+  --color-ramp-5: #14857a;
+  --color-ramp-6: #0f5f58;
+
+  /* ── Radius (restrained) ────────────────────────────────────── */
+  --radius-xs: 0.1875rem;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+
+  /* ── Elevation ──────────────────────────────────────────────── */
+  --shadow-xs: 0 1px 2px 0 rgb(16 24 40 / 0.05);
+  --shadow-sm: 0 1px 3px 0 rgb(16 24 40 / 0.08), 0 1px 2px -1px rgb(16 24 40 / 0.06);
+  --shadow-md: 0 4px 10px -2px rgb(16 24 40 / 0.1), 0 2px 4px -2px rgb(16 24 40 / 0.06);
+  --shadow-lg: 0 20px 40px -12px rgb(16 24 40 / 0.22), 0 4px 8px -4px rgb(16 24 40 / 0.08);
+
+  /* ── Breakpoints ────────────────────────────────────────────── */
+  --breakpoint-xs: 30rem;
+  --breakpoint-sm: 40rem;
+  --breakpoint-md: 48rem;
+  --breakpoint-lg: 64rem;
+  --breakpoint-xl: 80rem;
+  --breakpoint-2xl: 96rem;
+
+  /* ── Motion ─────────────────────────────────────────────────── */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --animate-fade-in: fade-in 140ms var(--ease-standard);
+  --animate-pop-in: pop-in 160ms var(--ease-standard);
+  --animate-drawer-in: drawer-in 220ms var(--ease-standard);
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes pop-in {
+    from {
+      opacity: 0;
+      transform: translateY(4px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @keyframes drawer-in {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: none;
+    }
+  }
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    font-feature-settings:
+      'cv11' 1,
+      'ss01' 1;
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    min-width: 20rem;
+    background: var(--color-canvas);
+    color: var(--color-fg);
+    font-size: var(--text-base);
+    line-height: var(--text-base--line-height);
+  }
+
+  /* One consistent, always-visible keyboard focus indicator. */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--color-accent-soft-hover);
+  }
+
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']) {
+    cursor: pointer;
+  }
+
+  dialog {
+    color: inherit;
+  }
+  dialog::backdrop {
+    background: var(--color-overlay);
+    animation: var(--animate-fade-in);
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
