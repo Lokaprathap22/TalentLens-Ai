@@ -11,11 +11,30 @@ import { createSessionRepository } from './modules/auth/session.repository.js';
 import { createSessionService, type SessionService } from './modules/auth/session.service.js';
 import { loadEnvironment } from './config/env.js';
 import { createShutdownHandler } from './lifecycle.js';
+import { createRequisitionRepository } from './modules/requisitions/requisition.repository.js';
+import { createRequisitionService } from './modules/requisitions/requisition.service.js';
+import { createOpenAiCompatibleProvider } from './modules/scorecards/jd-extraction.provider.js';
+import { createScorecardRepository } from './modules/scorecards/scorecard.repository.js';
+import { createScorecardService } from './modules/scorecards/scorecard.service.js';
+import { createResumeRepository } from './modules/resumes/resume.repository.js';
+import { createResumeService } from './modules/resumes/resume.service.js';
 
 const environment = loadEnvironment();
 let sessionService: SessionService | undefined;
 let sessionRepository: SessionRepository | undefined;
 let authRepository: AuthRepository | undefined;
+let requisitionRepository: ReturnType<typeof createRequisitionRepository> | undefined;
+let requisitionService: ReturnType<typeof createRequisitionService> | undefined;
+let scorecardRepository: ReturnType<typeof createScorecardRepository> | undefined;
+let scorecardService: ReturnType<typeof createScorecardService> | undefined;
+let resumeRepository: ReturnType<typeof createResumeRepository> | undefined;
+let resumeService: ReturnType<typeof createResumeService> | undefined;
+const extractionProvider = createOpenAiCompatibleProvider({
+  apiKey: environment.aiApiKey,
+  baseUrl: environment.aiBaseUrl,
+  model: environment.aiModel,
+  timeoutMs: environment.aiTimeoutMs,
+});
 const lazySessionService: SessionService = {
   createSession: (...args) => {
     sessionService ??= createSessionService({
@@ -48,6 +67,31 @@ function getSessionRepository(): SessionRepository {
   return sessionRepository;
 }
 
+function getRequisitionService(): ReturnType<typeof createRequisitionService> {
+  requisitionRepository ??= createRequisitionRepository();
+  requisitionService ??= createRequisitionService({
+    repository: requisitionRepository,
+  });
+  return requisitionService;
+}
+
+function getScorecardService(): ReturnType<typeof createScorecardService> {
+  scorecardRepository ??= createScorecardRepository();
+  scorecardService ??= createScorecardService({
+    repository: scorecardRepository,
+    extractionProvider,
+  });
+  return scorecardService;
+}
+
+function getResumeService(): ReturnType<typeof createResumeService> {
+  resumeRepository ??= createResumeRepository();
+  resumeService ??= createResumeService({
+    repository: resumeRepository,
+  });
+  return resumeService;
+}
+
 const server = createServer(
   createApp({
     auth: {
@@ -55,6 +99,41 @@ const server = createServer(
         repository: lazyAuthRepository,
         sessionService: lazySessionService,
       }),
+      sessionService: lazySessionService,
+      applicationOrigin: environment.appOrigin,
+      isProduction: environment.nodeEnv === 'production',
+    },
+    requisitions: {
+      service: {
+        create: (...args) => getRequisitionService().create(...args),
+        list: (...args) => getRequisitionService().list(...args),
+        get: (...args) => getRequisitionService().get(...args),
+        update: (...args) => getRequisitionService().update(...args),
+      },
+      sessionService: lazySessionService,
+      applicationOrigin: environment.appOrigin,
+      isProduction: environment.nodeEnv === 'production',
+    },
+    scorecards: {
+      service: {
+        generate: (...args) => getScorecardService().generate(...args),
+        list: (...args) => getScorecardService().list(...args),
+        get: (...args) => getScorecardService().get(...args),
+        update: (...args) => getScorecardService().update(...args),
+        approve: (...args) => getScorecardService().approve(...args),
+      },
+      sessionService: lazySessionService,
+      applicationOrigin: environment.appOrigin,
+      isProduction: environment.nodeEnv === 'production',
+    },
+    resumes: {
+      service: {
+        uploadResumes: (...args) => getResumeService().uploadResumes(...args),
+        listResumes: (...args) => getResumeService().listResumes(...args),
+        getResumeDetails: (...args) => getResumeService().getResumeDetails(...args),
+        getExtraction: (...args) => getResumeService().getExtraction(...args),
+        getResumeFile: (...args) => getResumeService().getResumeFile(...args),
+      },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
       isProduction: environment.nodeEnv === 'production',

@@ -1,0 +1,16 @@
+export {
+  DocxTextExtractor,
+  EncryptedDocumentError,
+  InvalidDocumentFormatError,
+  PdfTextExtractor,
+  ResumeParsingService,
+  SecurityLimitExceededError,
+  createResumeParsingService,
+  type DocxExtractorOptions,
+  type DocumentParser,
+  type ExtractionQualityStatus,
+  type PagePosition,
+  type ParagraphPosition,
+  type ParserResult,
+  type ResumeFileType,
+} from '@talentlens/document-processing';

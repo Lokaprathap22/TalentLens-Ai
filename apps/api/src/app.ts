@@ -5,10 +5,25 @@ import { healthResponseSchema } from '@talentlens/shared';
 
 import { createDatabaseHealthChecker, type DatabaseHealthChecker } from './database/readiness.js';
 import { createAuthRouter, type AuthRouterDependencies } from './modules/auth/auth.routes.js';
+import {
+  createRequisitionRouter,
+  type RequisitionRouterDependencies,
+} from './modules/requisitions/requisition.routes.js';
+import {
+  createScorecardRouter,
+  type ScorecardRouterDependencies,
+} from './modules/scorecards/scorecard.routes.js';
+import {
+  createResumeRouter,
+  type ResumeRouterDependencies,
+} from './modules/resumes/resume.routes.js';
 
 export interface AppDependencies {
   databaseHealthChecker?: DatabaseHealthChecker;
   auth?: AuthRouterDependencies;
+  requisitions?: RequisitionRouterDependencies;
+  scorecards?: ScorecardRouterDependencies;
+  resumes?: ResumeRouterDependencies;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -20,6 +35,15 @@ export function createApp(dependencies: AppDependencies = {}): Express {
   app.use(express.json({ limit: '100kb' }));
   if (dependencies.auth) {
     app.use('/api/v1/auth', createAuthRouter(dependencies.auth));
+  }
+  if (dependencies.requisitions) {
+    app.use('/api/v1/requisitions', createRequisitionRouter(dependencies.requisitions));
+  }
+  if (dependencies.scorecards) {
+    app.use('/api/v1/requisitions', createScorecardRouter(dependencies.scorecards));
+  }
+  if (dependencies.resumes) {
+    app.use('/api/v1/requisitions', createResumeRouter(dependencies.resumes));
   }
 
   app.get('/api/v1/health', (_request, response) => {

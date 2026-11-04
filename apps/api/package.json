@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@talentlens/database": "0.1.0",
+    "@talentlens/document-processing": "0.1.0",
     "@talentlens/shared": "0.1.0",
     "argon2": "^0.45.2",
     "dotenv": "^17.2.3",

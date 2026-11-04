@@ -35,6 +35,20 @@ const environmentSchema = z
         }
       }, 'APP_ORIGIN must not include a path, query, or fragment')
       .optional(),
+    AI_API_KEY: z.string().min(1).optional(),
+    AI_BASE_URL: z.string().url().optional(),
+    AI_MODEL: z.string().min(1).optional(),
+    AI_TIMEOUT_MS: z
+      .preprocess(
+        (value) => value ?? '30000',
+        z
+          .string()
+          .regex(/^\d+$/)
+          .transform(Number)
+          .refine((value) => value >= 1_000 && value <= 120_000),
+      )
+      .optional(),
+    RESUME_STORAGE_ROOT: z.string().min(1).default('./storage/resumes'),
   })
   .superRefine((value, context) => {
     if (value.NODE_ENV === 'production' && !value.APP_ORIGIN) {
@@ -45,12 +59,31 @@ const environmentSchema = z
       });
     }
   })
-  .transform(({ NODE_ENV, API_PORT, DATABASE_URL, APP_ORIGIN }) => ({
-    nodeEnv: NODE_ENV,
-    apiPort: API_PORT,
-    databaseUrl: DATABASE_URL,
-    appOrigin: APP_ORIGIN ?? 'http://localhost:5173',
-  }));
+  .transform(
+    ({
+      NODE_ENV,
+      API_PORT,
+      DATABASE_URL,
+      APP_ORIGIN,
+      AI_API_KEY,
+      AI_BASE_URL,
+      AI_MODEL,
+      AI_TIMEOUT_MS,
+      RESUME_STORAGE_ROOT,
+    }) => ({
+      nodeEnv: NODE_ENV,
+      apiPort: API_PORT,
+      databaseUrl: DATABASE_URL,
+      appOrigin: APP_ORIGIN ?? 'http://localhost:5173',
+      aiApiKey: AI_API_KEY,
+      aiBaseUrl: AI_BASE_URL,
+      aiModel: AI_MODEL,
+      aiTimeoutMs: AI_TIMEOUT_MS ?? 30_000,
+      resumeStorageRoot: path.isAbsolute(RESUME_STORAGE_ROOT)
+        ? path.normalize(RESUME_STORAGE_ROOT)
+        : path.resolve(repositoryRoot(), RESUME_STORAGE_ROOT),
+    }),
+  );
 
 export type Environment = z.infer<typeof environmentSchema>;
 export type EnvironmentInput = Record<string, string | undefined>;
@@ -77,8 +110,12 @@ export function parseEnvironment(input: EnvironmentInput): Environment {
   return result.data;
 }
 
+function repositoryRoot(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../');
+}
+
 function repositoryEnvironmentPath(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../.env');
+  return path.resolve(repositoryRoot(), '.env');
 }
 
 export function loadEnvironment(input: EnvironmentInput = process.env): Environment {

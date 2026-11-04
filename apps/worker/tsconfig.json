@@ -8,5 +8,9 @@
     "moduleResolution": "NodeNext",
     "types": ["node"]
   },
+  "references": [
+    { "path": "../../packages/database" },
+    { "path": "../../packages/document-processing" }
+  ],
   "include": ["src/**/*.ts"]
 }

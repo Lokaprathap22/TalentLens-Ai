@@ -8,7 +8,10 @@
     "moduleResolution": "NodeNext",
     "types": ["node", "vitest/globals"]
   },
-  "references": [{ "path": "../../packages/shared" }],
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/document-processing" }
+  ],
   "include": ["src/**/*.ts"],
   "exclude": ["**/*.test.ts", "**/*.spec.ts", "**/*.test.tsx", "**/*.spec.tsx"]
 }

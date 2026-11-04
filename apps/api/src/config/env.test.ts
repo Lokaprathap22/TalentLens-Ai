@@ -17,6 +17,11 @@ describe('parseEnvironment', () => {
       apiPort: 4000,
       databaseUrl: validDatabaseUrl,
       appOrigin: 'http://localhost:5173',
+      aiApiKey: undefined,
+      aiBaseUrl: undefined,
+      aiModel: undefined,
+      aiTimeoutMs: 30_000,
+      resumeStorageRoot: expect.stringContaining('storage'),
     });
   });
 
@@ -33,6 +38,16 @@ describe('parseEnvironment', () => {
       apiPort: 443,
       appOrigin: 'https://app.example.com',
     });
+  });
+
+  it('resolves relative RESUME_STORAGE_ROOT against the repository root', () => {
+    const env = parseEnvironment({
+      NODE_ENV: 'development',
+      API_PORT: '4000',
+      DATABASE_URL: validDatabaseUrl,
+      RESUME_STORAGE_ROOT: './custom-storage',
+    });
+    expect(env.resumeStorageRoot).toMatch(/[\\/]custom-storage$/);
   });
 
   it('rejects a missing database URL', () => {
