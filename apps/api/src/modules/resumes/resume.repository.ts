@@ -228,6 +228,7 @@ export function createResumeRepository(
               status: 'ACTIVE',
               withdrawnAt: null,
               policyVersion: { not: '' },
+              requisitionId,
             },
             select: { id: true },
           });
@@ -433,11 +434,13 @@ export function createResumeRepository(
             attempts: number;
             resume_document_id: string | null;
             organization_id: string;
+            requisition_id: string;
           }>
         >(
           Prisma.sql`
-            SELECT pj.id, pj.status, pj.attempts, pj.resume_document_id, pj.organization_id
+            SELECT pj.id, pj.status, pj.attempts, pj.resume_document_id, pj.organization_id, pb.requisition_id
             FROM "processing_jobs" pj
+            JOIN "processing_batches" pb ON pb.id = pj.batch_id
             WHERE (
               (pj.status = 'QUEUED')
               OR (
@@ -519,6 +522,7 @@ export function createResumeRepository(
             withdrawnAt: null,
             policyVersion: { not: '' },
             captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+            requisitionId: candidateJob.requisition_id,
           },
           select: { id: true },
         });
@@ -611,6 +615,15 @@ export function createResumeRepository(
     async completeProcessingJob(jobId, resumeDocumentId, organizationId, result, leaseToken) {
       return database.$transaction(async (tx) => {
         // 1. Re-verify active authorization
+        const job = await tx.processingJob.findUnique({
+          where: { id: jobId },
+          select: { batch: { select: { requisitionId: true } } },
+        });
+
+        if (!job?.batch?.requisitionId) {
+          return false;
+        }
+
         const activeConsent = await tx.candidateConsent.findFirst({
           where: {
             organizationId,
@@ -624,6 +637,7 @@ export function createResumeRepository(
             withdrawnAt: null,
             policyVersion: { not: '' },
             captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+            requisitionId: job.batch.requisitionId,
           },
           select: { id: true },
         });
@@ -787,7 +801,7 @@ export function createResumeRepository(
           return { releasedCount: 0, reason: 'CANDIDATE_NOT_FOUND' };
         }
 
-        const validConsent = await tx.candidateConsent.findFirst({
+        const activeConsents = await tx.candidateConsent.findMany({
           where: {
             organizationId,
             candidateId,
@@ -796,15 +810,20 @@ export function createResumeRepository(
             withdrawnAt: null,
             policyVersion: { not: '' },
             captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+            requisitionId: requisitionId ? requisitionId : { not: null },
           },
-          select: { id: true },
+          select: { id: true, requisitionId: true },
         });
 
-        if (!validConsent) {
+        if (activeConsents.length === 0) {
           return { releasedCount: 0, reason: 'NO_ACTIVE_VALID_CONSENT' };
         }
 
-        // Find candidate's held jobs in this organization
+        const consentedRequisitionIds = activeConsents
+          .map((c) => c.requisitionId)
+          .filter((id): id is string => typeof id === 'string');
+
+        // Find candidate's held jobs in this organization strictly matching consented requisitions
         const heldJobs = await tx.processingJob.findMany({
           where: {
             organizationId,
@@ -813,7 +832,9 @@ export function createResumeRepository(
               candidateId,
               organizationId,
             },
-            ...(requisitionId ? { batch: { requisitionId } } : {}),
+            batch: {
+              requisitionId: { in: consentedRequisitionIds },
+            },
           },
           include: {
             batch: {
@@ -874,7 +895,7 @@ export function createResumeRepository(
               resourceId: candidateId,
               metadataJson: {
                 releasedCount: updated.count,
-                consentId: validConsent.id,
+                consentIds: activeConsents.map((c) => c.id),
                 requisitionIds: authorizedRequisitionIds,
                 recruiterId: recruiterId ?? null,
               },

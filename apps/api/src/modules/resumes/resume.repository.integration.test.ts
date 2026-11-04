@@ -144,6 +144,7 @@ async function createTestFixture(client: AnyPrismaClient): Promise<TestFixture> 
       });
     }
 
+    await c.consentWithdrawalRequest.deleteMany({ where: { organizationId: orgId } });
     await c.candidateConsent.deleteMany({ where: { organizationId: orgId } });
 
     if (candidateIds.length > 0) {
@@ -258,11 +259,37 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
       expect(unconsentedRelease.releasedCount).toBe(0);
       expect(unconsentedRelease.reason).toBe('NO_ACTIVE_VALID_CONSENT');
 
+      // Regression test: legacy consent with requisitionId = null cannot release held job for a new requisition
+      const legacyConsent = await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          requisitionId: null, // Legacy null-requisition consent!
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+
+      const legacyRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+        fixture.principal.userId,
+        fixture.requisitionId,
+      );
+      expect(legacyRelease.releasedCount).toBe(0);
+      expect(legacyRelease.reason).toBe('NO_ACTIVE_VALID_CONSENT');
+
+      await pgClient.candidateConsent.delete({ where: { id: legacyConsent.id } });
+
       // Add revoked consent -> fails
       const revokedConsent = await pgClient.candidateConsent.create({
         data: {
           organizationId: fixture.organizationId,
           candidateId,
+          requisitionId: fixture.requisitionId,
           purpose: 'HIRING_USE',
           status: 'ACTIVE',
           policyVersion: 'v1.0',
@@ -494,6 +521,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         data: {
           organizationId: fixture.organizationId,
           candidateId,
+          requisitionId: fixture.requisitionId,
           purpose: 'HIRING_USE',
           status: 'ACTIVE',
           policyVersion: 'v1.0',
@@ -588,6 +616,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         data: {
           organizationId: fixture.organizationId,
           candidateId,
+          requisitionId: fixture.requisitionId,
           purpose: 'HIRING_USE',
           status: 'ACTIVE',
           policyVersion: 'v1.0',
@@ -596,7 +625,12 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         },
       });
 
-      await repository.releaseHeldProcessingJobs(fixture.organizationId, candidateId);
+      await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+        fixture.principal.userId,
+        fixture.requisitionId,
+      );
 
       // Attempt 1: claim
       const job1 = await repository.claimNextProcessingJob('worker-retry', 5);
@@ -686,6 +720,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         data: {
           organizationId: fixture.organizationId,
           candidateId,
+          requisitionId: fixture.requisitionId,
           purpose: 'HIRING_USE',
           status: 'ACTIVE',
           policyVersion: 'v1.0',
@@ -746,6 +781,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         data: {
           organizationId: fixture.organizationId,
           candidateId,
+          requisitionId: fixture.requisitionId,
           purpose: 'HIRING_USE',
           status: 'ACTIVE',
           policyVersion: 'v1.0',
@@ -828,6 +864,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         data: {
           organizationId: fixture.organizationId,
           candidateId,
+          requisitionId: fixture.requisitionId,
           purpose: 'HIRING_USE',
           status: 'ACTIVE',
           policyVersion: '', // Invalid empty policy version!
@@ -966,6 +1003,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
           data: {
             organizationId: fixture.principal.organizationId,
             candidateId: item.candidateId,
+            requisitionId: fixture.requisitionId,
             purpose: 'HIRING_USE',
             status: 'ACTIVE',
             policyVersion: '1.0',
@@ -976,6 +1014,8 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         await repository.releaseHeldProcessingJobs(
           fixture.principal.organizationId,
           item.candidateId,
+          fixture.principal.userId,
+          fixture.requisitionId,
         );
       }
 
@@ -1037,6 +1077,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
           data: {
             organizationId: fixture.principal.organizationId,
             candidateId: item.candidateId,
+            requisitionId: fixture.requisitionId,
             purpose: 'HIRING_USE',
             status: 'ACTIVE',
             policyVersion: '1.0',
@@ -1047,6 +1088,8 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         await repository.releaseHeldProcessingJobs(
           fixture.principal.organizationId,
           item.candidateId,
+          fixture.principal.userId,
+          fixture.requisitionId,
         );
       }
 
@@ -1148,6 +1191,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
           data: {
             organizationId: fixture.principal.organizationId,
             candidateId: item.candidateId,
+            requisitionId: fixture.requisitionId,
             purpose: 'HIRING_USE',
             status: 'ACTIVE',
             policyVersion: '1.0',
@@ -1158,6 +1202,8 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         await repository.releaseHeldProcessingJobs(
           fixture.principal.organizationId,
           item.candidateId,
+          fixture.principal.userId,
+          fixture.requisitionId,
         );
       }
 

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import dotenv from 'dotenv';
 import { z } from 'zod';
+import { parseApprovedPolicies } from '../modules/consent/consent.policy.js';
 
 const environmentSchema = z
   .object({
@@ -49,6 +50,8 @@ const environmentSchema = z
       )
       .optional(),
     RESUME_STORAGE_ROOT: z.string().min(1).default('./storage/resumes'),
+    CONSENT_APPROVED_POLICIES: z.string().optional(),
+    CONSENT_APPROVED_POLICY_VERSIONS: z.string().optional(),
   })
   .superRefine((value, context) => {
     if (value.NODE_ENV === 'production' && !value.APP_ORIGIN) {
@@ -70,6 +73,8 @@ const environmentSchema = z
       AI_MODEL,
       AI_TIMEOUT_MS,
       RESUME_STORAGE_ROOT,
+      CONSENT_APPROVED_POLICIES,
+      CONSENT_APPROVED_POLICY_VERSIONS,
     }) => ({
       nodeEnv: NODE_ENV,
       apiPort: API_PORT,
@@ -82,6 +87,12 @@ const environmentSchema = z
       resumeStorageRoot: path.isAbsolute(RESUME_STORAGE_ROOT)
         ? path.normalize(RESUME_STORAGE_ROOT)
         : path.resolve(repositoryRoot(), RESUME_STORAGE_ROOT),
+      approvedPolicies: parseApprovedPolicies(CONSENT_APPROVED_POLICIES),
+      approvedPolicyVersions: CONSENT_APPROVED_POLICY_VERSIONS
+        ? CONSENT_APPROVED_POLICY_VERSIONS.split(',')
+            .map((v) => v.trim())
+            .filter(Boolean)
+        : [],
     }),
   );
 

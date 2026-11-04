@@ -17,6 +17,10 @@ import {
   createResumeRouter,
   type ResumeRouterDependencies,
 } from './modules/resumes/resume.routes.js';
+import {
+  createConsentRouter,
+  type ConsentRouterDependencies,
+} from './modules/consent/consent.routes.js';
 
 export interface AppDependencies {
   databaseHealthChecker?: DatabaseHealthChecker;
@@ -24,6 +28,7 @@ export interface AppDependencies {
   requisitions?: RequisitionRouterDependencies;
   scorecards?: ScorecardRouterDependencies;
   resumes?: ResumeRouterDependencies;
+  consent?: ConsentRouterDependencies;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -44,6 +49,9 @@ export function createApp(dependencies: AppDependencies = {}): Express {
   }
   if (dependencies.resumes) {
     app.use('/api/v1/requisitions', createResumeRouter(dependencies.resumes));
+  }
+  if (dependencies.consent) {
+    app.use('/api/v1', createConsentRouter(dependencies.consent));
   }
 
   app.get('/api/v1/health', (_request, response) => {

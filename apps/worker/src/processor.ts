@@ -104,11 +104,13 @@ export class WorkerJobProcessor {
           attempts: number;
           resume_document_id: string | null;
           organization_id: string;
+          requisition_id: string;
         }>
       >(
         Prisma.sql`
-          SELECT pj.id, pj.status, pj.attempts, pj.resume_document_id, pj.organization_id
+          SELECT pj.id, pj.status, pj.attempts, pj.resume_document_id, pj.organization_id, pb.requisition_id
           FROM "processing_jobs" pj
+          JOIN "processing_batches" pb ON pb.id = pj.batch_id
           WHERE (
             (pj.status = 'QUEUED')
             OR (
@@ -191,6 +193,7 @@ export class WorkerJobProcessor {
           withdrawnAt: null,
           policyVersion: { not: '' },
           captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+          requisitionId: candidateJob.requisition_id,
         },
         select: { id: true },
       });
@@ -226,6 +229,9 @@ export class WorkerJobProcessor {
       const claimedRecord = await tx.processingJob.findUnique({
         where: { id: candidateJob.id },
         include: {
+          batch: {
+            select: { requisitionId: true },
+          },
           resumeDocument: {
             select: { id: true, objectKey: true, fileType: true, organizationId: true },
           },
@@ -302,22 +308,25 @@ export class WorkerJobProcessor {
       // 3. Phase 3 — Short Transaction: Fenced idempotent completion with authorization recheck
       await this.database.$transaction(async (tx) => {
         // A. Recheck authorization before committing extraction
-        const stillConsented = await tx.candidateConsent.findFirst({
-          where: {
-            organizationId: resumeDoc.organizationId,
-            candidate: {
-              resumes: {
-                some: { id: resumeDoc.id },
+        const stillConsented = claimed.batch?.requisitionId
+          ? await tx.candidateConsent.findFirst({
+              where: {
+                organizationId: resumeDoc.organizationId,
+                candidate: {
+                  resumes: {
+                    some: { id: resumeDoc.id },
+                  },
+                },
+                purpose: 'HIRING_USE',
+                status: 'ACTIVE',
+                withdrawnAt: null,
+                policyVersion: { not: '' },
+                captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+                requisitionId: claimed.batch.requisitionId,
               },
-            },
-            purpose: 'HIRING_USE',
-            status: 'ACTIVE',
-            withdrawnAt: null,
-            policyVersion: { not: '' },
-            captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
-          },
-          select: { id: true },
-        });
+              select: { id: true },
+            })
+          : null;
 
         if (!stillConsented) {
           // Consent revoked during processing: hold job, clear lease, do not persist extraction

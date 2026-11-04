@@ -22,7 +22,28 @@ describe('parseEnvironment', () => {
       aiModel: undefined,
       aiTimeoutMs: 30_000,
       resumeStorageRoot: expect.stringContaining('storage'),
+      approvedPolicies: [],
+      approvedPolicyVersions: [],
     });
+  });
+
+  it('parses configured approved policies with version and notice hash', () => {
+    const hash = 'a'.repeat(64);
+    const env = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      CONSENT_APPROVED_POLICIES: `2026-11-v1:${hash}`,
+    });
+    expect(env.approvedPolicies).toEqual([{ version: '2026-11-v1', noticeTextHash: hash }]);
+  });
+
+  it('parses configured approved policy versions', () => {
+    const env = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      CONSENT_APPROVED_POLICY_VERSIONS: '2026-11-v1, 2026-12-v2',
+    });
+    expect(env.approvedPolicyVersions).toEqual(['2026-11-v1', '2026-12-v2']);
   });
 
   it('parses valid production configuration', () => {

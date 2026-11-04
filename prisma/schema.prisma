@@ -1,6 +1,7 @@
 generator client {
-  provider = "prisma-client"
-  output   = "../packages/database/src/generated/prisma"
+  provider        = "prisma-client"
+  output          = "../packages/database/src/generated/prisma"
+  previewFeatures = ["partialIndexes"]
 }
 
 datasource db {
@@ -198,6 +199,27 @@ enum ConsentCaptureMethod {
   IMPORTED
 }
 
+enum ConsentInvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  SUPERSEDED
+}
+
+enum InvitationDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  NOT_CONFIGURED
+}
+
+enum WithdrawalRequestStatus {
+  PENDING
+  COMPLETED
+  EXPIRED
+}
+
 enum DeletionRequestStatus {
   REQUESTED
   PROCESSING
@@ -231,6 +253,8 @@ model Organization {
   deletionRequests     DeletionRequest[]
   scorecardVersions    ScorecardVersion[]
   pipelineEvents       PipelineEvent[]
+  consentInvitations   ConsentInvitation[]
+  consentWithdrawalRequests ConsentWithdrawalRequest[]
 
   @@unique([normalizedName])
   @@map("organizations")
@@ -260,6 +284,7 @@ model User {
   clientDecisions      ClientDecision[]
   pipelineEvents       PipelineEvent[]
   capturedConsents     CandidateConsent[]    @relation("ConsentCapturer")
+  createdConsentInvitations ConsentInvitation[] @relation("InvitationCreator")
   deletionRequests     DeletionRequest[]     @relation("DeletionRequester")
   auditLogs            AuditLog[]
 
@@ -351,6 +376,8 @@ model Requisition {
   submissions       CandidateSubmission[]
   pipelineEvents    PipelineEvent[]
   auditLogs         AuditLog[]
+  candidateConsents CandidateConsent[]
+  consentInvitations ConsentInvitation[]
 
   @@unique([id, organizationId], map: "requisitions_id_organization_id_key")
   @@unique([id, clientId, organizationId], map: "requisitions_id_client_org_key")
@@ -423,6 +450,8 @@ model Candidate {
   submissions      CandidateSubmission[]
   pipelineEvents   PipelineEvent[]
   consents         CandidateConsent[]
+  consentInvitations ConsentInvitation[]
+  consentWithdrawalRequests ConsentWithdrawalRequest[]
   deletionRequests DeletionRequest[]
   auditLogs        AuditLog[]
 
@@ -806,25 +835,86 @@ model PipelineEvent {
 }
 
 model CandidateConsent {
-  id             String               @id @default(uuid()) @db.Uuid
-  organizationId String               @map("organization_id") @db.Uuid
-  candidateId    String               @map("candidate_id") @db.Uuid
-  purpose        ConsentPurpose
-  status         ConsentStatus
-  policyVersion  String               @map("policy_version")
-  captureMethod  ConsentCaptureMethod @map("capture_method")
-  capturedAt     DateTime             @map("captured_at")
-  capturedById   String?              @map("captured_by") @db.Uuid
-  withdrawnAt    DateTime?            @map("withdrawn_at")
-  createdAt      DateTime             @default(now()) @map("created_at")
-  updatedAt      DateTime             @updatedAt @map("updated_at")
+  id               String               @id @default(uuid()) @db.Uuid
+  organizationId   String               @map("organization_id") @db.Uuid
+  candidateId      String               @map("candidate_id") @db.Uuid
+  requisitionId    String?              @map("requisition_id") @db.Uuid
+  purpose          ConsentPurpose
+  status           ConsentStatus
+  policyVersion    String               @map("policy_version")
+  noticeTextHash   String?              @map("notice_text_hash")
+  confirmationName String?              @map("confirmation_name")
+  captureMethod    ConsentCaptureMethod @map("capture_method")
+  capturedAt       DateTime             @map("captured_at")
+  capturedById     String?              @map("captured_by") @db.Uuid
+  withdrawnAt      DateTime?            @map("withdrawn_at")
+  createdAt        DateTime             @default(now()) @map("created_at")
+  updatedAt        DateTime             @updatedAt @map("updated_at")
+
+  organization       Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate          Candidate                  @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition        Requisition?               @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  capturedBy         User?                      @relation("ConsentCapturer", fields: [capturedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  withdrawalRequests ConsentWithdrawalRequest[]
+
+  @@unique([organizationId, candidateId, requisitionId, purpose], map: "candidate_consents_active_scope_unique_idx", where: raw("status = 'ACTIVE' AND requisition_id IS NOT NULL"))
+  @@index([candidateId, purpose, status])
+  @@index([candidateId, requisitionId, status])
+  @@index([organizationId, candidateId, requisitionId, purpose, status])
+  @@map("candidate_consents")
+}
+
+model ConsentInvitation {
+  id             String                   @id @default(uuid()) @db.Uuid
+  organizationId String                   @map("organization_id") @db.Uuid
+  candidateId    String                   @map("candidate_id") @db.Uuid
+  requisitionId  String                   @map("requisition_id") @db.Uuid
+  createdById    String                   @map("created_by") @db.Uuid
+  tokenHash      String                   @unique @map("token_hash")
+  email          String
+  purpose        ConsentPurpose           @default(HIRING_USE)
+  status         ConsentInvitationStatus  @default(PENDING)
+  policyVersion  String                   @map("policy_version")
+  noticeTextHash String                   @map("notice_text_hash")
+  deliveryStatus InvitationDeliveryStatus @default(PENDING) @map("delivery_status")
+  deliveryError  String?                  @map("delivery_error")
+  expiresAt      DateTime                 @map("expires_at")
+  consumedAt     DateTime?                @map("consumed_at")
+  createdAt      DateTime                 @default(now()) @map("created_at")
+  updatedAt      DateTime                 @updatedAt @map("updated_at")
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   candidate    Candidate    @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
-  capturedBy   User?        @relation("ConsentCapturer", fields: [capturedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition  Requisition  @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy    User         @relation("InvitationCreator", fields: [createdById, organizationId], references: [id, organizationId], onDelete: Restrict)
 
-  @@index([candidateId, purpose, status])
-  @@map("candidate_consents")
+  @@index([tokenHash])
+  @@index([organizationId, candidateId, requisitionId, status])
+  @@index([expiresAt, status])
+  @@map("consent_invitations")
+}
+
+model ConsentWithdrawalRequest {
+  id             String                  @id @default(uuid()) @db.Uuid
+  organizationId String                  @map("organization_id") @db.Uuid
+  candidateId    String                  @map("candidate_id") @db.Uuid
+  consentId      String                  @map("consent_id") @db.Uuid
+  tokenHash      String                  @unique @map("token_hash")
+  email          String
+  status         WithdrawalRequestStatus @default(PENDING)
+  expiresAt      DateTime                @map("expires_at")
+  consumedAt     DateTime?               @map("consumed_at")
+  createdAt      DateTime                @default(now()) @map("created_at")
+  updatedAt      DateTime                @updatedAt @map("updated_at")
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate    Candidate        @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  consent      CandidateConsent @relation(fields: [consentId], references: [id], onDelete: Restrict)
+
+  @@index([tokenHash])
+  @@index([organizationId, candidateId, status])
+  @@index([expiresAt, status])
+  @@map("consent_withdrawal_requests")
 }
 
 model DeletionRequest {

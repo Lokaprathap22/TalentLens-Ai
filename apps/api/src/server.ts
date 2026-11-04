@@ -18,6 +18,9 @@ import { createScorecardRepository } from './modules/scorecards/scorecard.reposi
 import { createScorecardService } from './modules/scorecards/scorecard.service.js';
 import { createResumeRepository } from './modules/resumes/resume.repository.js';
 import { createResumeService } from './modules/resumes/resume.service.js';
+import { createConsentRepository } from './modules/consent/consent.repository.js';
+import { createConsentService } from './modules/consent/consent.service.js';
+import { DefaultEmailDeliveryService } from './modules/consent/consent.email.js';
 
 const environment = loadEnvironment();
 let sessionService: SessionService | undefined;
@@ -29,6 +32,9 @@ let scorecardRepository: ReturnType<typeof createScorecardRepository> | undefine
 let scorecardService: ReturnType<typeof createScorecardService> | undefined;
 let resumeRepository: ReturnType<typeof createResumeRepository> | undefined;
 let resumeService: ReturnType<typeof createResumeService> | undefined;
+let consentRepository: ReturnType<typeof createConsentRepository> | undefined;
+let consentService: ReturnType<typeof createConsentService> | undefined;
+const emailDeliveryService = new DefaultEmailDeliveryService();
 const extractionProvider = createOpenAiCompatibleProvider({
   apiKey: environment.aiApiKey,
   baseUrl: environment.aiBaseUrl,
@@ -92,6 +98,17 @@ function getResumeService(): ReturnType<typeof createResumeService> {
   return resumeService;
 }
 
+function getConsentService(): ReturnType<typeof createConsentService> {
+  consentRepository ??= createConsentRepository();
+  consentService ??= createConsentService({
+    repository: consentRepository,
+    emailDeliveryService,
+    applicationOrigin: environment.appOrigin,
+    approvedPolicies: environment.approvedPolicies,
+  });
+  return consentService;
+}
+
 const server = createServer(
   createApp({
     auth: {
@@ -135,6 +152,19 @@ const server = createServer(
         getResumeFile: (...args) => getResumeService().getResumeFile(...args),
         releaseHeldProcessingJobs: (...args) =>
           getResumeService().releaseHeldProcessingJobs(...args),
+      },
+      sessionService: lazySessionService,
+      applicationOrigin: environment.appOrigin,
+      isProduction: environment.nodeEnv === 'production',
+    },
+    consent: {
+      consentService: {
+        createInvitation: (...args) => getConsentService().createInvitation(...args),
+        inspectNotice: (...args) => getConsentService().inspectNotice(...args),
+        acceptConsent: (...args) => getConsentService().acceptConsent(...args),
+        declineConsent: (...args) => getConsentService().declineConsent(...args),
+        requestWithdrawal: (...args) => getConsentService().requestWithdrawal(...args),
+        confirmWithdrawal: (...args) => getConsentService().confirmWithdrawal(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,

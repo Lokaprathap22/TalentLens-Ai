@@ -27,6 +27,7 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
       attempts: 0,
       resume_document_id: 'doc-1',
       organization_id: 'org-1',
+      requisition_id: 'req-1',
     };
 
     const mockClaimedRecord = {
@@ -37,6 +38,9 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
       jobType: 'EXTRACT_TEXT',
       attempts: 1,
       leaseExpiresAt: new Date(Date.now() + 300000),
+      batch: {
+        requisitionId: 'req-1',
+      },
       resumeDocument: {
         id: 'doc-1',
         objectKey: '2026-11/test.pdf',
