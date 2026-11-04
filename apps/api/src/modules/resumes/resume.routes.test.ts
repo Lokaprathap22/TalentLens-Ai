@@ -19,12 +19,16 @@ const resumeId = '223e4567-e89b-42d3-a456-426614174000';
 const recruiterPrincipal = {
   userId: 'recruiter-a',
   organizationId: 'organization-a',
+  organizationName: 'Organization A',
+  email: 'recruiter-a@example.com',
   role: 'RECRUITER' as const,
 };
 
 const hiringManagerPrincipal = {
   userId: 'hm-a',
   organizationId: 'organization-a',
+  organizationName: 'Organization A',
+  email: 'hm-a@example.com',
   role: 'CLIENT_HIRING_MANAGER' as const,
 };
 

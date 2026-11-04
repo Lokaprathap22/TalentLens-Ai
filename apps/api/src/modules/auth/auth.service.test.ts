@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { AuthenticationError, createAuthService } from './auth.service.js';
-import type { AuthRepository, LoginUser } from './auth.repository.js';
+import { createAuthRepository, type AuthRepository, type LoginUser } from './auth.repository.js';
 import { DUMMY_PASSWORD_HASH } from './password.service.js';
 import type { SessionService } from './session.service.js';
 
 const activeRecruiter: LoginUser = {
   id: 'user-1',
   organizationId: 'org-1',
+  organizationName: 'TalentLens',
   email: 'recruiter@example.com',
   passwordHash: 'stored-hash',
   role: 'RECRUITER',
@@ -46,6 +47,7 @@ describe('auth service', () => {
       user: {
         userId: 'user-1',
         organizationId: 'org-1',
+        organizationName: 'TalentLens',
         email: 'recruiter@example.com',
         role: 'RECRUITER',
       },
@@ -56,6 +58,44 @@ describe('auth service', () => {
     );
     expect(sessionService.createSession).toHaveBeenCalledWith('user-1');
     expect(verifyPassword).toHaveBeenCalledExactlyOnceWith('password', 'stored-hash');
+  });
+
+  it('retrieves the organization display name in the auth repository', async () => {
+    const findUniqueOrganization = vi.fn(async () => ({
+      id: 'org-1',
+      name: 'TalentLens Enterprise',
+    }));
+    const findFirstUser = vi.fn(async () => ({
+      id: 'user-1',
+      organizationId: 'org-1',
+      email: 'recruiter@example.com',
+      passwordHash: 'stored-hash',
+      role: 'RECRUITER' as const,
+      status: 'ACTIVE' as const,
+    }));
+    const repository = createAuthRepository({
+      organization: { findUnique: findUniqueOrganization },
+      user: { findFirst: findFirstUser },
+    } as never);
+
+    const found = await repository.findUserByOrganizationAndEmail(
+      'talentlens enterprise',
+      'recruiter@example.com',
+    );
+
+    expect(findUniqueOrganization).toHaveBeenCalledWith({
+      where: { normalizedName: 'talentlens enterprise' },
+      select: { id: true, name: true },
+    });
+    expect(found).toEqual({
+      id: 'user-1',
+      organizationId: 'org-1',
+      organizationName: 'TalentLens Enterprise',
+      email: 'recruiter@example.com',
+      passwordHash: 'stored-hash',
+      role: 'RECRUITER',
+      status: 'ACTIVE',
+    });
   });
 
   it('supports client hiring manager identities without exposing credentials', async () => {

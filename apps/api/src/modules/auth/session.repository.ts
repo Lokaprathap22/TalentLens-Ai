@@ -1,5 +1,7 @@
 import { getDatabaseClient, type PrismaClient } from '@talentlens/database';
 
+import type { UserRole } from './auth.dto.js';
+
 export interface SessionCreation {
   userId: string;
   tokenHash: string;
@@ -9,8 +11,12 @@ export interface SessionCreation {
 export interface SessionUser {
   id: string;
   organizationId: string;
-  role: 'RECRUITER' | 'CLIENT_HIRING_MANAGER' | 'DELIVERY_HEAD';
+  email: string;
+  role: UserRole;
   status: 'ACTIVE' | 'INVITED' | 'SUSPENDED' | 'DEACTIVATED';
+  organization: {
+    name: string;
+  };
 }
 
 export interface SessionRecord {
@@ -69,8 +75,14 @@ export function createSessionRepository(
             select: {
               id: true,
               organizationId: true,
+              email: true,
               role: true,
               status: true,
+              organization: {
+                select: {
+                  name: true,
+                },
+              },
             },
           },
         },

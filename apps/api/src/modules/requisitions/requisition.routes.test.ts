@@ -3,15 +3,18 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
+import type { AuthenticatedUserDto } from '../auth/auth.dto.js';
 import type { SessionService } from '../auth/session.service.js';
 import { RequisitionNotFoundError, type RequisitionService } from './requisition.service.js';
 
 const rawToken = 'A'.repeat(43);
 const requisitionId = '123e4567-e89b-42d3-a456-426614174000';
-const principal = {
+const principal: AuthenticatedUserDto = {
   userId: 'recruiter-a',
   organizationId: 'organization-a',
-  role: 'RECRUITER' as const,
+  organizationName: 'Organization A',
+  email: 'recruiter-a@example.com',
+  role: 'RECRUITER',
 };
 const requisition = {
   id: 'requisition-a',
@@ -26,8 +29,7 @@ const requisition = {
 
 function createTestApp(
   options: {
-    principal?:
-      typeof principal | { userId: string; organizationId: string; role: 'CLIENT_HIRING_MANAGER' };
+    principal?: AuthenticatedUserDto;
     getError?: Error;
     updateError?: Error;
   } = {},
@@ -141,6 +143,8 @@ describe('requisition routes', () => {
       principal: {
         userId: 'client-manager-a',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'client-manager-a@example.com',
         role: 'CLIENT_HIRING_MANAGER',
       },
     });
@@ -209,6 +213,8 @@ describe('requisition routes', () => {
       principal: {
         userId: 'recruiter-b',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'recruiter-b@example.com',
         role: 'RECRUITER',
       },
       getError: new RequisitionNotFoundError(),
@@ -224,6 +230,8 @@ describe('requisition routes', () => {
       {
         userId: 'recruiter-b',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'recruiter-b@example.com',
         role: 'RECRUITER',
       },
       requisitionId,
@@ -235,6 +243,8 @@ describe('requisition routes', () => {
       principal: {
         userId: 'recruiter-a',
         organizationId: 'organization-b',
+        organizationName: 'Organization B',
+        email: 'recruiter-a@org-b.example.com',
         role: 'RECRUITER',
       },
       getError: new RequisitionNotFoundError(),
@@ -250,6 +260,8 @@ describe('requisition routes', () => {
       {
         userId: 'recruiter-a',
         organizationId: 'organization-b',
+        organizationName: 'Organization B',
+        email: 'recruiter-a@org-b.example.com',
         role: 'RECRUITER',
       },
       requisitionId,
@@ -257,10 +269,12 @@ describe('requisition routes', () => {
   });
 
   it('returns 404 for cross-recruiter update access', async () => {
-    const crossRecruiter = {
+    const crossRecruiter: AuthenticatedUserDto = {
       userId: 'recruiter-b',
       organizationId: 'organization-a',
-      role: 'RECRUITER' as const,
+      organizationName: 'Organization A',
+      email: 'recruiter-b@example.com',
+      role: 'RECRUITER',
     };
     const { app, service } = createTestApp({
       principal: crossRecruiter,

@@ -11,6 +11,7 @@ const rawToken = 'A'.repeat(43);
 const user = {
   userId: 'user-1',
   organizationId: 'organization-1',
+  organizationName: 'TalentLens',
   email: 'recruiter@example.com',
   role: 'RECRUITER' as const,
 };
@@ -26,6 +27,8 @@ function createAuthFakes() {
         ? {
             userId: user.userId,
             organizationId: user.organizationId,
+            organizationName: user.organizationName,
+            email: user.email,
             role: user.role,
           }
         : null,
@@ -140,15 +143,28 @@ describe('HTTP authentication layer', () => {
     expect(missing.status).toBe(401);
 
     const cookie = `${DEVELOPMENT_SESSION_COOKIE}=${rawToken}`;
+    const login = await request(app)
+      .post('/api/v1/auth/login')
+      .set('Origin', 'http://localhost:5173')
+      .send({
+        organization: 'TalentLens',
+        email: 'recruiter@example.com',
+        password: 'password',
+      });
+    expect(login.status).toBe(200);
+
     const me = await request(app).get('/api/v1/auth/me').set('Cookie', cookie);
     expect(me.status).toBe(200);
     expect(me.body).toEqual({
       user: {
         userId: user.userId,
         organizationId: user.organizationId,
+        organizationName: user.organizationName,
+        email: user.email,
         role: user.role,
       },
     });
+    expect(me.body).toEqual(login.body);
     expect(JSON.stringify(me.body)).not.toContain('passwordHash');
 
     const csrf = await request(app).get('/api/v1/auth/csrf').set('Cookie', cookie);

@@ -1,17 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import type { AuthenticatedUserDto } from './auth.dto.js';
+import { SESSION_TTL_MS, createSessionService } from './session.service.js';
 import {
-  SESSION_TTL_MS,
-  createSessionService,
-  type AuthenticatedPrincipal,
-} from './session.service.js';
-import type { SessionCreation, SessionRecord, SessionRepository } from './session.repository.js';
+  createSessionRepository,
+  type SessionCreation,
+  type SessionRecord,
+  type SessionRepository,
+} from './session.repository.js';
 
 const user = {
   id: 'user-1',
   organizationId: 'organization-1',
+  email: 'recruiter@example.com',
   role: 'RECRUITER' as const,
   status: 'ACTIVE' as const,
+  organization: {
+    name: 'TalentLens',
+  },
 };
 
 function createFakeRepository() {
@@ -21,7 +27,10 @@ function createFakeRepository() {
       sessions.set(session.tokenHash, {
         expiresAt: session.expiresAt,
         revokedAt: null,
-        user: { ...user },
+        user: {
+          ...user,
+          organization: { ...user.organization },
+        },
       });
       return true;
     }),
@@ -57,7 +66,7 @@ describe('session service', () => {
     expect(created.expiresAt.getTime()).toBe(now + SESSION_TTL_MS);
   });
 
-  it('allows multiple sessions and validates only the minimal principal', async () => {
+  it('allows multiple sessions and restores the complete authenticated user DTO without credentials', async () => {
     const { repository } = createFakeRepository();
     const service = createSessionService({
       repository,
@@ -72,15 +81,69 @@ describe('session service', () => {
     const second = await service.createSession(user.id);
     const principal = await service.validateSession(first.token);
 
-    const expected: AuthenticatedPrincipal = {
+    const expected: AuthenticatedUserDto = {
       userId: user.id,
       organizationId: user.organizationId,
+      organizationName: user.organization.name,
+      email: user.email,
       role: user.role,
     };
     expect(first.token).not.toBe(second.token);
     expect(principal).toEqual(expected);
-    expect(principal && 'email' in principal).toBe(false);
+    expect(principal && 'passwordHash' in principal).toBe(false);
     expect(principal && 'tokenHash' in principal).toBe(false);
+  });
+
+  it('selects user email and organization display name in the session repository', async () => {
+    const expiresAt = new Date('2026-11-04T07:33:39.684Z');
+    const findUniqueSession = vi.fn(async () => ({
+      expiresAt,
+      revokedAt: null,
+      user: {
+        id: 'user-1',
+        organizationId: 'organization-1',
+        email: 'recruiter@example.com',
+        role: 'RECRUITER' as const,
+        status: 'ACTIVE' as const,
+        organization: {
+          name: 'TalentLens',
+        },
+      },
+    }));
+    const repository = createSessionRepository({
+      user: { findFirst: vi.fn() },
+      session: {
+        create: vi.fn(),
+        findUnique: findUniqueSession,
+        updateMany: vi.fn(),
+      },
+    } as never);
+
+    const record = await repository.findByTokenHash('token-hash-1');
+
+    expect(findUniqueSession).toHaveBeenCalledWith({
+      where: { tokenHash: 'token-hash-1' },
+      select: {
+        expiresAt: true,
+        revokedAt: true,
+        user: {
+          select: {
+            id: true,
+            organizationId: true,
+            email: true,
+            role: true,
+            status: true,
+            organization: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(record?.user.email).toBe('recruiter@example.com');
+    expect(record?.user.organization.name).toBe('TalentLens');
   });
 
   it('rejects unknown, malformed, expired, revoked, and inactive sessions', async () => {

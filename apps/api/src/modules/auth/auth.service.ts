@@ -50,6 +50,7 @@ export function createAuthService(dependencies: AuthServiceDependencies = {}): {
         user: {
           userId: user.id,
           organizationId: user.organizationId,
+          organizationName: user.organizationName,
           email: user.email,
           role: user.role,
         },

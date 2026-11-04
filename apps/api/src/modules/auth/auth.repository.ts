@@ -1,11 +1,14 @@
 import { getDatabaseClient, type PrismaClient } from '@talentlens/database';
 
+import type { UserRole } from './auth.dto.js';
+
 export interface LoginUser {
   id: string;
   organizationId: string;
+  organizationName: string;
   email: string;
   passwordHash: string | null;
-  role: 'RECRUITER' | 'CLIENT_HIRING_MANAGER' | 'DELIVERY_HEAD';
+  role: UserRole;
   status: 'ACTIVE' | 'INVITED' | 'SUSPENDED' | 'DEACTIVATED';
 }
 
@@ -32,6 +35,7 @@ export function createAuthRepository(
         },
         select: {
           id: true,
+          name: true,
         },
       });
 
@@ -39,7 +43,7 @@ export function createAuthRepository(
         return null;
       }
 
-      return database.user.findFirst({
+      const user = await database.user.findFirst({
         where: {
           organizationId: organization.id,
           normalizedEmail,
@@ -53,6 +57,15 @@ export function createAuthRepository(
           status: true,
         },
       });
+
+      if (!user) {
+        return null;
+      }
+
+      return {
+        ...user,
+        organizationName: organization.name,
+      };
     },
   };
 }

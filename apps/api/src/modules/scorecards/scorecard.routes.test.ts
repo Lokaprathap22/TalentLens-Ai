@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
+import type { AuthenticatedUserDto } from '../auth/auth.dto.js';
 import type { SessionService } from '../auth/session.service.js';
 import {
   ScorecardInvalidError,
@@ -13,10 +14,12 @@ import {
 const token = 'B'.repeat(43);
 const requisitionId = '123e4567-e89b-42d3-a456-426614174000';
 const scorecardId = '123e4567-e89b-42d3-a456-426614174001';
-const recruiter = {
+const recruiter: AuthenticatedUserDto = {
   userId: 'recruiter-a',
   organizationId: 'organization-a',
-  role: 'RECRUITER' as const,
+  organizationName: 'Organization A',
+  email: 'recruiter-a@example.com',
+  role: 'RECRUITER',
 };
 const scorecard = {
   id: scorecardId,
@@ -33,8 +36,7 @@ const scorecard = {
 
 function createTestApp(
   options: {
-    principal?:
-      typeof recruiter | { userId: string; organizationId: string; role: 'CLIENT_HIRING_MANAGER' };
+    principal?: AuthenticatedUserDto;
     getError?: Error;
     updateError?: Error;
     approveError?: Error;
@@ -106,6 +108,8 @@ describe('scorecard routes', () => {
       principal: {
         userId: 'client-manager-a',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'client-manager-a@example.com',
         role: 'CLIENT_HIRING_MANAGER',
       },
     });
