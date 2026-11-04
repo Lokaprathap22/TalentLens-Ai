@@ -7,6 +7,8 @@ import { Prisma } from '@talentlens/database';
 import { PrismaClient } from '../../../../../packages/database/dist/generated/prisma/client.js';
 
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
+import { createConsentRepository } from '../consent/consent.repository.js';
+import { hashToken } from '../consent/consent.service.js';
 import { createResumeRepository, type ResumeRepository } from './resume.repository.js';
 import type { ParserResult } from './resume.types.js';
 
@@ -1285,6 +1287,576 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
       });
       const neverClaimed = await repository.claimNextProcessingJob();
       expect(neverClaimed).toBeNull();
+    });
+  });
+
+  describe('Test 8: Requisition-Specific Resume Reuse, Versioning & Identity Safety (F-10) and Composite FK Catalog (F-12)', () => {
+    let fixture: TestFixture;
+    let secondRequisitionId: string;
+
+    beforeAll(async () => {
+      fixture = await createTestFixture(pgClient);
+      const secondReq = await pgClient.requisition.create({
+        data: {
+          organizationId: fixture.organizationId,
+          clientId: fixture.clientId,
+          title: 'Second Requisition — Principal Architect',
+          jdText: 'Principal Architect JD',
+          status: 'OPEN',
+          assignedRecruiterId: fixture.recruiterId,
+          createdById: fixture.recruiterId,
+        },
+      });
+      secondRequisitionId = secondReq.id;
+    });
+
+    afterAll(async () => {
+      if (secondRequisitionId) {
+        await pgClient.auditLog.deleteMany({
+          where: { requisitionId: secondRequisitionId },
+        });
+        await pgClient.processingJob.deleteMany({
+          where: { batch: { requisitionId: secondRequisitionId } },
+        });
+        await pgClient.processingBatch.deleteMany({
+          where: { requisitionId: secondRequisitionId },
+        });
+        await pgClient.consentInvitation.deleteMany({
+          where: { requisitionId: secondRequisitionId },
+        });
+        await pgClient.candidateConsent.deleteMany({
+          where: { requisitionId: secondRequisitionId },
+        });
+        await pgClient.requisition.deleteMany({
+          where: { id: secondRequisitionId },
+        });
+      }
+      await fixture.cleanup(pgClient);
+    });
+
+    it('supports requisition-specific duplicate detection, known-candidate resume reuse across requisitions, version=2 uploads, and prevents silent SHA-256 candidate merging (F-10)', async () => {
+      const shaV1 = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+      const shaV2 = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+
+      // 1. Upload candidate 1 resume to Requisition 1
+      const batch1 = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/cand1-v1.pdf',
+            fileName: 'cand1-v1.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1200,
+            sha256: shaV1,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      const cand1Id = batch1.accepted[0]!.candidateId;
+      const doc1Id = batch1.accepted[0]!.resumeDocumentId;
+
+      // 2. Same-requisition lookup reports Requisition 1 in requisitionIds
+      const lookupAfterReq1 = await repository.findExistingResumeBySha256(
+        fixture.organizationId,
+        shaV1,
+      );
+      expect(lookupAfterReq1?.requisitionIds).toContain(fixture.requisitionId);
+      expect(lookupAfterReq1?.requisitionIds).not.toContain(secondRequisitionId);
+
+      // 3. Reusing known candidate's resume for Requisition 2 reuses the existing ResumeDocument without duplicate storage
+      const reused = await repository.reuseCandidateResumeForRequisition!(
+        fixture.principal,
+        secondRequisitionId,
+        cand1Id,
+      );
+      expect(reused).not.toBeNull();
+      expect(reused?.resumeDocumentId).toBe(doc1Id);
+      expect(reused?.candidateId).toBe(cand1Id);
+      expect(reused?.jobStatus).toBe('HELD_FOR_AUTHORIZATION'); // Requires separate Req 2 consent!
+      expect(reused?.isExisting).toBe(false);
+
+      // Calling reuse again on Requisition 2 is idempotent
+      const reusedAgain = await repository.reuseCandidateResumeForRequisition!(
+        fixture.principal,
+        secondRequisitionId,
+        cand1Id,
+      );
+      expect(reusedAgain?.isExisting).toBe(true);
+      expect(reusedAgain?.jobId).toBe(reused?.jobId);
+
+      // Candidate appears in both Requisition 1 and Requisition 2 resume lists
+      const req1List = await repository.listResumesForRequisition(
+        fixture.organizationId,
+        fixture.recruiterId,
+        fixture.requisitionId,
+      );
+      const req2List = await repository.listResumesForRequisition(
+        fixture.organizationId,
+        fixture.recruiterId,
+        secondRequisitionId,
+      );
+      expect(req1List.some((r) => r.id === doc1Id && r.candidateId === cand1Id)).toBe(true);
+      expect(req2List.some((r) => r.id === doc1Id && r.candidateId === cand1Id)).toBe(true);
+
+      // 4. Known candidate uploads a newer resume version (version = 2)
+      const batchV2 = await repository.createResumeBatch(
+        fixture.principal,
+        secondRequisitionId,
+        [
+          {
+            storageKey: '2026-11/cand1-v2.pdf',
+            fileName: 'cand1-v2.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1500,
+            sha256: shaV2,
+            candidateId: cand1Id,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      const docV2Id = batchV2.accepted[0]!.resumeDocumentId;
+      expect(batchV2.accepted[0]!.candidateId).toBe(cand1Id);
+      const docV2InDb = await pgClient.resumeDocument.findUnique({ where: { id: docV2Id } });
+      expect(docV2InDb?.version).toBe(2);
+
+      // 5. Uncertain identity: uploading an identical SHA-256 to Requisition 2 WITHOUT candidateId creates a distinct candidate (never silently merges!)
+      const batchUnlinked = await repository.createResumeBatch(
+        fixture.principal,
+        secondRequisitionId,
+        [
+          {
+            storageKey: '2026-11/other-cand-same-sha.pdf',
+            fileName: 'other-cand-same-sha.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1200,
+            sha256: shaV1,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      expect(batchUnlinked.accepted[0]!.candidateId).not.toBe(cand1Id);
+    });
+
+    it('verifies live PostgreSQL catalog has composite tenant FKs and candidate_consents composite index (F-12)', async () => {
+      const indexRows = await pgClient.$queryRaw<Array<{ indexname: string }>>`
+        SELECT indexname FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname IN (
+            'candidate_consents_organization_id_candidate_id_requisition_idx',
+            'candidate_consents_id_candidate_org_key',
+            'candidate_submissions_id_req_org_key',
+            'resume_documents_organization_id_candidate_id_sha256_key'
+          )
+      `;
+      const names = indexRows.map((r) => r.indexname);
+      expect(names).toContain('candidate_consents_organization_id_candidate_id_requisition_idx');
+      expect(names).toContain('candidate_consents_id_candidate_org_key');
+      expect(names).toContain('candidate_submissions_id_req_org_key');
+      expect(names).toContain('resume_documents_organization_id_candidate_id_sha256_key');
+
+      const fkRows = await pgClient.$queryRaw<Array<{ conname: string }>>`
+        SELECT conname FROM pg_constraint
+        WHERE conname IN (
+          'consent_withdrawal_requests_consent_id_candidate_id_organi_fkey',
+          'interview_proposals_submission_id_requisition_id_organizat_fkey'
+        )
+      `;
+      const fkNames = fkRows.map((r) => r.conname);
+      expect(fkNames).toContain('consent_withdrawal_requests_consent_id_candidate_id_organi_fkey');
+      expect(fkNames).toContain('interview_proposals_submission_id_requisition_id_organizat_fkey');
+    });
+
+    it('RB-01 (A, B, C, F): already-parsed resume reused before destination consent reuses existing extraction upon consent without redundant extraction or version collision', async () => {
+      const consentRepo = createConsentRepository(pgClient as unknown as PrismaClient);
+      const shaParsed = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+
+      // 1. Upload resume under Requisition A
+      const batchA = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/rb01-parsed.pdf',
+            fileName: 'rb01-parsed.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 2048,
+            sha256: shaParsed,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      const candId = batchA.accepted[0]!.candidateId;
+      const docId = batchA.accepted[0]!.resumeDocumentId;
+
+      // Grant consent for Requisition A and parse the document
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId: candId,
+          requisitionId: fixture.requisitionId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+      await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candId,
+        fixture.recruiterId,
+        fixture.requisitionId,
+      );
+
+      const claimedReqA = await repository.claimNextProcessingJob('worker-rb01-a', 5);
+      expect(claimedReqA).not.toBeNull();
+      expect(claimedReqA?.resumeDocumentId).toBe(docId);
+
+      const originalExtractedText =
+        'Principal Distributed Systems Engineer with 12 years of Go, Rust, and PostgreSQL experience.';
+      const completedA = await repository.completeProcessingJob(
+        claimedReqA!.id,
+        docId,
+        fixture.organizationId,
+        {
+          extractedText: originalExtractedText,
+          pageMapJson: {
+            pageCount: 1,
+            pages: [{ pageNumber: 1, startOffset: 0, endOffset: originalExtractedText.length }],
+          },
+          parser: 'talentlens-pdf-v1',
+          ocrUsed: false,
+          qualityStatus: 'COMPLETE',
+        },
+        claimedReqA!.leaseToken ?? undefined,
+      );
+      expect(completedA).toBe(true);
+
+      const extractionBeforeReuse = await pgClient.documentExtraction.findFirst({
+        where: { resumeDocumentId: docId, organizationId: fixture.organizationId },
+      });
+      expect(extractionBeforeReuse?.version).toBe(1);
+      expect(extractionBeforeReuse?.extractedText).toBe(originalExtractedText);
+
+      // 2. Reuse the already-parsed resume for Requisition B BEFORE Requisition B has consent
+      const reusedB = await repository.reuseCandidateResumeForRequisition!(
+        fixture.principal,
+        secondRequisitionId,
+        candId,
+        docId,
+      );
+      expect(reusedB).not.toBeNull();
+      expect(reusedB?.jobStatus).toBe('HELD_FOR_AUTHORIZATION');
+      expect(reusedB?.parseStatus).toBe('PARSED');
+
+      const batchBBeforeConsent = await pgClient.processingBatch.findUnique({
+        where: { id: reusedB!.batchId },
+      });
+      expect(batchBBeforeConsent?.status).toBe('CREATED');
+
+      // Scenario F: No destination processing occurs before consent
+      const unauthorizedClaim = await repository.claimNextProcessingJob('worker-rb01-unauth', 5);
+      expect(unauthorizedClaim).toBeNull();
+
+      // 3. Candidate accepts consent invitation for Requisition B
+      const rawInviteToken = `rb01-invite-${randomUUID()}`;
+      const inviteTokenHash = hashToken(rawInviteToken);
+      await pgClient.consentInvitation.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId: candId,
+          requisitionId: secondRequisitionId,
+          createdById: fixture.recruiterId,
+          email: `rb01-${candId.slice(0, 8)}@example.com`,
+          tokenHash: inviteTokenHash,
+          purpose: 'HIRING_USE',
+          policyVersion: '2026-11-v1',
+          noticeTextHash: 'a'.repeat(64),
+          status: 'PENDING',
+          expiresAt: new Date(Date.now() + 86_400_000),
+        },
+      });
+
+      const acceptedConsent = await consentRepo.acceptInvitation(
+        inviteTokenHash,
+        ' Candidate RB01 ',
+      );
+      expect(acceptedConsent).not.toBeNull();
+      expect(acceptedConsent?.releasedJobCount).toBe(1);
+
+      // Scenario A: Existing valid extraction is reused; destination job is SUCCEEDED (not QUEUED) and batch is COMPLETED
+      const jobBAfterConsent = await pgClient.processingJob.findUnique({
+        where: { id: reusedB!.jobId },
+      });
+      expect(jobBAfterConsent?.status).toBe('SUCCEEDED');
+      expect(jobBAfterConsent?.finishedAt).not.toBeNull();
+
+      const batchBAfterConsent = await pgClient.processingBatch.findUnique({
+        where: { id: reusedB!.batchId },
+      });
+      expect(batchBAfterConsent?.status).toBe('COMPLETED');
+
+      // No redundant EXTRACT_TEXT job is queued for any worker
+      const redundantClaim = await repository.claimNextProcessingJob('worker-rb01-post', 5);
+      expect(redundantClaim).toBeNull();
+
+      // Calling releaseHeldProcessingJobs again is idempotent
+      const secondRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candId,
+        fixture.recruiterId,
+        secondRequisitionId,
+      );
+      expect(secondRelease.releasedCount).toBe(0);
+
+      // Scenario B & C: No duplicate extraction version is created; existing extraction contents and Requisition A records remain untouched
+      const extractionsAfter = await pgClient.documentExtraction.findMany({
+        where: { resumeDocumentId: docId, organizationId: fixture.organizationId },
+      });
+      expect(extractionsAfter).toHaveLength(1);
+      expect(extractionsAfter[0]!.id).toBe(extractionBeforeReuse!.id);
+      expect(extractionsAfter[0]!.version).toBe(1);
+      expect(extractionsAfter[0]!.extractedText).toBe(originalExtractedText);
+
+      const jobAAfter = await pgClient.processingJob.findUnique({
+        where: { id: claimedReqA!.id },
+      });
+      expect(jobAAfter?.status).toBe('SUCCEEDED');
+
+      // Extraction is retrievable under Requisition B
+      const reqBExtraction = await repository.findLatestExtraction(
+        fixture.organizationId,
+        fixture.recruiterId,
+        secondRequisitionId,
+        docId,
+      );
+      expect(reqBExtraction?.id).toBe(extractionBeforeReuse!.id);
+      expect(reqBExtraction?.extractedText).toBe(originalExtractedText);
+    });
+
+    it('RB-01 (D & E): unparsed documents and documents with missing/inconsistent extractions are queued for normal extraction after consent', async () => {
+      const shaUnparsed = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+      const shaInconsistent = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+
+      // Scenario D: Unparsed document reused before consent -> queued after consent
+      const batchUnparsed = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/rb01-unparsed.pdf',
+            fileName: 'rb01-unparsed.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: shaUnparsed,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      const unparsedCandId = batchUnparsed.accepted[0]!.candidateId;
+      const unparsedDocId = batchUnparsed.accepted[0]!.resumeDocumentId;
+
+      const reusedUnparsed = await repository.reuseCandidateResumeForRequisition!(
+        fixture.principal,
+        secondRequisitionId,
+        unparsedCandId,
+        unparsedDocId,
+      );
+      expect(reusedUnparsed?.jobStatus).toBe('HELD_FOR_AUTHORIZATION');
+
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId: unparsedCandId,
+          requisitionId: secondRequisitionId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+
+      const releasedUnparsed = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        unparsedCandId,
+        fixture.recruiterId,
+        secondRequisitionId,
+      );
+      expect(releasedUnparsed.releasedCount).toBe(1);
+
+      const unparsedJobAfter = await pgClient.processingJob.findUnique({
+        where: { id: reusedUnparsed!.jobId },
+      });
+      expect(unparsedJobAfter?.status).toBe('QUEUED');
+
+      // Scenario E: Inconsistent state where ResumeDocument.parseStatus is 'PARSED' but DocumentExtraction is missing
+      const batchInconsistent = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/rb01-inconsistent.pdf',
+            fileName: 'rb01-inconsistent.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: shaInconsistent,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      const inconsistentCandId = batchInconsistent.accepted[0]!.candidateId;
+      const inconsistentDocId = batchInconsistent.accepted[0]!.resumeDocumentId;
+
+      // Forcibly set parseStatus = 'PARSED' without creating a DocumentExtraction record
+      await pgClient.resumeDocument.update({
+        where: { id: inconsistentDocId },
+        data: { parseStatus: 'PARSED' },
+      });
+
+      const reusedInconsistent = await repository.reuseCandidateResumeForRequisition!(
+        fixture.principal,
+        secondRequisitionId,
+        inconsistentCandId,
+        inconsistentDocId,
+      );
+      expect(reusedInconsistent?.jobStatus).toBe('HELD_FOR_AUTHORIZATION');
+      // Healed from PARSED to PENDING because no extraction record exists!
+      expect(reusedInconsistent?.parseStatus).toBe('PENDING');
+
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId: inconsistentCandId,
+          requisitionId: secondRequisitionId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+
+      const releasedInconsistent = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        inconsistentCandId,
+        fixture.recruiterId,
+        secondRequisitionId,
+      );
+      expect(releasedInconsistent.releasedCount).toBe(1);
+
+      const inconsistentJobAfter = await pgClient.processingJob.findUnique({
+        where: { id: reusedInconsistent!.jobId },
+      });
+      // Must be QUEUED for extraction, NOT falsely marked SUCCEEDED!
+      expect(inconsistentJobAfter?.status).toBe('QUEUED');
+    });
+
+    it('RB-02: concurrent reuse requests (Promise.all) and sequential retries resolve to identical batchId and jobId without duplicate jobs or orphaned batches', async () => {
+      const shaConcurrent = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+
+      // 1. Upload candidate resume under Requisition A
+      const uploadBatch = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/rb02-concurrent.pdf',
+            fileName: 'rb02-concurrent.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1536,
+            sha256: shaConcurrent,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+      const candId = uploadBatch.accepted[0]!.candidateId;
+      const docId = uploadBatch.accepted[0]!.resumeDocumentId;
+
+      const batchesBefore = await pgClient.processingBatch.count({
+        where: {
+          organizationId: fixture.organizationId,
+          requisitionId: secondRequisitionId,
+        },
+      });
+
+      // 2. Execute two simultaneous reuse requests for the exact same (organization, requisition, candidate, resumeDocument)
+      const [resA, resB] = await Promise.all([
+        repository.reuseCandidateResumeForRequisition!(
+          fixture.principal,
+          secondRequisitionId,
+          candId,
+          docId,
+        ),
+        repository.reuseCandidateResumeForRequisition!(
+          fixture.principal,
+          secondRequisitionId,
+          candId,
+          docId,
+        ),
+      ]);
+
+      expect(resA).not.toBeNull();
+      expect(resB).not.toBeNull();
+
+      // Both must resolve to identical batchId and jobId
+      expect(resA!.jobId).toBe(resB!.jobId);
+      expect(resA!.batchId).toBe(resB!.batchId);
+      expect(resA!.resumeDocumentId).toBe(docId);
+      expect(resB!.resumeDocumentId).toBe(docId);
+
+      // Exactly one request created the initial job (isExisting: false) and the other observed it (isExisting: true)
+      expect([resA!.isExisting, resB!.isExisting].sort()).toEqual([false, true]);
+
+      // Verify exactly one ProcessingJob exists for this (requisition, resumeDocument)
+      const jobsInDestReq = await pgClient.processingJob.findMany({
+        where: {
+          organizationId: fixture.organizationId,
+          resumeDocumentId: docId,
+          batch: {
+            requisitionId: secondRequisitionId,
+          },
+        },
+      });
+      expect(jobsInDestReq).toHaveLength(1);
+      expect(jobsInDestReq[0]!.id).toBe(resA!.jobId);
+
+      // Verify exactly one new ProcessingBatch was created and zero orphaned batches exist
+      const batchesAfter = await pgClient.processingBatch.count({
+        where: {
+          organizationId: fixture.organizationId,
+          requisitionId: secondRequisitionId,
+        },
+      });
+      expect(batchesAfter - batchesBefore).toBe(1);
+
+      const orphanedBatches = await pgClient.processingBatch.count({
+        where: {
+          organizationId: fixture.organizationId,
+          requisitionId: secondRequisitionId,
+          jobs: { none: {} },
+        },
+      });
+      expect(orphanedBatches).toBe(0);
+
+      // 3. Sequential retry returns the exact same batchId and jobId
+      const retrySeq = await repository.reuseCandidateResumeForRequisition!(
+        fixture.principal,
+        secondRequisitionId,
+        candId,
+        docId,
+      );
+      expect(retrySeq?.isExisting).toBe(true);
+      expect(retrySeq?.jobId).toBe(resA!.jobId);
+      expect(retrySeq?.batchId).toBe(resA!.batchId);
     });
   });
 });

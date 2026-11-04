@@ -20,6 +20,7 @@ export interface ExistingResumeLookup {
   id: string;
   sha256: string;
   candidateId: string;
+  requisitionIds?: string[] | undefined;
 }
 
 export interface FileToIngest {
@@ -29,6 +30,20 @@ export interface FileToIngest {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
+  candidateId?: string | undefined;
+}
+
+export interface ReusedResumeRecord {
+  batchId: string;
+  jobId: string;
+  jobStatus: string;
+  resumeDocumentId: string;
+  candidateId: string;
+  candidateCode: string;
+  requisitionId: string;
+  version: number;
+  parseStatus: ResumeParseStatus;
+  isExisting: boolean;
 }
 
 export interface CreatedBatchRecord {
@@ -147,6 +162,56 @@ export interface ResumeRepository {
     organizationId: string,
     candidateId: string,
   ): Promise<{ heldCount: number }>;
+
+  recordResumeInspection(
+    organizationId: string,
+    recruiterId: string,
+    requisitionId: string,
+    resumeId: string,
+    candidateId: string,
+  ): Promise<void>;
+
+  reuseCandidateResumeForRequisition?(
+    principal: AuthenticatedPrincipal,
+    requisitionId: string,
+    candidateId: string,
+    resumeDocumentId?: string,
+  ): Promise<ReusedResumeRecord | null>;
+}
+
+function hasConsistentValidExtraction(
+  resume: {
+    id: string;
+    organizationId: string;
+    parseStatus: string;
+    version: number;
+  },
+  latestExtraction:
+    | {
+        id: string;
+        resumeDocumentId: string;
+        organizationId: string;
+        version: number;
+        qualityStatus: string;
+        extractedText: string;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (resume.parseStatus !== 'PARSED') return false;
+  if (!Number.isInteger(resume.version) || resume.version < 1) return false;
+  if (!latestExtraction) return false;
+  if (latestExtraction.resumeDocumentId !== resume.id) return false;
+  if (latestExtraction.organizationId !== resume.organizationId) return false;
+  if (!Number.isInteger(latestExtraction.version) || latestExtraction.version < 1) return false;
+  if (latestExtraction.qualityStatus !== 'COMPLETE') return false;
+  if (
+    typeof latestExtraction.extractedText !== 'string' ||
+    latestExtraction.extractedText.trim().length === 0
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export function createResumeRepository(
@@ -166,16 +231,35 @@ export function createResumeRepository(
     },
 
     async findExistingResumeBySha256(organizationId, sha256) {
-      const record = await database.resumeDocument.findUnique({
+      const record = await database.resumeDocument.findFirst({
         where: {
-          organizationId_sha256: {
-            organizationId,
-            sha256,
+          organizationId,
+          sha256,
+        },
+        orderBy: { uploadedAt: 'asc' },
+        select: {
+          id: true,
+          sha256: true,
+          candidateId: true,
+          processingJobs: {
+            select: {
+              batch: {
+                select: { requisitionId: true },
+              },
+            },
           },
         },
-        select: { id: true, sha256: true, candidateId: true },
       });
-      return record;
+      if (!record) return null;
+      const requisitionIds = Array.from(
+        new Set(record.processingJobs.map((j) => j.batch.requisitionId)),
+      );
+      return {
+        id: record.id,
+        sha256: record.sha256,
+        candidateId: record.candidateId,
+        requisitionIds,
+      };
     },
 
     async createResumeBatch(principal, requisitionId, filesToIngest, auditSummary) {
@@ -193,31 +277,92 @@ export function createResumeRepository(
         const accepted: CreatedBatchRecord['accepted'] = [];
 
         for (const file of filesToIngest) {
-          // 1. Create a distinct candidate placeholder for this document
-          const candidateCode = `CAN-${randomUUID().slice(0, 8).toUpperCase()}`;
-          const candidate = await tx.candidate.create({
-            data: {
-              organizationId: principal.organizationId,
-              candidateCode,
-              recordStatus: 'ACTIVE',
-            },
-          });
+          let candidate: { id: string; candidateCode: string };
+          let resume: { id: string; parseStatus: string };
 
-          // 2. Create the ResumeDocument
-          const resume = await tx.resumeDocument.create({
-            data: {
-              organizationId: principal.organizationId,
-              candidateId: candidate.id,
-              objectKey: file.storageKey,
-              sha256: file.sha256,
-              mimeType: file.mimeType,
-              fileType: file.fileType,
-              sizeBytes: BigInt(file.sizeBytes),
-              version: 1,
-              parseStatus: 'PENDING',
-              uploadedById: principal.userId,
-            },
-          });
+          if (file.candidateId) {
+            const existingCandidate = await tx.candidate.findFirst({
+              where: {
+                id: file.candidateId,
+                organizationId: principal.organizationId,
+              },
+              include: {
+                resumes: {
+                  orderBy: { version: 'desc' },
+                },
+              },
+            });
+
+            if (!existingCandidate) {
+              throw new Error('CANDIDATE_NOT_FOUND');
+            }
+
+            candidate = {
+              id: existingCandidate.id,
+              candidateCode: existingCandidate.candidateCode,
+            };
+
+            const existingSameHash = existingCandidate.resumes.find(
+              (r) => r.sha256 === file.sha256,
+            );
+
+            if (existingSameHash) {
+              resume = {
+                id: existingSameHash.id,
+                parseStatus: existingSameHash.parseStatus,
+              };
+            } else {
+              const nextVersion = (existingCandidate.resumes[0]?.version ?? 0) + 1;
+              const createdResume = await tx.resumeDocument.create({
+                data: {
+                  organizationId: principal.organizationId,
+                  candidateId: candidate.id,
+                  objectKey: file.storageKey,
+                  sha256: file.sha256,
+                  mimeType: file.mimeType,
+                  fileType: file.fileType,
+                  sizeBytes: BigInt(file.sizeBytes),
+                  version: nextVersion,
+                  parseStatus: 'PENDING',
+                  uploadedById: principal.userId,
+                },
+              });
+              resume = {
+                id: createdResume.id,
+                parseStatus: createdResume.parseStatus,
+              };
+            }
+          } else {
+            // 1. Create a distinct candidate placeholder for this document
+            const candidateCode = `CAN-${randomUUID().slice(0, 8).toUpperCase()}`;
+            candidate = await tx.candidate.create({
+              data: {
+                organizationId: principal.organizationId,
+                candidateCode,
+                recordStatus: 'ACTIVE',
+              },
+            });
+
+            // 2. Create the ResumeDocument
+            const createdResume = await tx.resumeDocument.create({
+              data: {
+                organizationId: principal.organizationId,
+                candidateId: candidate.id,
+                objectKey: file.storageKey,
+                sha256: file.sha256,
+                mimeType: file.mimeType,
+                fileType: file.fileType,
+                sizeBytes: BigInt(file.sizeBytes),
+                version: 1,
+                parseStatus: 'PENDING',
+                uploadedById: principal.userId,
+              },
+            });
+            resume = {
+              id: createdResume.id,
+              parseStatus: createdResume.parseStatus,
+            };
+          }
 
           // 3. Create the ProcessingJob (held for authorization unless genuine active consent exists)
           const activeConsent = await tx.candidateConsent.findFirst({
@@ -233,7 +378,11 @@ export function createResumeRepository(
             select: { id: true },
           });
 
-          const initialJobStatus = activeConsent ? 'QUEUED' : 'HELD_FOR_AUTHORIZATION';
+          const initialJobStatus = activeConsent
+            ? resume.parseStatus === 'PARSED'
+              ? 'SUCCEEDED'
+              : 'QUEUED'
+            : 'HELD_FOR_AUTHORIZATION';
 
           await tx.processingJob.create({
             data: {
@@ -243,6 +392,7 @@ export function createResumeRepository(
               jobType: 'EXTRACT_TEXT',
               status: initialJobStatus,
               attempts: 0,
+              ...(initialJobStatus === 'SUCCEEDED' ? { finishedAt: new Date() } : {}),
             },
           });
 
@@ -447,15 +597,15 @@ export function createResumeRepository(
                 pj.status = 'RETRYABLE_FAILURE'
                 AND pj.attempts < 3
                 AND (
-                  (pj.attempts = 1 AND pj.updated_at + INTERVAL '30 seconds' <= NOW())
+                  (pj.attempts = 1 AND pj.updated_at + INTERVAL '30 seconds' <= clock_timestamp())
                   OR
-                  (pj.attempts = 2 AND pj.updated_at + INTERVAL '120 seconds' <= NOW())
+                  (pj.attempts = 2 AND pj.updated_at + INTERVAL '120 seconds' <= clock_timestamp())
                 )
               )
               OR (
                 pj.status = 'PROCESSING'
                 AND pj.lease_expires_at IS NOT NULL
-                AND pj.lease_expires_at <= NOW()
+                AND pj.lease_expires_at <= clock_timestamp()
               )
             )
             ORDER BY pj.created_at ASC
@@ -550,7 +700,7 @@ export function createResumeRepository(
               attempts = attempts + 1,
               locked_by = ${workerId},
               lease_token = ${leaseToken}::uuid,
-              lease_expires_at = NOW() + (${leaseDurationMinutes} * INTERVAL '1 minute'),
+              lease_expires_at = clock_timestamp() + (${leaseDurationMinutes} * INTERVAL '1 minute'),
               started_at = NOW(),
               updated_at = NOW()
           WHERE id = ${candidateJob.id}::uuid
@@ -601,13 +751,13 @@ export function createResumeRepository(
     async renewJobLease(jobId, leaseToken, extensionMinutes = 5) {
       const updated = await database.$executeRaw(Prisma.sql`
         UPDATE "processing_jobs"
-        SET lease_expires_at = NOW() + (${extensionMinutes} * INTERVAL '1 minute'),
+        SET lease_expires_at = clock_timestamp() + (${extensionMinutes} * INTERVAL '1 minute'),
             updated_at = NOW()
         WHERE id = ${jobId}::uuid
           AND status = 'PROCESSING'
           AND lease_token = ${leaseToken}::uuid
           AND lease_expires_at IS NOT NULL
-          AND lease_expires_at > NOW()
+          AND lease_expires_at > clock_timestamp()
       `);
       return updated > 0;
     },
@@ -617,7 +767,7 @@ export function createResumeRepository(
         // 1. Re-verify active authorization
         const job = await tx.processingJob.findUnique({
           where: { id: jobId },
-          select: { batch: { select: { requisitionId: true } } },
+          select: { batchId: true, batch: { select: { requisitionId: true } } },
         });
 
         if (!job?.batch?.requisitionId) {
@@ -653,7 +803,10 @@ export function createResumeRepository(
                   lease_token = NULL,
                   updated_at = NOW()
               WHERE id = ${jobId}::uuid
+                AND status = 'PROCESSING'
                 AND lease_token = ${leaseToken}::uuid
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at > clock_timestamp()
             `);
           }
           return false;
@@ -662,6 +815,19 @@ export function createResumeRepository(
         // 2. Fenced update conditional on current lease owner and unexpired lease
         let updatedCount: number;
         if (leaseToken) {
+          const leaseLock = await tx.$executeRaw(Prisma.sql`
+            SELECT id FROM "processing_jobs"
+            WHERE id = ${jobId}::uuid
+              AND status = 'PROCESSING'
+              AND lease_token = ${leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > clock_timestamp()
+            FOR UPDATE
+          `);
+          if (leaseLock === 0) {
+            return false;
+          }
+
           updatedCount = await tx.$executeRaw(Prisma.sql`
             UPDATE "processing_jobs"
             SET status = 'SUCCEEDED',
@@ -674,7 +840,7 @@ export function createResumeRepository(
               AND status = 'PROCESSING'
               AND lease_token = ${leaseToken}::uuid
               AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > NOW()
+              AND lease_expires_at > clock_timestamp()
           `);
         } else {
           const existingJob = await tx.processingJob.findUnique({
@@ -698,38 +864,83 @@ export function createResumeRepository(
           return false;
         }
 
-        // 3. Persist extraction and update resume parseStatus
-        const latest = await tx.documentExtraction.aggregate({
-          where: { resumeDocumentId, organizationId },
-          _max: { version: true },
-        });
-
-        const nextVersion = (latest._max.version ?? 0) + 1;
-
-        await tx.documentExtraction.create({
-          data: {
-            organizationId,
-            resumeDocumentId,
-            version: nextVersion,
-            extractedText: result.extractedText,
-            pageMapJson: result.pageMapJson as Prisma.InputJsonValue,
-            parser: result.parser,
-            ocrUsed: result.ocrUsed,
-            qualityStatus: result.qualityStatus,
+        // 3. Check whether a consistent valid extraction already exists for this document
+        const existingDoc = await tx.resumeDocument.findFirst({
+          where: { id: resumeDocumentId, organizationId },
+          select: {
+            id: true,
+            organizationId: true,
+            parseStatus: true,
+            version: true,
+            extractions: {
+              where: { organizationId },
+              orderBy: { version: 'desc' },
+              take: 1,
+              select: {
+                id: true,
+                resumeDocumentId: true,
+                organizationId: true,
+                version: true,
+                qualityStatus: true,
+                extractedText: true,
+              },
+            },
           },
         });
 
-        const targetParseStatus: ResumeParseStatus =
-          result.qualityStatus === 'COMPLETE'
-            ? 'PARSED'
-            : result.qualityStatus === 'NEEDS_REVIEW'
-              ? 'NEEDS_REVIEW'
-              : 'FAILED';
+        const alreadyValidlyParsed = existingDoc
+          ? hasConsistentValidExtraction(existingDoc, existingDoc.extractions[0])
+          : false;
 
-        await tx.resumeDocument.update({
-          where: { id: resumeDocumentId },
-          data: { parseStatus: targetParseStatus },
-        });
+        if (!alreadyValidlyParsed) {
+          const latest = await tx.documentExtraction.aggregate({
+            where: { resumeDocumentId, organizationId },
+            _max: { version: true },
+          });
+
+          const nextVersion = (latest._max.version ?? 0) + 1;
+
+          await tx.documentExtraction.create({
+            data: {
+              organizationId,
+              resumeDocumentId,
+              version: nextVersion,
+              extractedText: result.extractedText,
+              pageMapJson: result.pageMapJson as Prisma.InputJsonValue,
+              parser: result.parser,
+              ocrUsed: result.ocrUsed,
+              qualityStatus: result.qualityStatus,
+            },
+          });
+
+          const targetParseStatus: ResumeParseStatus =
+            result.qualityStatus === 'COMPLETE'
+              ? 'PARSED'
+              : result.qualityStatus === 'NEEDS_REVIEW'
+                ? 'NEEDS_REVIEW'
+                : 'FAILED';
+
+          await tx.resumeDocument.update({
+            where: { id: resumeDocumentId },
+            data: { parseStatus: targetParseStatus },
+          });
+        }
+
+        if (job.batchId) {
+          const remainingInBatch = await tx.processingJob.count({
+            where: {
+              batchId: job.batchId,
+              organizationId,
+              status: { not: 'SUCCEEDED' },
+            },
+          });
+          if (remainingInBatch === 0) {
+            await tx.processingBatch.updateMany({
+              where: { id: job.batchId, organizationId, status: { not: 'COMPLETED' } },
+              data: { status: 'COMPLETED' },
+            });
+          }
+        }
 
         return true;
       });
@@ -748,6 +959,19 @@ export function createResumeRepository(
 
         let updatedCount: number;
         if (leaseToken) {
+          const leaseLock = await tx.$executeRaw(Prisma.sql`
+            SELECT id FROM "processing_jobs"
+            WHERE id = ${jobId}::uuid
+              AND status = 'PROCESSING'
+              AND lease_token = ${leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > clock_timestamp()
+            FOR UPDATE
+          `);
+          if (leaseLock === 0) {
+            return false;
+          }
+
           updatedCount = await tx.$executeRaw(Prisma.sql`
             UPDATE "processing_jobs"
             SET status = ${nextStatus}::"ProcessingJobStatus",
@@ -761,7 +985,7 @@ export function createResumeRepository(
               AND status = 'PROCESSING'
               AND lease_token = ${leaseToken}::uuid
               AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > NOW()
+              AND lease_expires_at > clock_timestamp()
           `);
         } else {
           const res = await tx.processingJob.updateMany({
@@ -838,7 +1062,28 @@ export function createResumeRepository(
           },
           include: {
             batch: {
-              select: { requisitionId: true },
+              select: { id: true, requisitionId: true },
+            },
+            resumeDocument: {
+              select: {
+                id: true,
+                organizationId: true,
+                parseStatus: true,
+                version: true,
+                extractions: {
+                  where: { organizationId },
+                  orderBy: { version: 'desc' },
+                  take: 1,
+                  select: {
+                    id: true,
+                    resumeDocumentId: true,
+                    organizationId: true,
+                    version: true,
+                    qualityStatus: true,
+                    extractedText: true,
+                  },
+                },
+              },
             },
           },
         });
@@ -869,24 +1114,98 @@ export function createResumeRepository(
           }
         }
 
-        const updated = await tx.processingJob.updateMany({
-          where: {
-            organizationId,
-            status: 'HELD_FOR_AUTHORIZATION',
-            batch: {
-              requisitionId: { in: authorizedRequisitionIds },
-            },
-            resumeDocument: {
-              candidateId,
+        const authorizedSet = new Set(authorizedRequisitionIds);
+        const authorizedHeldJobs = heldJobs.filter((j) => authorizedSet.has(j.batch.requisitionId));
+
+        const alreadyParsedJobIds: string[] = [];
+        const alreadyParsedBatchIds = new Set<string>();
+        const jobsToQueueIds: string[] = [];
+        const inconsistentResumeIds = new Set<string>();
+
+        for (const job of authorizedHeldJobs) {
+          if (job.jobType === 'EXTRACT_TEXT' && job.resumeDocument) {
+            const latestExtraction = job.resumeDocument.extractions[0];
+            const isValid = hasConsistentValidExtraction(job.resumeDocument, latestExtraction);
+            if (isValid) {
+              alreadyParsedJobIds.push(job.id);
+              alreadyParsedBatchIds.add(job.batchId);
+            } else {
+              if (job.resumeDocument.parseStatus === 'PARSED') {
+                inconsistentResumeIds.add(job.resumeDocument.id);
+              }
+              jobsToQueueIds.push(job.id);
+            }
+          } else {
+            jobsToQueueIds.push(job.id);
+          }
+        }
+
+        if (inconsistentResumeIds.size > 0) {
+          await tx.resumeDocument.updateMany({
+            where: {
+              id: { in: Array.from(inconsistentResumeIds) },
               organizationId,
             },
-          },
-          data: {
-            status: 'QUEUED',
-          },
-        });
+            data: {
+              parseStatus: 'PENDING',
+            },
+          });
+        }
 
-        if (updated.count > 0) {
+        let totalReleasedCount = 0;
+
+        if (alreadyParsedJobIds.length > 0) {
+          const completedRes = await tx.processingJob.updateMany({
+            where: {
+              id: { in: alreadyParsedJobIds },
+              organizationId,
+              status: 'HELD_FOR_AUTHORIZATION',
+            },
+            data: {
+              status: 'SUCCEEDED',
+              finishedAt: new Date(),
+              leaseExpiresAt: null,
+              lockedBy: null,
+              leaseToken: null,
+            },
+          });
+          totalReleasedCount += completedRes.count;
+
+          for (const batchId of alreadyParsedBatchIds) {
+            const remaining = await tx.processingJob.count({
+              where: {
+                batchId,
+                organizationId,
+                status: { not: 'SUCCEEDED' },
+              },
+            });
+            if (remaining === 0) {
+              await tx.processingBatch.updateMany({
+                where: { id: batchId, organizationId, status: { not: 'COMPLETED' } },
+                data: { status: 'COMPLETED' },
+              });
+            }
+          }
+        }
+
+        if (jobsToQueueIds.length > 0) {
+          const queuedRes = await tx.processingJob.updateMany({
+            where: {
+              id: { in: jobsToQueueIds },
+              organizationId,
+              status: 'HELD_FOR_AUTHORIZATION',
+            },
+            data: {
+              status: 'QUEUED',
+              leaseExpiresAt: null,
+              lockedBy: null,
+              leaseToken: null,
+            },
+          });
+          totalReleasedCount += queuedRes.count;
+        }
+
+        if (totalReleasedCount > 0) {
           await tx.auditLog.create({
             data: {
               organizationId,
@@ -894,7 +1213,9 @@ export function createResumeRepository(
               resourceType: 'Candidate',
               resourceId: candidateId,
               metadataJson: {
-                releasedCount: updated.count,
+                releasedCount: totalReleasedCount,
+                reusedCompletedCount: alreadyParsedJobIds.length,
+                queuedCount: jobsToQueueIds.length,
                 consentIds: activeConsents.map((c) => c.id),
                 requisitionIds: authorizedRequisitionIds,
                 recruiterId: recruiterId ?? null,
@@ -903,7 +1224,7 @@ export function createResumeRepository(
           });
         }
 
-        return { releasedCount: updated.count };
+        return { releasedCount: totalReleasedCount };
       });
     },
 
@@ -928,6 +1249,266 @@ export function createResumeRepository(
 
         return { heldCount: updated.count };
       });
+    },
+
+    async recordResumeInspection(
+      organizationId,
+      recruiterId,
+      requisitionId,
+      resumeId,
+      candidateId,
+    ) {
+      await database.auditLog.create({
+        data: {
+          organizationId,
+          actorId: recruiterId,
+          action: 'ORIGINAL_RESUME_INSPECTED',
+          resourceType: 'ResumeDocument',
+          resourceId: resumeId,
+          requisitionId,
+          candidateId,
+          metadataJson: {
+            resumeDocumentId: resumeId,
+            inspectedAt: new Date().toISOString(),
+          },
+        },
+      });
+    },
+
+    async reuseCandidateResumeForRequisition(
+      principal,
+      requisitionId,
+      candidateId,
+      resumeDocumentId,
+    ) {
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          return await database.$transaction(async (tx) => {
+            const req = await tx.requisition.findFirst({
+              where: {
+                id: requisitionId,
+                organizationId: principal.organizationId,
+                assignedRecruiterId: principal.userId,
+              },
+              select: { id: true },
+            });
+            if (!req) return null;
+
+            // Acquire transaction-scoped row lock on the candidate's target ResumeDocument (and Candidate)
+            // so concurrent reuse requests for the same scope serialize before checking or creating a batch/job.
+            const lockedRows = resumeDocumentId
+              ? await tx.$queryRaw<
+                  Array<{
+                    id: string;
+                    organization_id: string;
+                    candidate_id: string;
+                    version: number;
+                    parse_status: string;
+                    candidate_code: string;
+                  }>
+                >(Prisma.sql`
+                  SELECT
+                    rd.id,
+                    rd.organization_id,
+                    rd.candidate_id,
+                    rd.version,
+                    rd.parse_status::text AS parse_status,
+                    c.candidate_code
+                  FROM "resume_documents" rd
+                  JOIN "candidates" c
+                    ON c.id = rd.candidate_id
+                   AND c.organization_id = rd.organization_id
+                  WHERE rd.id = ${resumeDocumentId}::uuid
+                    AND rd.candidate_id = ${candidateId}::uuid
+                    AND rd.organization_id = ${principal.organizationId}::uuid
+                  LIMIT 1
+                  FOR UPDATE OF rd, c
+                `)
+              : await tx.$queryRaw<
+                  Array<{
+                    id: string;
+                    organization_id: string;
+                    candidate_id: string;
+                    version: number;
+                    parse_status: string;
+                    candidate_code: string;
+                  }>
+                >(Prisma.sql`
+                  SELECT
+                    rd.id,
+                    rd.organization_id,
+                    rd.candidate_id,
+                    rd.version,
+                    rd.parse_status::text AS parse_status,
+                    c.candidate_code
+                  FROM "resume_documents" rd
+                  JOIN "candidates" c
+                    ON c.id = rd.candidate_id
+                   AND c.organization_id = rd.organization_id
+                  WHERE rd.candidate_id = ${candidateId}::uuid
+                    AND rd.organization_id = ${principal.organizationId}::uuid
+                  ORDER BY rd.version DESC
+                  LIMIT 1
+                  FOR UPDATE OF rd, c
+                `);
+
+            const locked = lockedRows[0];
+            if (!locked) return null;
+
+            const candidate = {
+              id: locked.candidate_id,
+              candidateCode: locked.candidate_code,
+            };
+            const resume = {
+              id: locked.id,
+              organizationId: locked.organization_id,
+              version: Number(locked.version),
+              parseStatus: locked.parse_status as ResumeParseStatus,
+            };
+
+            const latestExtraction = await tx.documentExtraction.findFirst({
+              where: {
+                resumeDocumentId: resume.id,
+                organizationId: principal.organizationId,
+              },
+              orderBy: { version: 'desc' },
+              select: {
+                id: true,
+                resumeDocumentId: true,
+                organizationId: true,
+                version: true,
+                qualityStatus: true,
+                extractedText: true,
+              },
+            });
+
+            const isValidlyParsed = hasConsistentValidExtraction(resume, latestExtraction);
+            let effectiveParseStatus = resume.parseStatus;
+
+            if (!isValidlyParsed && resume.parseStatus === 'PARSED') {
+              await tx.resumeDocument.update({
+                where: { id: resume.id },
+                data: { parseStatus: 'PENDING' },
+              });
+              effectiveParseStatus = 'PENDING';
+            }
+
+            const existingJob = await tx.processingJob.findFirst({
+              where: {
+                organizationId: principal.organizationId,
+                resumeDocumentId: resume.id,
+                batch: {
+                  requisitionId,
+                  organizationId: principal.organizationId,
+                },
+              },
+              orderBy: { createdAt: 'desc' },
+              select: { id: true, batchId: true, status: true },
+            });
+
+            if (existingJob) {
+              return {
+                batchId: existingJob.batchId,
+                jobId: existingJob.id,
+                jobStatus: existingJob.status,
+                resumeDocumentId: resume.id,
+                candidateId: candidate.id,
+                candidateCode: candidate.candidateCode,
+                requisitionId,
+                version: resume.version,
+                parseStatus: effectiveParseStatus,
+                isExisting: true,
+              };
+            }
+
+            const activeConsent = await tx.candidateConsent.findFirst({
+              where: {
+                organizationId: principal.organizationId,
+                candidateId: candidate.id,
+                requisitionId,
+                purpose: 'HIRING_USE',
+                status: 'ACTIVE',
+                withdrawnAt: null,
+                policyVersion: { not: '' },
+              },
+              select: { id: true },
+            });
+
+            const initialJobStatus = activeConsent
+              ? isValidlyParsed
+                ? 'SUCCEEDED'
+                : 'QUEUED'
+              : 'HELD_FOR_AUTHORIZATION';
+
+            const batch = await tx.processingBatch.create({
+              data: {
+                organizationId: principal.organizationId,
+                requisitionId,
+                createdById: principal.userId,
+                totalFiles: 1,
+                status: initialJobStatus === 'SUCCEEDED' ? 'COMPLETED' : 'CREATED',
+              },
+            });
+
+            const job = await tx.processingJob.create({
+              data: {
+                batchId: batch.id,
+                organizationId: principal.organizationId,
+                resumeDocumentId: resume.id,
+                jobType: 'EXTRACT_TEXT',
+                status: initialJobStatus,
+                attempts: 0,
+                ...(initialJobStatus === 'SUCCEEDED' ? { finishedAt: new Date() } : {}),
+              },
+            });
+
+            await tx.auditLog.create({
+              data: {
+                organizationId: principal.organizationId,
+                actorId: principal.userId,
+                action: 'CANDIDATE_RESUME_REUSED_FOR_REQUISITION',
+                resourceType: 'ResumeDocument',
+                resourceId: resume.id,
+                requisitionId,
+                candidateId: candidate.id,
+                metadataJson: {
+                  resumeDocumentId: resume.id,
+                  version: resume.version,
+                  batchId: batch.id,
+                  jobId: job.id,
+                  jobStatus: job.status,
+                },
+              },
+            });
+
+            return {
+              batchId: batch.id,
+              jobId: job.id,
+              jobStatus: job.status,
+              resumeDocumentId: resume.id,
+              candidateId: candidate.id,
+              candidateCode: candidate.candidateCode,
+              requisitionId,
+              version: resume.version,
+              parseStatus: effectiveParseStatus,
+              isExisting: false,
+            };
+          });
+        } catch (err: unknown) {
+          const isSerializationConflict =
+            (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034') ||
+            (err instanceof Error &&
+              (err.message.includes('40001') ||
+                err.message.includes('40P01') ||
+                err.message.includes('could not serialize access')));
+          if (isSerializationConflict && attempt < maxAttempts) {
+            continue;
+          }
+          throw err;
+        }
+      }
+      return null;
     },
   };
 }

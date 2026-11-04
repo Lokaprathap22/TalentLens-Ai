@@ -1,5 +1,6 @@
 import type { ProcessingJobStatus } from '@talentlens/database';
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
+import { validateScorecardCriterionWeights } from './assessment.scoring.js';
 import type { AssessmentJobDto, CandidateAssessmentDto } from './assessment.types.js';
 import type { AssessmentRepository } from './assessment.repository.js';
 
@@ -99,23 +100,9 @@ export function createAssessmentService(repository: AssessmentRepository): Asses
       }
 
       // Validate approved scorecard criterion weights before enqueueing
-      let totalActiveWeight = 0;
-      for (const criterion of context.criteria) {
-        if (
-          typeof criterion.weight !== 'number' ||
-          !Number.isFinite(criterion.weight) ||
-          criterion.weight <= 0
-        ) {
-          throw new AssessmentScorecardInvalidWeightsError(
-            `Approved scorecard criterion "${criterion.label}" has an invalid weight (${criterion.weight}). Weights must be finite and strictly positive.`,
-          );
-        }
-        totalActiveWeight += criterion.weight;
-      }
-      if (!Number.isFinite(totalActiveWeight) || totalActiveWeight <= 0) {
-        throw new AssessmentScorecardInvalidWeightsError(
-          'Total active scorecard weight must be finite and strictly positive.',
-        );
+      const weightValidation = validateScorecardCriterionWeights(context.criteria);
+      if (!weightValidation.valid) {
+        throw new AssessmentScorecardInvalidWeightsError(weightValidation.reason);
       }
 
       // 2. Idempotency Check: Already completed assessment for this exact scorecard version?

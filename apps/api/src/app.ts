@@ -25,6 +25,10 @@ import {
   createAssessmentRouter,
   type AssessmentRouterDependencies,
 } from './modules/assessments/assessment.routes.js';
+import {
+  createWorkflowRouter,
+  type WorkflowRouterDependencies,
+} from './modules/workflow/workflow.routes.js';
 
 export interface AppDependencies {
   databaseHealthChecker?: DatabaseHealthChecker;
@@ -34,6 +38,7 @@ export interface AppDependencies {
   resumes?: ResumeRouterDependencies;
   consent?: ConsentRouterDependencies;
   assessments?: AssessmentRouterDependencies;
+  workflow?: WorkflowRouterDependencies;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -60,6 +65,9 @@ export function createApp(dependencies: AppDependencies = {}): Express {
   }
   if (dependencies.assessments) {
     app.use('/api/v1', createAssessmentRouter(dependencies.assessments));
+  }
+  if (dependencies.workflow) {
+    app.use('/api/v1', createWorkflowRouter(dependencies.workflow));
   }
 
   app.get('/api/v1/health', (_request, response) => {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PrismaClient } from '@talentlens/database';
+import { createAssessmentProvider } from './assessment.js';
 import { WorkerJobProcessor } from './processor.js';
 import type { WorkerStorageService } from './storage.js';
 
@@ -964,6 +965,596 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
       expect(processed).toBe(true);
       expect(txCount).toBe(2);
       expect(mockTx2.$executeRaw).toHaveBeenCalled();
+    });
+
+    it('uses the shared OpenAI-compatible provider when ASSESSMENT_PROVIDER="openai" is configured (F-01)', async () => {
+      const critId = '123e4567-e89b-42d3-a456-426614174000';
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    criteria: [
+                      {
+                        criterionId: critId,
+                        status: 'MATCH',
+                        score: 0.9,
+                        explanation: 'Verified TypeScript in resume',
+                        evidenceQuotes: ['TypeScript'],
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+            usage: { prompt_tokens: 100, completion_tokens: 40, total_tokens: 140 },
+          }),
+      });
+
+      const prevEnv = { ...process.env };
+      try {
+        process.env['NODE_ENV'] = 'development';
+        process.env['ASSESSMENT_PROVIDER'] = 'openai';
+        process.env['ASSESSMENT_OPENAI_API_KEY'] = 'sk-worker-test';
+        process.env['ASSESSMENT_OPENAI_MODEL'] = 'gpt-4o-mini';
+
+        const provider = createAssessmentProvider({
+          fetch: mockFetch as unknown as typeof globalThis.fetch,
+        });
+        const processor = new WorkerJobProcessor({} as PrismaClient, {} as WorkerStorageService, {
+          heartbeatIntervalMs: 0,
+          assessmentProvider: provider,
+        });
+
+        const output = await processor.assessmentProvider.assess({
+          jobTitle: 'Backend Engineer',
+          criteria: [
+            {
+              id: critId,
+              key: 'ts',
+              label: 'TypeScript',
+              category: 'Technical',
+              requirementType: 'MUST_HAVE',
+              weight: 100,
+            },
+          ],
+          resumeText: 'Experienced in TypeScript.',
+        });
+
+        expect(output.model).toBe('gpt-4o-mini');
+        expect(output.criteria[0]?.score).toBe(0.9);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      } finally {
+        process.env = prevEnv;
+      }
+    });
+
+    it('RB-03 (A, B, C): redacts confirmed candidate name and candidate code from active requisition-specific consent before provider execution and blocks execution when pre-provider consent is missing', async () => {
+      const mockJob = {
+        id: 'assess-job-redact-1',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-redact-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const mockClaimedRecord = {
+        id: 'assess-job-redact-1',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-redact-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: { requisitionId: 'req-1' },
+        resumeDocument: {
+          id: 'doc-redact-1',
+          candidateId: 'cand-redact-1',
+          objectKey: '2026-11/alexandra.pdf',
+          fileType: 'PDF' as const,
+          organizationId: 'org-1',
+        },
+      };
+
+      let txCount = 0;
+      const mockTx1 = {
+        $queryRaw: vi.fn(async () => [mockJob]),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-req-1',
+            candidateId: 'cand-redact-1',
+            confirmationName: 'Alexandra Vance-Sterling',
+            noticeTextHash: 'hash-1',
+            candidate: {
+              id: 'cand-redact-1',
+              candidateCode: 'CAN-998877',
+              profiles: [{ location: '742 Evergreen Terrace' }],
+            },
+          })),
+        },
+        $executeRaw: vi.fn(async () => 1),
+        processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+      };
+
+      const mockTx2 = {
+        $queryRaw: vi.fn(async () => [{ id: 'assess-job-redact-1' }]),
+        $executeRaw: vi.fn(async () => 1),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-req-1',
+            candidateId: 'cand-redact-1',
+            noticeTextHash: 'hash-1',
+          })),
+        },
+        candidateAssessment: { upsert: vi.fn(async () => ({ id: 'cand-assess-redact-1' })) },
+        assessmentText: {
+          findFirst: vi.fn(async () => null),
+          create: vi.fn(async () => ({ id: 'assess-text-redact-1' })),
+        },
+        criterionAssessment: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'crit-assess-1' })),
+        },
+        evidenceSnippet: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'snip-1' })),
+        },
+        auditLog: { create: vi.fn(async () => ({ id: 'audit-1' })) },
+      };
+
+      const rawUnredactedResume =
+        'Alexandra Vance-Sterling (Candidate ID: CAN-998877) | Email: alexandra@example.com | Phone: (415) 555-0199 | Address: 742 Evergreen Terrace | DOB: 1990-05-14 | Senior Engineer with 8 years of TypeScript experience.';
+
+      const mockDb = {
+        $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+          txCount += 1;
+          if (txCount === 1) return cb(mockTx1);
+          return cb(mockTx2);
+        }),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-req-1',
+            candidateId: 'cand-redact-1',
+            confirmationName: 'Alexandra Vance-Sterling',
+            noticeTextHash: 'hash-1',
+            candidate: {
+              id: 'cand-redact-1',
+              candidateCode: 'CAN-998877',
+              profiles: [{ location: '742 Evergreen Terrace' }],
+            },
+          })),
+        },
+        documentExtraction: {
+          findFirst: vi.fn(async () => ({
+            id: 'ext-redact-1',
+            extractedText: rawUnredactedResume,
+            pageMapJson: [{ pageNumber: 1, startOffset: 0, endOffset: rawUnredactedResume.length }],
+          })),
+        },
+        scorecardVersion: {
+          findFirst: vi.fn(async () => ({
+            id: 'scorecard-v1',
+            requisition: { title: 'Senior Backend Engineer' },
+            criteria: [
+              {
+                id: 'crit-ts',
+                key: 'typescript',
+                label: 'TypeScript',
+                category: 'EXPERIENCE',
+                requirementType: 'MUST_HAVE',
+                weight: 1.0,
+                active: true,
+                displayOrder: 1,
+              },
+            ],
+          })),
+        },
+      } as unknown as PrismaClient;
+
+      let capturedProviderResumeText = '';
+      const mockProvider = {
+        assess: vi.fn(async (input: { resumeText: string }) => {
+          capturedProviderResumeText = input.resumeText;
+          return {
+            model: 'test-model',
+            promptVersion: '2026-11-assessment-v1',
+            inputHash: 'in-1',
+            outputHash: 'out-1',
+            criteria: [
+              {
+                criterionId: 'crit-ts',
+                status: 'MATCH' as const,
+                score: 1.0,
+                explanation: 'Verified TypeScript experience.',
+                evidenceQuotes: ['8 years of TypeScript experience'],
+              },
+            ],
+          };
+        }),
+      };
+
+      const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+        workerId: 'worker-rb03-1',
+        heartbeatIntervalMs: 0,
+        assessmentProvider: mockProvider,
+      });
+
+      const processed = await processor.processNextJob();
+      expect(processed).toBe(true);
+      expect(mockProvider.assess).toHaveBeenCalledTimes(1);
+
+      // Verify NO unredacted candidate name, code, email, phone, address, or DOB entered provider input
+      expect(capturedProviderResumeText).not.toContain('Alexandra');
+      expect(capturedProviderResumeText).not.toContain('Vance-Sterling');
+      expect(capturedProviderResumeText).not.toContain('CAN-998877');
+      expect(capturedProviderResumeText).not.toContain('alexandra@example.com');
+      expect(capturedProviderResumeText).not.toContain('555-0199');
+      expect(capturedProviderResumeText).not.toContain('742 Evergreen Terrace');
+      expect(capturedProviderResumeText).not.toContain('1990-05-14');
+      // Technical evidence remains intact
+      expect(capturedProviderResumeText).toContain('8 years of TypeScript experience');
+    });
+
+    it('RB-03 (C): blocks provider execution and holds job if requisition-specific consent is revoked before provider call', async () => {
+      const mockJob = {
+        id: 'assess-job-pre-revoke',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const mockClaimedRecord = {
+        id: 'assess-job-pre-revoke',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: { requisitionId: 'req-1' },
+        resumeDocument: {
+          id: 'doc-1',
+          candidateId: 'cand-1',
+          objectKey: '2026-11/test.pdf',
+          fileType: 'PDF' as const,
+          organizationId: 'org-1',
+        },
+      };
+
+      let txCount = 0;
+      const mockTx1 = {
+        $queryRaw: vi.fn(async () => [mockJob]),
+        candidateConsent: { findFirst: vi.fn(async () => ({ id: 'consent-1' })) },
+        $executeRaw: vi.fn(async () => 1),
+        processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+      };
+
+      const mockHoldTx = {
+        $executeRaw: vi.fn(async () => 1),
+      };
+
+      const mockDb = {
+        $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+          txCount += 1;
+          if (txCount === 1) return cb(mockTx1);
+          return cb(mockHoldTx);
+        }),
+        candidateConsent: {
+          // Consent was withdrawn right after claim and before provider execution!
+          findFirst: vi.fn(async () => null),
+        },
+        documentExtraction: {
+          findFirst: vi.fn(async () => ({
+            id: 'ext-1',
+            extractedText: 'Senior Engineer with TypeScript experience.',
+            pageMapJson: [],
+          })),
+        },
+        scorecardVersion: {
+          findFirst: vi.fn(async () => ({
+            id: 'scorecard-v1',
+            requisition: { title: 'Backend Engineer' },
+            criteria: [
+              {
+                id: 'crit-ts',
+                key: 'ts',
+                label: 'TS',
+                category: 'EXPERIENCE',
+                requirementType: 'MUST_HAVE',
+                weight: 1.0,
+                active: true,
+              },
+            ],
+          })),
+        },
+      } as unknown as PrismaClient;
+
+      const mockProvider = {
+        assess: vi.fn(),
+      };
+
+      const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+        workerId: 'worker-rb03-pre',
+        heartbeatIntervalMs: 0,
+        assessmentProvider: mockProvider,
+      });
+
+      const processed = await processor.processNextJob();
+      expect(processed).toBe(true);
+      // Provider must NOT be called when pre-execution consent revalidation fails!
+      expect(mockProvider.assess).not.toHaveBeenCalled();
+      expect(mockHoldTx.$executeRaw).toHaveBeenCalledTimes(1);
+    });
+
+    it('RB-03 (D, E, F, G): throws WorkerLeaseLostError and aborts transaction if final fenced job update affects 0 rows', async () => {
+      const mockJob = {
+        id: 'assess-job-final-fence',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const mockClaimedRecord = {
+        id: 'assess-job-final-fence',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: { requisitionId: 'req-1' },
+        resumeDocument: {
+          id: 'doc-1',
+          candidateId: 'cand-1',
+          objectKey: '2026-11/test.pdf',
+          fileType: 'PDF' as const,
+          organizationId: 'org-1',
+        },
+      };
+
+      let txCount = 0;
+      let tx2AbortedByThrow = false;
+      const mockTx1 = {
+        $queryRaw: vi.fn(async () => [mockJob]),
+        candidateConsent: { findFirst: vi.fn(async () => ({ id: 'consent-1' })) },
+        $executeRaw: vi.fn(async () => 1),
+        processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+      };
+
+      const mockTx2 = {
+        $queryRaw: vi.fn(async () => [{ id: 'assess-job-final-fence' }]),
+        // Final fenced UPDATE returns 0 (lease expired or stolen before final update)
+        $executeRaw: vi.fn(async () => 0),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({ id: 'consent-1', candidateId: 'cand-1' })),
+        },
+        candidateAssessment: {
+          upsert: vi.fn(async () => ({ id: 'cand-assess-1' })),
+        },
+        assessmentText: {
+          findFirst: vi.fn(async () => null),
+          create: vi.fn(async () => ({ id: 'assess-text-1' })),
+        },
+        criterionAssessment: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'crit-assess-1' })),
+        },
+        evidenceSnippet: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'snip-1' })),
+        },
+        auditLog: {
+          create: vi.fn(async () => ({ id: 'audit-1' })),
+        },
+      };
+
+      const mockDb = {
+        $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+          txCount += 1;
+          if (txCount === 1) return cb(mockTx1);
+          try {
+            return await cb(mockTx2);
+          } catch (err) {
+            tx2AbortedByThrow = true;
+            throw err;
+          }
+        }),
+        documentExtraction: {
+          findFirst: vi.fn(async () => ({
+            id: 'ext-1',
+            extractedText: 'Engineer with TypeScript experience.',
+            pageMapJson: [],
+          })),
+        },
+        scorecardVersion: {
+          findFirst: vi.fn(async () => ({
+            id: 'scorecard-v1',
+            requisition: { title: 'Backend Engineer' },
+            criteria: [
+              {
+                id: 'crit-ts',
+                key: 'ts',
+                label: 'TS',
+                category: 'EXPERIENCE',
+                requirementType: 'MUST_HAVE',
+                weight: 1.0,
+                active: true,
+              },
+            ],
+          })),
+        },
+      } as unknown as PrismaClient;
+
+      const mockProvider = {
+        assess: vi.fn(async () => ({
+          model: 'test-model',
+          promptVersion: '2026-11-assessment-v1',
+          inputHash: 'h1',
+          outputHash: 'h2',
+          criteria: [
+            {
+              criterionId: 'crit-ts',
+              status: 'MATCH' as const,
+              score: 1.0,
+              explanation: 'ok',
+              evidenceQuotes: ['TypeScript experience'],
+            },
+          ],
+        })),
+      };
+
+      const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+        workerId: 'worker-rb03-fence',
+        heartbeatIntervalMs: 0,
+        assessmentProvider: mockProvider,
+      });
+
+      const processed = await processor.processNextJob();
+      expect(processed).toBe(true);
+      // Transaction 2 must have thrown WorkerLeaseLostError so Prisma rolls back all assessment writes!
+      expect(tx2AbortedByThrow).toBe(true);
+      // Audit log after the fenced UPDATE must never be reached
+      expect(mockTx2.auditLog.create).not.toHaveBeenCalled();
+      // And Phase 4 failure transaction must NOT have run (txCount remains 2)
+      expect(txCount).toBe(2);
+    });
+
+    it('rejects completion before writing artifacts when lease expires while waiting on FOR UPDATE row lock (post-lock clock_timestamp check)', async () => {
+      const mockJob = {
+        id: 'assess-job-lock-wait-expired',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const mockClaimedRecord = {
+        id: 'assess-job-lock-wait-expired',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: { requisitionId: 'req-1' },
+        resumeDocument: {
+          id: 'doc-1',
+          candidateId: 'cand-1',
+          objectKey: '2026-11/test.pdf',
+          fileType: 'PDF' as const,
+          organizationId: 'org-1',
+        },
+      };
+
+      let txCount = 0;
+      let tx2AbortedByThrow = false;
+      const mockTx1 = {
+        $queryRaw: vi.fn(async () => [mockJob]),
+        candidateConsent: { findFirst: vi.fn(async () => ({ id: 'consent-1' })) },
+        $executeRaw: vi.fn(async () => 1),
+        processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+      };
+
+      // Simulate: 1st $queryRaw (FOR UPDATE) returns 1 row (IndexScan evaluated before lock wait),
+      // 2nd $queryRaw (post-lock clock_timestamp verification) returns 0 rows (lease expired during lock wait).
+      const mockTx2 = {
+        $queryRaw: vi
+          .fn()
+          .mockResolvedValueOnce([{ id: 'assess-job-lock-wait-expired' }])
+          .mockResolvedValueOnce([]),
+        $executeRaw: vi.fn(async () => 1),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({ id: 'consent-1', candidateId: 'cand-1' })),
+        },
+        candidateAssessment: { upsert: vi.fn() },
+        assessmentText: { findFirst: vi.fn(), create: vi.fn() },
+        criterionAssessment: { deleteMany: vi.fn(), create: vi.fn() },
+        evidenceSnippet: { deleteMany: vi.fn(), create: vi.fn() },
+        auditLog: { create: vi.fn() },
+      };
+
+      const mockDb = {
+        $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+          txCount += 1;
+          if (txCount === 1) return cb(mockTx1);
+          try {
+            return await cb(mockTx2);
+          } catch (err) {
+            tx2AbortedByThrow = true;
+            throw err;
+          }
+        }),
+        documentExtraction: {
+          findFirst: vi.fn(async () => ({
+            id: 'ext-1',
+            extractedText: 'Engineer with TypeScript experience.',
+            pageMapJson: [],
+          })),
+        },
+        scorecardVersion: {
+          findFirst: vi.fn(async () => ({
+            id: 'scorecard-v1',
+            requisition: { title: 'Backend Engineer' },
+            criteria: [
+              {
+                id: 'crit-ts',
+                key: 'ts',
+                label: 'TS',
+                category: 'EXPERIENCE',
+                requirementType: 'MUST_HAVE',
+                weight: 1.0,
+                active: true,
+              },
+            ],
+          })),
+        },
+      } as unknown as PrismaClient;
+
+      const mockProvider = {
+        assess: vi.fn(async () => ({
+          model: 'test-model',
+          promptVersion: '2026-11-assessment-v1',
+          inputHash: 'h1',
+          outputHash: 'h2',
+          criteria: [
+            {
+              criterionId: 'crit-ts',
+              status: 'MATCH' as const,
+              score: 1.0,
+              explanation: 'ok',
+              evidenceQuotes: ['TypeScript experience'],
+            },
+          ],
+        })),
+      };
+
+      const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+        workerId: 'worker-lock-wait-fence',
+        heartbeatIntervalMs: 0,
+        assessmentProvider: mockProvider,
+      });
+
+      const processed = await processor.processNextJob();
+      expect(processed).toBe(true);
+      expect(tx2AbortedByThrow).toBe(true);
+      expect(mockTx2.$queryRaw).toHaveBeenCalledTimes(2);
+      expect(mockTx2.candidateAssessment.upsert).not.toHaveBeenCalled();
+      expect(mockTx2.auditLog.create).not.toHaveBeenCalled();
+      expect(txCount).toBe(2);
     });
   });
 });

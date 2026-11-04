@@ -163,16 +163,33 @@ enum ClientDecisionType {
   PROPOSE_INTERVIEW
 }
 
+enum InterviewFormat {
+  VIDEO
+  PHONE
+  IN_PERSON
+}
+
+enum InterviewProposalStatus {
+  PROPOSED
+  ACCEPTED
+  REJECTED
+  RESCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
 enum PipelineStage {
   SOURCED
   PARSING
   PARSED
   ASSESSED
   RECRUITER_REVIEW
+  RECRUITER_SHORTLISTED
   SUBMITTED_TO_CLIENT
   CLIENT_SHORTLISTED
   INTERVIEW_PROPOSED
   INTERVIEW_SCHEDULED
+  INTERVIEW_COMPLETED
   OFFERED
   JOINED
   CLIENT_REJECTED
@@ -248,6 +265,8 @@ model Organization {
   documentExtractions  DocumentExtraction[]
   candidateReviews     CandidateReview[]
   candidateSubmissions CandidateSubmission[]
+  candidateShortlists  CandidateShortlist[]
+  interviewProposals   InterviewProposal[]
   clientDecisions      ClientDecision[]
   candidateConsents    CandidateConsent[]
   deletionRequests     DeletionRequest[]
@@ -280,7 +299,9 @@ model User {
   uploadedResumes      ResumeDocument[]      @relation("ResumeUploader")
   createdBatches       ProcessingBatch[]
   reviews              CandidateReview[]
+  candidateShortlists  CandidateShortlist[]  @relation("CandidateShortlister")
   submittedCandidates  CandidateSubmission[]
+  interviewProposals   InterviewProposal[]   @relation("InterviewProposer")
   clientDecisions      ClientDecision[]
   pipelineEvents       PipelineEvent[]
   capturedConsents     CandidateConsent[]    @relation("ConsentCapturer")
@@ -372,8 +393,10 @@ model Requisition {
   scorecardVersions ScorecardVersion[]
   batches           ProcessingBatch[]
   assessments       CandidateAssessment[]
-  reviews           CandidateReview[]
-  submissions       CandidateSubmission[]
+  reviews            CandidateReview[]
+  shortlists         CandidateShortlist[]
+  submissions        CandidateSubmission[]
+  interviewProposals InterviewProposal[]
   pipelineEvents    PipelineEvent[]
   auditLogs         AuditLog[]
   candidateConsents CandidateConsent[]
@@ -447,6 +470,7 @@ model Candidate {
   resumes          ResumeDocument[]
   assessments      CandidateAssessment[]
   reviews          CandidateReview[]
+  shortlists       CandidateShortlist[]
   submissions      CandidateSubmission[]
   pipelineEvents   PipelineEvent[]
   consents         CandidateConsent[]
@@ -544,10 +568,11 @@ model ResumeDocument {
   reviews              CandidateReview[]
   candidateSubmissions CandidateSubmission[]
 
-  @@unique([organizationId, sha256])
+  @@unique([organizationId, candidateId, sha256])
   @@unique([candidateId, version])
   @@unique([id, organizationId], map: "resume_documents_id_organization_id_key")
   @@unique([id, candidateId, organizationId], map: "resume_documents_id_candidate_org_key")
+  @@index([organizationId, sha256])
   @@index([candidateId, parseStatus])
   @@map("resume_documents")
 }
@@ -756,6 +781,25 @@ model CandidateReview {
   @@map("candidate_reviews")
 }
 
+model CandidateShortlist {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  candidateId     String   @map("candidate_id") @db.Uuid
+  requisitionId   String   @map("requisition_id") @db.Uuid
+  shortlistedById String   @map("shortlisted_by") @db.Uuid
+  shortlistedAt   DateTime @default(now()) @map("shortlisted_at")
+  notesInternal   String?  @map("notes_internal")
+
+  organization  Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  candidate     Candidate    @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  requisition   Requisition  @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  shortlistedBy User         @relation("CandidateShortlister", fields: [shortlistedById, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([requisitionId, candidateId])
+  @@index([organizationId, candidateId])
+  @@map("candidate_shortlists")
+}
+
 model CandidateSubmission {
   id               String           @id @default(uuid()) @db.Uuid
   organizationId   String           @map("organization_id") @db.Uuid
@@ -778,11 +822,13 @@ model CandidateSubmission {
   assessment     CandidateAssessment @relation(fields: [assessmentId, candidateId, requisitionId, resumeDocumentId], references: [id, candidateId, requisitionId, resumeDocumentId], onDelete: Restrict)
   review         CandidateReview     @relation(fields: [reviewId, candidateId, requisitionId, resumeDocumentId], references: [id, candidateId, requisitionId, resumeDocumentId], onDelete: Restrict)
   resumeDocument ResumeDocument      @relation(fields: [resumeDocumentId, candidateId, organizationId], references: [id, candidateId, organizationId], onDelete: Restrict)
-  decisions      ClientDecision[]
-  pipelineEvents PipelineEvent[]
+  decisions          ClientDecision[]
+  pipelineEvents     PipelineEvent[]
+  interviewProposals InterviewProposal[]
 
-  @@unique([requisitionId, candidateId])
+  @@unique([requisitionId, candidateId], map: "candidate_submissions_active_scope_unique_idx", where: raw("(status <> ALL (ARRAY['WITHDRAWN'::\"SubmissionStatus\", 'CLIENT_REJECTED'::\"SubmissionStatus\"]))"))
   @@unique([id, clientId], map: "candidate_submissions_id_client_key")
+  @@unique([id, requisitionId, organizationId], map: "candidate_submissions_id_req_org_key")
   @@unique([id, candidateId, requisitionId, organizationId], map: "candidate_submissions_pipeline_key")
   @@index([clientId, requisitionId, status])
   @@map("candidate_submissions")
@@ -809,6 +855,33 @@ model ClientDecision {
 
   @@index([submissionId, createdAt])
   @@map("client_decisions")
+}
+
+model InterviewProposal {
+  id             String                  @id @default(uuid()) @db.Uuid
+  organizationId String                  @map("organization_id") @db.Uuid
+  submissionId   String                  @map("submission_id") @db.Uuid
+  requisitionId  String                  @map("requisition_id") @db.Uuid
+  proposerUserId String                  @map("proposer_user_id") @db.Uuid
+  proposerRole   UserRole                @map("proposer_role")
+  startAt        DateTime                @map("start_at")
+  endAt          DateTime                @map("end_at")
+  timezone       String
+  format         InterviewFormat         @default(VIDEO)
+  status         InterviewProposalStatus @default(PROPOSED)
+  reason         String?
+  expiresAt      DateTime?               @map("expires_at")
+  createdAt      DateTime                @default(now()) @map("created_at")
+  updatedAt      DateTime                @default(now()) @updatedAt @map("updated_at")
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  submission   CandidateSubmission @relation(fields: [submissionId, requisitionId, organizationId], references: [id, requisitionId, organizationId], onDelete: Restrict)
+  requisition  Requisition         @relation(fields: [requisitionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  proposerUser User                @relation("InterviewProposer", fields: [proposerUserId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@index([submissionId, status])
+  @@index([organizationId, requisitionId])
+  @@map("interview_proposals")
 }
 
 model PipelineEvent {
@@ -858,6 +931,7 @@ model CandidateConsent {
   withdrawalRequests ConsentWithdrawalRequest[]
 
   @@unique([organizationId, candidateId, requisitionId, purpose], map: "candidate_consents_active_scope_unique_idx", where: raw("status = 'ACTIVE' AND requisition_id IS NOT NULL"))
+  @@unique([id, candidateId, organizationId], map: "candidate_consents_id_candidate_org_key")
   @@index([candidateId, purpose, status])
   @@index([candidateId, requisitionId, status])
   @@index([organizationId, candidateId, requisitionId, purpose, status])
@@ -909,7 +983,7 @@ model ConsentWithdrawalRequest {
 
   organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   candidate    Candidate        @relation(fields: [candidateId, organizationId], references: [id, organizationId], onDelete: Restrict)
-  consent      CandidateConsent @relation(fields: [consentId], references: [id], onDelete: Restrict)
+  consent      CandidateConsent @relation(fields: [consentId, candidateId, organizationId], references: [id, candidateId, organizationId], onDelete: Restrict)
 
   @@index([tokenHash])
   @@index([organizationId, candidateId, status])

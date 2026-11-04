@@ -87,7 +87,7 @@ export interface AssessmentRepository {
     status: 'FAILED' | 'RETRYABLE_FAILURE';
     errorCode: string;
     attempts: number;
-  }): Promise<void>;
+  }): Promise<boolean>;
 }
 
 export function createAssessmentRepository(
@@ -464,205 +464,270 @@ export function createAssessmentRepository(
     },
 
     async completeAssessment(params) {
-      return database.$transaction(async (tx) => {
-        // 1. Re-validate worker lease
-        const leaseVerification = await tx.$executeRaw(Prisma.sql`
-          SELECT id FROM "processing_jobs"
-          WHERE id = ${params.jobId}::uuid
-            AND locked_by = ${params.workerId}
-            AND lease_token = ${params.leaseToken}::uuid
-            AND lease_expires_at > NOW()
-            AND status = 'PROCESSING'
-          FOR UPDATE
-        `);
+      try {
+        return await database.$transaction(async (tx) => {
+          // 1a. Acquire row-level lock on the processing job
+          const leaseLock = await tx.$executeRaw(Prisma.sql`
+            SELECT id FROM "processing_jobs"
+            WHERE id = ${params.jobId}::uuid
+              AND status = 'PROCESSING'
+              AND locked_by = ${params.workerId}
+              AND lease_token = ${params.leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > clock_timestamp()
+            FOR UPDATE
+          `);
 
-        if (leaseVerification === 0) {
-          // Worker lost lease or lease expired
-          return false;
-        }
+          if (leaseLock === 0) {
+            // Worker lost lease or lease expired prior to lock acquisition
+            return false;
+          }
 
-        // 2. Re-validate candidate consent
-        const consent = await tx.candidateConsent.findFirst({
-          where: {
-            organizationId: params.organizationId,
-            candidateId: params.candidateId,
-            requisitionId: params.requisitionId,
-            purpose: 'HIRING_USE',
-            status: 'ACTIVE',
-            withdrawnAt: null,
-          },
-          select: { id: true },
-        });
+          // 1b. Separately verify lease validity against actual wall-clock time AFTER the row lock is held,
+          // because PostgreSQL's IndexScan may evaluate WHERE predicates before LockRows finishes waiting on a row lock.
+          const postLockVerification = await tx.$executeRaw(Prisma.sql`
+            SELECT id FROM "processing_jobs"
+            WHERE id = ${params.jobId}::uuid
+              AND status = 'PROCESSING'
+              AND locked_by = ${params.workerId}
+              AND lease_token = ${params.leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > clock_timestamp()
+          `);
 
-        if (!consent) {
-          // Consent was withdrawn during inference!
-          // Mark job held and clear lease
-          await tx.$executeRaw(Prisma.sql`
+          if (postLockVerification === 0) {
+            // Lease expired while waiting for the processing_jobs row lock
+            return false;
+          }
+
+          // 2. Re-validate candidate consent
+          const consent = await tx.candidateConsent.findFirst({
+            where: {
+              organizationId: params.organizationId,
+              candidateId: params.candidateId,
+              requisitionId: params.requisitionId,
+              purpose: 'HIRING_USE',
+              status: 'ACTIVE',
+              withdrawnAt: null,
+              policyVersion: { not: '' },
+            },
+            select: { id: true },
+          });
+
+          if (!consent) {
+            // Consent was withdrawn during inference!
+            // Mark job held and clear lease (fenced by active worker lease)
+            await tx.$executeRaw(Prisma.sql`
+              UPDATE "processing_jobs"
+              SET status = 'HELD_FOR_AUTHORIZATION',
+                  lease_expires_at = NULL,
+                  locked_by = NULL,
+                  lease_token = NULL,
+                  updated_at = NOW()
+              WHERE id = ${params.jobId}::uuid
+                AND status = 'PROCESSING'
+                AND locked_by = ${params.workerId}
+                AND lease_token = ${params.leaseToken}::uuid
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at > clock_timestamp()
+            `);
+            return false;
+          }
+
+          // 3. Upsert AssessmentText
+          let assessmentText = await tx.assessmentText.findFirst({
+            where: {
+              resumeDocumentId: params.resumeDocumentId,
+              version: 1,
+            },
+          });
+
+          if (!assessmentText) {
+            assessmentText = await tx.assessmentText.create({
+              data: {
+                organizationId: params.organizationId,
+                documentExtractionId: params.documentExtractionId,
+                resumeDocumentId: params.resumeDocumentId,
+                version: 1,
+                redactedText: params.redactedText,
+                pageMapJson: params.pageMapJson as Prisma.InputJsonValue,
+                redactionMapJson: params.redactionMapJson as Prisma.InputJsonValue,
+                redactorVersion: '2026-11-redactor-v2',
+              },
+            });
+          }
+
+          // 4. Upsert CandidateAssessment
+          const assessmentId = randomUUID();
+          const candidateAssessment = await tx.candidateAssessment.upsert({
+            where: {
+              requisitionId_candidateId_resumeDocumentId_scorecardVersionId: {
+                requisitionId: params.requisitionId,
+                candidateId: params.candidateId,
+                resumeDocumentId: params.resumeDocumentId,
+                scorecardVersionId: params.scorecardVersionId,
+              },
+            },
+            create: {
+              id: assessmentId,
+              organizationId: params.organizationId,
+              requisitionId: params.requisitionId,
+              candidateId: params.candidateId,
+              resumeDocumentId: params.resumeDocumentId,
+              documentExtractionId: params.documentExtractionId,
+              scorecardVersionId: params.scorecardVersionId,
+              assessmentTextId: assessmentText.id,
+              score:
+                params.summary.score !== null ? new Prisma.Decimal(params.summary.score) : null,
+              coverage: new Prisma.Decimal(params.summary.coverage),
+              status: params.summary.status,
+              formulaVersion: params.summary.formulaVersion,
+              modelMetadataJson: params.metadata as unknown as Prisma.InputJsonValue,
+            },
+            update: {
+              score:
+                params.summary.score !== null ? new Prisma.Decimal(params.summary.score) : null,
+              coverage: new Prisma.Decimal(params.summary.coverage),
+              status: params.summary.status,
+              formulaVersion: params.summary.formulaVersion,
+              modelMetadataJson: params.metadata as unknown as Prisma.InputJsonValue,
+              updatedAt: new Date(),
+            },
+          });
+
+          // 5. Replace existing criterion assessments and evidence snippets if updating
+          await tx.evidenceSnippet.deleteMany({
+            where: { assessmentId: candidateAssessment.id },
+          });
+          await tx.criterionAssessment.deleteMany({
+            where: { assessmentId: candidateAssessment.id },
+          });
+
+          // 6. Persist CriterionAssessments and EvidenceSnippets
+          for (const crit of params.summary.criterionResults) {
+            const criterionAssessmentId = randomUUID();
+            await tx.criterionAssessment.create({
+              data: {
+                id: criterionAssessmentId,
+                organizationId: params.organizationId,
+                assessmentId: candidateAssessment.id,
+                criterionId: crit.criterionId,
+                scorecardVersionId: params.scorecardVersionId,
+                resumeDocumentId: params.resumeDocumentId,
+                assessmentTextId: assessmentText.id,
+                documentExtractionId: params.documentExtractionId,
+                status: crit.status,
+                normalizedValue:
+                  crit.normalizedValue !== null ? new Prisma.Decimal(crit.normalizedValue) : null,
+                explanation: crit.explanation,
+              },
+            });
+
+            for (const ev of crit.evidenceSnippets) {
+              await tx.evidenceSnippet.create({
+                data: {
+                  organizationId: params.organizationId,
+                  criterionAssessmentId,
+                  assessmentId: candidateAssessment.id,
+                  scorecardVersionId: params.scorecardVersionId,
+                  assessmentTextId: assessmentText.id,
+                  resumeDocumentId: params.resumeDocumentId,
+                  documentExtractionId: params.documentExtractionId,
+                  quote: ev.quote,
+                  pageNumber: ev.pageNumber,
+                  startOffset: ev.startOffset,
+                  endOffset: ev.endOffset,
+                  verified: ev.verified,
+                  verificationMethod: ev.verificationMethod,
+                },
+              });
+            }
+          }
+
+          // 7. Fenced completion of ProcessingJob — if 0 rows match, throw to roll back all assessment writes
+          const updatedJobCount = await tx.$executeRaw(Prisma.sql`
             UPDATE "processing_jobs"
-            SET status = 'HELD_FOR_AUTHORIZATION',
+            SET status = 'SUCCEEDED',
+                finished_at = NOW(),
                 lease_expires_at = NULL,
                 locked_by = NULL,
                 lease_token = NULL,
                 updated_at = NOW()
             WHERE id = ${params.jobId}::uuid
+              AND status = 'PROCESSING'
+              AND locked_by = ${params.workerId}
+              AND lease_token = ${params.leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > clock_timestamp()
           `);
-          return false;
-        }
 
-        // 3. Upsert AssessmentText
-        let assessmentText = await tx.assessmentText.findFirst({
-          where: {
-            resumeDocumentId: params.resumeDocumentId,
-            version: 1,
-          },
-        });
+          if (updatedJobCount === 0) {
+            throw new Error('STALE_WORKER_LEASE');
+          }
 
-        if (!assessmentText) {
-          assessmentText = await tx.assessmentText.create({
+          // 8. Audit log
+          await tx.auditLog.create({
             data: {
               organizationId: params.organizationId,
-              documentExtractionId: params.documentExtractionId,
-              resumeDocumentId: params.resumeDocumentId,
-              version: 1,
-              redactedText: params.redactedText,
-              pageMapJson: params.pageMapJson as Prisma.InputJsonValue,
-              redactionMapJson: params.redactionMapJson as Prisma.InputJsonValue,
-              redactorVersion: '1.0.0',
-            },
-          });
-        }
-
-        // 4. Upsert CandidateAssessment
-        const assessmentId = randomUUID();
-        const candidateAssessment = await tx.candidateAssessment.upsert({
-          where: {
-            requisitionId_candidateId_resumeDocumentId_scorecardVersionId: {
+              action: 'ASSESSMENT_COMPLETED',
+              resourceType: 'CandidateAssessment',
+              resourceId: candidateAssessment.id,
               requisitionId: params.requisitionId,
               candidateId: params.candidateId,
-              resumeDocumentId: params.resumeDocumentId,
-              scorecardVersionId: params.scorecardVersionId,
-            },
-          },
-          create: {
-            id: assessmentId,
-            organizationId: params.organizationId,
-            requisitionId: params.requisitionId,
-            candidateId: params.candidateId,
-            resumeDocumentId: params.resumeDocumentId,
-            documentExtractionId: params.documentExtractionId,
-            scorecardVersionId: params.scorecardVersionId,
-            assessmentTextId: assessmentText.id,
-            score: params.summary.score !== null ? new Prisma.Decimal(params.summary.score) : null,
-            coverage: new Prisma.Decimal(params.summary.coverage),
-            status: params.summary.status,
-            formulaVersion: params.summary.formulaVersion,
-            modelMetadataJson: params.metadata as unknown as Prisma.InputJsonValue,
-          },
-          update: {
-            score: params.summary.score !== null ? new Prisma.Decimal(params.summary.score) : null,
-            coverage: new Prisma.Decimal(params.summary.coverage),
-            status: params.summary.status,
-            formulaVersion: params.summary.formulaVersion,
-            modelMetadataJson: params.metadata as unknown as Prisma.InputJsonValue,
-            updatedAt: new Date(),
-          },
-        });
-
-        // 5. Replace existing criterion assessments and evidence snippets if updating
-        await tx.evidenceSnippet.deleteMany({
-          where: { assessmentId: candidateAssessment.id },
-        });
-        await tx.criterionAssessment.deleteMany({
-          where: { assessmentId: candidateAssessment.id },
-        });
-
-        // 6. Persist CriterionAssessments and EvidenceSnippets
-        for (const crit of params.summary.criterionResults) {
-          const criterionAssessmentId = randomUUID();
-          await tx.criterionAssessment.create({
-            data: {
-              id: criterionAssessmentId,
-              organizationId: params.organizationId,
-              assessmentId: candidateAssessment.id,
-              criterionId: crit.criterionId,
-              scorecardVersionId: params.scorecardVersionId,
-              resumeDocumentId: params.resumeDocumentId,
-              assessmentTextId: assessmentText.id,
-              documentExtractionId: params.documentExtractionId,
-              status: crit.status,
-              normalizedValue:
-                crit.normalizedValue !== null ? new Prisma.Decimal(crit.normalizedValue) : null,
-              explanation: crit.explanation,
+              metadataJson: {
+                score: params.summary.score,
+                coverage: params.summary.coverage,
+                status: params.summary.status,
+                jobId: params.jobId,
+              },
             },
           });
 
-          for (const ev of crit.evidenceSnippets) {
-            await tx.evidenceSnippet.create({
-              data: {
-                organizationId: params.organizationId,
-                criterionAssessmentId,
-                assessmentId: candidateAssessment.id,
-                scorecardVersionId: params.scorecardVersionId,
-                assessmentTextId: assessmentText.id,
-                resumeDocumentId: params.resumeDocumentId,
-                documentExtractionId: params.documentExtractionId,
-                quote: ev.quote,
-                pageNumber: ev.pageNumber,
-                startOffset: ev.startOffset,
-                endOffset: ev.endOffset,
-                verified: ev.verified,
-                verificationMethod: ev.verificationMethod,
-              },
-            });
-          }
+          return true;
+        });
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message === 'STALE_WORKER_LEASE') {
+          return false;
         }
-
-        // 7. Complete ProcessingJob and clear lease
-        await tx.processingJob.update({
-          where: { id: params.jobId },
-          data: {
-            status: 'SUCCEEDED',
-            finishedAt: new Date(),
-            leaseExpiresAt: null,
-            lockedBy: null,
-            leaseToken: null,
-          },
-        });
-
-        // 8. Audit log
-        await tx.auditLog.create({
-          data: {
-            organizationId: params.organizationId,
-            action: 'ASSESSMENT_COMPLETED',
-            resourceType: 'CandidateAssessment',
-            resourceId: candidateAssessment.id,
-            requisitionId: params.requisitionId,
-            candidateId: params.candidateId,
-            metadataJson: {
-              score: params.summary.score,
-              coverage: params.summary.coverage,
-              status: params.summary.status,
-              jobId: params.jobId,
-            },
-          },
-        });
-
-        return true;
-      });
+        throw err;
+      }
     },
 
     async failAssessmentJob(params) {
-      await database.processingJob.update({
-        where: { id: params.jobId },
-        data: {
-          status: params.status,
-          attempts: params.attempts,
-          lastErrorCode: params.errorCode,
-          leaseExpiresAt: null,
-          lockedBy: null,
-          leaseToken: null,
-          ...(params.status === 'FAILED' ? { finishedAt: new Date() } : {}),
-        },
+      return database.$transaction(async (tx) => {
+        const leaseLock = await tx.$executeRaw(Prisma.sql`
+          SELECT id FROM "processing_jobs"
+          WHERE id = ${params.jobId}::uuid
+            AND status = 'PROCESSING'
+            AND locked_by = ${params.workerId}
+            AND lease_token = ${params.leaseToken}::uuid
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > clock_timestamp()
+          FOR UPDATE
+        `);
+
+        if (leaseLock === 0) {
+          return false;
+        }
+
+        const updated = await tx.$executeRaw(Prisma.sql`
+          UPDATE "processing_jobs"
+          SET status = ${params.status}::"ProcessingJobStatus",
+              attempts = ${params.attempts},
+              last_error_code = ${params.errorCode},
+              lease_expires_at = NULL,
+              locked_by = NULL,
+              lease_token = NULL,
+              finished_at = CASE WHEN ${params.status} = 'FAILED' THEN NOW() ELSE finished_at END,
+              updated_at = NOW()
+          WHERE id = ${params.jobId}::uuid
+            AND status = 'PROCESSING'
+            AND locked_by = ${params.workerId}
+            AND lease_token = ${params.leaseToken}::uuid
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > clock_timestamp()
+        `);
+        return updated > 0;
       });
     },
   };

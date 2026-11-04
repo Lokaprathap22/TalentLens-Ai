@@ -23,6 +23,9 @@ import { createConsentService } from './modules/consent/consent.service.js';
 import { DefaultEmailDeliveryService } from './modules/consent/consent.email.js';
 import { createAssessmentRepository } from './modules/assessments/assessment.repository.js';
 import { createAssessmentService } from './modules/assessments/assessment.service.js';
+import { createWorkflowRepository } from './modules/workflow/workflow.repository.js';
+import { createWorkflowService } from './modules/workflow/workflow.service.js';
+import { createAuthorizationService } from './modules/authorization/authorization.service.js';
 
 const environment = loadEnvironment();
 let sessionService: SessionService | undefined;
@@ -38,6 +41,9 @@ let consentRepository: ReturnType<typeof createConsentRepository> | undefined;
 let consentService: ReturnType<typeof createConsentService> | undefined;
 let assessmentRepository: ReturnType<typeof createAssessmentRepository> | undefined;
 let assessmentService: ReturnType<typeof createAssessmentService> | undefined;
+let workflowRepository: ReturnType<typeof createWorkflowRepository> | undefined;
+let workflowService: ReturnType<typeof createWorkflowService> | undefined;
+let authorizationService: ReturnType<typeof createAuthorizationService> | undefined;
 const emailDeliveryService = new DefaultEmailDeliveryService();
 const extractionProvider = createOpenAiCompatibleProvider({
   apiKey: environment.aiApiKey,
@@ -119,6 +125,17 @@ function getAssessmentService(): ReturnType<typeof createAssessmentService> {
   return assessmentService;
 }
 
+function getWorkflowService(): ReturnType<typeof createWorkflowService> {
+  workflowRepository ??= createWorkflowRepository();
+  workflowService ??= createWorkflowService(workflowRepository);
+  return workflowService;
+}
+
+function getAuthorizationService(): ReturnType<typeof createAuthorizationService> {
+  authorizationService ??= createAuthorizationService();
+  return authorizationService;
+}
+
 const server = createServer(
   createApp({
     auth: {
@@ -162,6 +179,8 @@ const server = createServer(
         getResumeFile: (...args) => getResumeService().getResumeFile(...args),
         releaseHeldProcessingJobs: (...args) =>
           getResumeService().releaseHeldProcessingJobs(...args),
+        reuseCandidateResumeForRequisition: (...args) =>
+          getResumeService().reuseCandidateResumeForRequisition(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
@@ -187,6 +206,38 @@ const server = createServer(
         list: (...args) => getAssessmentService().list(...args),
       },
       sessionService: lazySessionService,
+      applicationOrigin: environment.appOrigin,
+      isProduction: environment.nodeEnv === 'production',
+    },
+    workflow: {
+      service: {
+        listCandidatesForRequisition: (...args) =>
+          getWorkflowService().listCandidatesForRequisition(...args),
+        getCandidateDetail: (...args) => getWorkflowService().getCandidateDetail(...args),
+        recordCandidateReview: (...args) => getWorkflowService().recordCandidateReview(...args),
+        recordShortlist: (...args) => getWorkflowService().recordShortlist(...args),
+        submitCandidateToClient: (...args) => getWorkflowService().submitCandidateToClient(...args),
+        listSubmissionsForRequisition: (...args) =>
+          getWorkflowService().listSubmissionsForRequisition(...args),
+        getSubmissionForRequisition: (...args) =>
+          getWorkflowService().getSubmissionForRequisition(...args),
+        listSubmissionsForClient: (...args) =>
+          getWorkflowService().listSubmissionsForClient(...args),
+        getSubmissionForClient: (...args) => getWorkflowService().getSubmissionForClient(...args),
+        recordClientFeedback: (...args) => getWorkflowService().recordClientFeedback(...args),
+        recordClientInterviewProposal: (...args) =>
+          getWorkflowService().recordClientInterviewProposal(...args),
+        respondToInterview: (...args) => getWorkflowService().respondToInterview(...args),
+        respondToInterviewAsClient: (...args) =>
+          getWorkflowService().respondToInterviewAsClient(...args),
+        listAuthorizedClients: (...args) => getWorkflowService().listAuthorizedClients(...args),
+        getCandidateTimeline: (...args) => getWorkflowService().getCandidateTimeline(...args),
+      },
+      sessionService: lazySessionService,
+      authorizationService: {
+        authorizeClientMembership: (...args) =>
+          getAuthorizationService().authorizeClientMembership(...args),
+      },
       applicationOrigin: environment.appOrigin,
       isProduction: environment.nodeEnv === 'production',
     },

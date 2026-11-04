@@ -49,6 +49,20 @@ const environmentSchema = z
           .refine((value) => value >= 1_000 && value <= 120_000),
       )
       .optional(),
+    ASSESSMENT_PROVIDER: z.enum(['openai', 'fake']).optional(),
+    ASSESSMENT_OPENAI_API_KEY: z.string().min(1).optional(),
+    ASSESSMENT_OPENAI_BASE_URL: z.string().url().optional(),
+    ASSESSMENT_OPENAI_MODEL: z.string().min(1).optional(),
+    ASSESSMENT_TIMEOUT_MS: z
+      .preprocess(
+        (value) => value ?? '30000',
+        z
+          .string()
+          .regex(/^\d+$/)
+          .transform(Number)
+          .refine((value) => value >= 1_000 && value <= 120_000),
+      )
+      .optional(),
     RESUME_STORAGE_ROOT: z.string().min(1).default('./storage/resumes'),
     CONSENT_APPROVED_POLICIES: z.string().optional(),
     CONSENT_APPROVED_POLICY_VERSIONS: z.string().optional(),
@@ -59,6 +73,13 @@ const environmentSchema = z
         code: 'custom',
         path: ['APP_ORIGIN'],
         message: 'APP_ORIGIN is required in production',
+      });
+    }
+    if (value.ASSESSMENT_PROVIDER === 'fake' && value.NODE_ENV !== 'test') {
+      context.addIssue({
+        code: 'custom',
+        path: ['ASSESSMENT_PROVIDER'],
+        message: 'ASSESSMENT_PROVIDER=fake is strictly forbidden outside NODE_ENV=test',
       });
     }
   })
@@ -72,6 +93,11 @@ const environmentSchema = z
       AI_BASE_URL,
       AI_MODEL,
       AI_TIMEOUT_MS,
+      ASSESSMENT_PROVIDER,
+      ASSESSMENT_OPENAI_API_KEY,
+      ASSESSMENT_OPENAI_BASE_URL,
+      ASSESSMENT_OPENAI_MODEL,
+      ASSESSMENT_TIMEOUT_MS,
       RESUME_STORAGE_ROOT,
       CONSENT_APPROVED_POLICIES,
       CONSENT_APPROVED_POLICY_VERSIONS,
@@ -84,6 +110,11 @@ const environmentSchema = z
       aiBaseUrl: AI_BASE_URL,
       aiModel: AI_MODEL,
       aiTimeoutMs: AI_TIMEOUT_MS ?? 30_000,
+      assessmentProvider: ASSESSMENT_PROVIDER ?? (NODE_ENV === 'test' ? 'fake' : 'openai'),
+      assessmentOpenAiApiKey: ASSESSMENT_OPENAI_API_KEY,
+      assessmentOpenAiBaseUrl: ASSESSMENT_OPENAI_BASE_URL,
+      assessmentOpenAiModel: ASSESSMENT_OPENAI_MODEL,
+      assessmentTimeoutMs: ASSESSMENT_TIMEOUT_MS ?? 30_000,
       resumeStorageRoot: path.isAbsolute(RESUME_STORAGE_ROOT)
         ? path.normalize(RESUME_STORAGE_ROOT)
         : path.resolve(repositoryRoot(), RESUME_STORAGE_ROOT),

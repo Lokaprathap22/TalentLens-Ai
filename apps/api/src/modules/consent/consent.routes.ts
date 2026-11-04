@@ -2,6 +2,7 @@ import express, { type RequestHandler, type Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
+import { requireCsrf } from '../../middleware/csrf.js';
 import { createRequireSession } from '../../middleware/require-session.js';
 import { createRequireSameOrigin } from '../../middleware/origin-protection.js';
 import { createRequireRole } from '../../middleware/require-role.js';
@@ -77,8 +78,9 @@ export function createConsentRouter(dependencies: ConsentRouterDependencies): Ro
   router.post(
     '/requisitions/:requisitionId/candidates/:candidateId/consent-invitations',
     requireSession,
-    sameOrigin,
     requireRecruiterRole,
+    sameOrigin,
+    requireCsrf,
     async (request, response) => {
       const parsed = createConsentInvitationSchema.safeParse(request.body);
       if (!parsed.success) {

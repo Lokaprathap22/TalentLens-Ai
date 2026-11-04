@@ -82,6 +82,18 @@ function createTestApp(
 
   const service: ResumeService = {
     releaseHeldProcessingJobs: vi.fn(async () => ({ releasedCount: 1 })),
+    reuseCandidateResumeForRequisition: vi.fn(async () => ({
+      batchId: 'batch-1',
+      jobId: 'job-1',
+      jobStatus: 'COMPLETED',
+      resumeDocumentId: resumeId,
+      candidateId: 'cand-1',
+      candidateCode: 'CAN-1234',
+      requisitionId,
+      version: 1,
+      parseStatus: 'PARSED' as const,
+      isExisting: false,
+    })),
     uploadResumes: vi.fn(async () => {
       if (options.uploadError) throw options.uploadError;
       return sampleUploadResult;

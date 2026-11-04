@@ -348,10 +348,89 @@ export function createConsentRepository(
           throw err;
         }
 
-        // 3. Atomically release ONLY held jobs matching this candidate AND this requisition
-        const released = await tx.$executeRaw(Prisma.sql`
+        // 3. Atomically release ONLY held jobs matching this candidate AND this requisition.
+        // Heal any inconsistent ResumeDocument marked PARSED without a valid COMPLETE extraction.
+        await tx.$executeRaw(Prisma.sql`
+          UPDATE "resume_documents" rd
+          SET parse_status = 'PENDING',
+              updated_at = NOW()
+          WHERE rd.candidate_id = ${invitation.candidateId}::uuid
+            AND rd.organization_id = ${invitation.organizationId}::uuid
+            AND rd.parse_status = 'PARSED'
+            AND NOT EXISTS (
+              SELECT 1 FROM "document_extractions" de
+              WHERE de.resume_document_id = rd.id
+                AND de.organization_id = rd.organization_id
+                AND de.version >= 1
+                AND de.quality_status = 'COMPLETE'
+                AND LENGTH(BTRIM(de.extracted_text)) > 0
+            )
+        `);
+
+        // 3a. For held EXTRACT_TEXT jobs whose resume document is already validly PARSED with a COMPLETE extraction,
+        // complete the job immediately without queuing redundant re-extraction.
+        const reusedCompleted = await tx.$executeRaw(Prisma.sql`
+          UPDATE "processing_jobs" pj
+          SET status = 'SUCCEEDED',
+              finished_at = NOW(),
+              lease_expires_at = NULL,
+              locked_by = NULL,
+              lease_token = NULL,
+              updated_at = NOW()
+          WHERE pj.organization_id = ${invitation.organizationId}::uuid
+            AND pj.status = 'HELD_FOR_AUTHORIZATION'
+            AND pj.job_type = 'EXTRACT_TEXT'
+            AND pj.resume_document_id IN (
+              SELECT rd.id FROM "resume_documents" rd
+              WHERE rd.candidate_id = ${invitation.candidateId}::uuid
+                AND rd.organization_id = ${invitation.organizationId}::uuid
+                AND rd.parse_status = 'PARSED'
+                AND rd.version >= 1
+                AND EXISTS (
+                  SELECT 1 FROM "document_extractions" de
+                  WHERE de.resume_document_id = rd.id
+                    AND de.organization_id = rd.organization_id
+                    AND de.version >= 1
+                    AND de.quality_status = 'COMPLETE'
+                    AND LENGTH(BTRIM(de.extracted_text)) > 0
+                )
+            )
+            AND pj.batch_id IN (
+              SELECT pb.id FROM "processing_batches" pb
+              WHERE pb.requisition_id = ${invitation.requisitionId}::uuid
+                AND pb.organization_id = ${invitation.organizationId}::uuid
+            )
+        `);
+
+        if (reusedCompleted > 0) {
+          await tx.$executeRaw(Prisma.sql`
+            UPDATE "processing_batches" pb
+            SET status = 'COMPLETED',
+                updated_at = NOW()
+            WHERE pb.organization_id = ${invitation.organizationId}::uuid
+              AND pb.requisition_id = ${invitation.requisitionId}::uuid
+              AND pb.status <> 'COMPLETED'
+              AND EXISTS (
+                SELECT 1 FROM "processing_jobs" pj
+                WHERE pj.batch_id = pb.id
+                  AND pj.organization_id = pb.organization_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM "processing_jobs" pj
+                WHERE pj.batch_id = pb.id
+                  AND pj.organization_id = pb.organization_id
+                  AND pj.status <> 'SUCCEEDED'
+              )
+          `);
+        }
+
+        // 3b. Release remaining held jobs (unparsed EXTRACT_TEXT or ASSESS_CANDIDATE) to QUEUED.
+        const releasedQueued = await tx.$executeRaw(Prisma.sql`
           UPDATE "processing_jobs"
           SET status = 'QUEUED',
+              lease_expires_at = NULL,
+              locked_by = NULL,
+              lease_token = NULL,
               updated_at = NOW()
           WHERE organization_id = ${invitation.organizationId}::uuid
             AND status = 'HELD_FOR_AUTHORIZATION'
@@ -366,6 +445,8 @@ export function createConsentRepository(
                 AND organization_id = ${invitation.organizationId}::uuid
             )
         `);
+
+        const released = Number(reusedCompleted) + Number(releasedQueued);
 
         // 4. Audit Log
         await tx.auditLog.create({
@@ -598,6 +679,119 @@ export function createConsentRepository(
                   AND organization_id = ${request.organizationId}::uuid
               )
           `);
+
+          // 3b. Mark genuinely active submissions for this requisition as WITHDRAWN and emit pipeline events
+          // Terminal submissions (CLIENT_REJECTED, WITHDRAWN, or those whose latest pipeline stage is JOINED) are preserved.
+          const candidateSubmissions = await tx.candidateSubmission.findMany({
+            where: {
+              organizationId: request.organizationId,
+              candidateId: request.candidateId,
+              requisitionId: request.consent.requisitionId,
+              status: { in: ['SUBMITTED', 'CLIENT_SHORTLISTED', 'INTERVIEW_PROPOSED'] },
+            },
+            include: {
+              pipelineEvents: {
+                orderBy: { createdAt: 'desc' },
+                take: 1,
+                select: { toStage: true },
+              },
+            },
+          });
+
+          const terminalPipelineStages = new Set<string>([
+            'JOINED',
+            'CLIENT_REJECTED',
+            'RECRUITER_CLOSED',
+            'CANDIDATE_WITHDREW',
+          ]);
+
+          const openSubmissions = candidateSubmissions.filter((sub) => {
+            const latestStage = sub.pipelineEvents[0]?.toStage;
+            return !latestStage || !terminalPipelineStages.has(latestStage);
+          });
+
+          if (openSubmissions.length > 0) {
+            const openSubmissionIds = openSubmissions.map((sub) => sub.id);
+
+            await tx.candidateSubmission.updateMany({
+              where: {
+                id: { in: openSubmissionIds },
+                organizationId: request.organizationId,
+                candidateId: request.candidateId,
+                requisitionId: request.consent.requisitionId,
+                status: { in: ['SUBMITTED', 'CLIENT_SHORTLISTED', 'INTERVIEW_PROPOSED'] },
+              },
+              data: {
+                status: 'WITHDRAWN',
+                updatedAt: now,
+              },
+            });
+
+            // Cancel pending proposals (PROPOSED, RESCHEDULED) and invalidate future ACCEPTED interviews (start_at > NOW())
+            // while strictly preserving completed interviews (COMPLETED) and past records (start_at <= NOW()).
+            await tx.$executeRaw(Prisma.sql`
+              UPDATE "interview_proposals"
+              SET status = 'CANCELLED',
+                  reason = 'Candidate consent withdrawn',
+                  updated_at = NOW()
+              WHERE organization_id = ${request.organizationId}::uuid
+                AND requisition_id = ${request.consent.requisitionId}::uuid
+                AND submission_id IN (${Prisma.join(
+                  openSubmissionIds.map((id) => Prisma.sql`${id}::uuid`),
+                )})
+                AND (
+                  status IN ('PROPOSED', 'RESCHEDULED')
+                  OR (status = 'ACCEPTED' AND start_at > NOW())
+                )
+            `);
+
+            const req = await tx.requisition.findUnique({
+              where: { id: request.consent.requisitionId },
+              select: { assignedRecruiterId: true },
+            });
+            const actorId = req?.assignedRecruiterId ?? request.consent.capturedById;
+
+            for (const sub of openSubmissions) {
+              const priorStage =
+                sub.pipelineEvents[0]?.toStage ??
+                (sub.status === 'CLIENT_SHORTLISTED'
+                  ? 'CLIENT_SHORTLISTED'
+                  : sub.status === 'INTERVIEW_PROPOSED'
+                    ? 'INTERVIEW_PROPOSED'
+                    : 'SUBMITTED_TO_CLIENT');
+
+              if (actorId) {
+                await tx.pipelineEvent.create({
+                  data: {
+                    organizationId: request.organizationId,
+                    requisitionId: request.consent.requisitionId,
+                    candidateId: request.candidateId,
+                    submissionId: sub.id,
+                    fromStage: priorStage,
+                    toStage: 'CANDIDATE_WITHDREW',
+                    actorId,
+                    reason: 'Candidate consent withdrawn',
+                  },
+                });
+              }
+
+              await tx.auditLog.create({
+                data: {
+                  organizationId: request.organizationId,
+                  action: 'SUBMISSION_WITHDRAWN_DUE_TO_CONSENT_REVOCATION',
+                  resourceType: 'CandidateSubmission',
+                  resourceId: sub.id,
+                  requisitionId: request.consent.requisitionId,
+                  candidateId: request.candidateId,
+                  metadataJson: {
+                    previousStatus: sub.status,
+                    previousStage: priorStage,
+                    consentId: request.consentId,
+                  },
+                },
+              });
+            }
+          }
         }
 
         // 4. Audit Log

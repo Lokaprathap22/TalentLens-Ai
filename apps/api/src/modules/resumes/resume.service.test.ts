@@ -377,6 +377,7 @@ describe('Resume Ingestion Service — Security and Ingestion Controls', () => {
         uploadedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       })),
+      recordResumeInspection: vi.fn(async () => undefined),
     };
 
     const service = createResumeService({
@@ -388,6 +389,13 @@ describe('Resume Ingestion Service — Security and Ingestion Controls', () => {
     expect(fileData.mimeType).toBe('application/pdf');
     expect(fileData.fileName).toBe('resume-123.pdf');
     expect(fileData.buffer).toBeInstanceOf(Buffer);
+    expect(mockRepo.recordResumeInspection).toHaveBeenCalledWith(
+      recruiterPrincipal.organizationId,
+      recruiterPrincipal.userId,
+      'req-uuid-1',
+      'resume-1',
+      'cand-1',
+    );
   });
 
   describe('releaseHeldProcessingJobs', () => {

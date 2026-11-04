@@ -181,5 +181,46 @@ export function createResumeRouter(dependencies: ResumeRouterDependencies): Rout
     }
   });
 
+  // 6. Reuse an existing candidate's resume for another requisition in the same organization (F-10)
+  router.post(
+    '/:requisitionId/candidates/:candidateId/resumes/reuse',
+    sameOrigin,
+    requireCsrf,
+    async (request, response) => {
+      const requisitionId = parseUuid(request.params['requisitionId']);
+      const candidateId = parseUuid(request.params['candidateId']);
+      if (!requisitionId || !candidateId) {
+        response.status(400).json({ error: 'invalid_request' });
+        return;
+      }
+
+      const rawResumeDocId = (request.body as Record<string, unknown> | undefined)?.[
+        'resumeDocumentId'
+      ];
+      let resumeDocumentId: string | undefined;
+      if (rawResumeDocId !== undefined) {
+        const parsedDocId = parseUuid(String(rawResumeDocId));
+        if (!parsedDocId) {
+          response.status(400).json({ error: 'invalid_request' });
+          return;
+        }
+        resumeDocumentId = parsedDocId;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const result = await dependencies.service.reuseCandidateResumeForRequisition(
+          principal,
+          requisitionId,
+          candidateId,
+          resumeDocumentId,
+        );
+        response.status(result.isExisting ? 200 : 201).json(result);
+      } catch (error) {
+        handleError(error, response);
+      }
+    },
+  );
+
   return router;
 }

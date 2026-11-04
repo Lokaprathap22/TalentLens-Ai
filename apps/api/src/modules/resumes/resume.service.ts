@@ -169,13 +169,17 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             continue;
           }
 
-          // 2. Duplicate detection within organization
+          // 2. Duplicate detection within requisition (or organization when requisitionIds is omitted)
           const existing = await repository.findExistingResumeBySha256(
             principal.organizationId,
             file.sha256,
           );
 
-          if (existing) {
+          const isSameRequisitionDuplicate =
+            existing &&
+            (!existing.requisitionIds || existing.requisitionIds.includes(requisitionId));
+
+          if (isSameRequisitionDuplicate) {
             duplicates.push({
               fileName: file.sanitizedFileName,
               sha256: file.sha256,
@@ -423,6 +427,17 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
       }
 
       const buffer = await storageService.read(details.objectKey);
+
+      if (typeof repository.recordResumeInspection === 'function') {
+        await repository.recordResumeInspection(
+          principal.organizationId,
+          principal.userId,
+          requisitionId,
+          resumeId,
+          details.candidateId,
+        );
+      }
+
       return {
         buffer,
         mimeType: getMimeType(details.fileType),
@@ -442,6 +457,40 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
         principal.userId,
         requisitionId,
       );
+    },
+
+    async reuseCandidateResumeForRequisition(
+      principal: AuthenticatedPrincipal,
+      requisitionId: string,
+      candidateId: string,
+      resumeDocumentId?: string,
+    ) {
+      requireRecruiter(principal);
+
+      const requisition = await repository.findAuthorizedRequisition(
+        principal.organizationId,
+        principal.userId,
+        requisitionId,
+      );
+      if (!requisition) {
+        throw new RequisitionNotFoundError();
+      }
+
+      if (typeof repository.reuseCandidateResumeForRequisition !== 'function') {
+        throw new ResumeNotFoundError();
+      }
+
+      const reused = await repository.reuseCandidateResumeForRequisition(
+        principal,
+        requisitionId,
+        candidateId,
+        resumeDocumentId,
+      );
+      if (!reused) {
+        throw new ResumeNotFoundError();
+      }
+
+      return reused;
     },
   };
 }

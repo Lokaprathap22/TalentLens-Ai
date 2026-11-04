@@ -11,6 +11,7 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
+    "@talentlens/assessment-engine": "0.1.0",
     "@talentlens/database": "0.1.0",
     "@talentlens/document-processing": "0.1.0",
     "@talentlens/shared": "0.1.0",

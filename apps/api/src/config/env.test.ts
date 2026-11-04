@@ -21,6 +21,11 @@ describe('parseEnvironment', () => {
       aiBaseUrl: undefined,
       aiModel: undefined,
       aiTimeoutMs: 30_000,
+      assessmentProvider: 'openai',
+      assessmentOpenAiApiKey: undefined,
+      assessmentOpenAiBaseUrl: undefined,
+      assessmentOpenAiModel: undefined,
+      assessmentTimeoutMs: 30_000,
       resumeStorageRoot: expect.stringContaining('storage'),
       approvedPolicies: [],
       approvedPolicyVersions: [],
@@ -125,5 +130,35 @@ describe('parseEnvironment', () => {
     }
 
     throw new Error('Expected environment validation to fail');
+  });
+
+  it('validates assessment provider settings and rejects fake provider outside test (F-11)', () => {
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'development',
+        DATABASE_URL: validDatabaseUrl,
+        ASSESSMENT_PROVIDER: 'fake',
+      }),
+    ).toThrow('ASSESSMENT_PROVIDER');
+
+    const testEnv = parseEnvironment({
+      NODE_ENV: 'test',
+      DATABASE_URL: validDatabaseUrl,
+      ASSESSMENT_PROVIDER: 'fake',
+    });
+    expect(testEnv.assessmentProvider).toBe('fake');
+
+    const openAiEnv = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      ASSESSMENT_PROVIDER: 'openai',
+      ASSESSMENT_OPENAI_API_KEY: 'sk-placeholder',
+      ASSESSMENT_OPENAI_MODEL: 'gpt-4o-mini',
+      ASSESSMENT_OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      ASSESSMENT_TIMEOUT_MS: '45000',
+    });
+    expect(openAiEnv.assessmentProvider).toBe('openai');
+    expect(openAiEnv.assessmentOpenAiModel).toBe('gpt-4o-mini');
+    expect(openAiEnv.assessmentTimeoutMs).toBe(45_000);
   });
 });

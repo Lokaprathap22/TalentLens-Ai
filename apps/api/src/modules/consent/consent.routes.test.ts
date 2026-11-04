@@ -2,6 +2,7 @@ import request from 'supertest';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../app.js';
+import { deriveCsrfToken } from '../../middleware/csrf.js';
 import type { SessionService } from '../auth/session.service.js';
 import { ConsentPolicyUnapprovedError, type ConsentService } from './consent.service.js';
 
@@ -82,6 +83,42 @@ describe('consent routes integration tests', () => {
     expect(response.status).toBe(403);
   });
 
+  it('rejects invitation creation when CSRF token is missing or invalid', async () => {
+    const sessionService = createMockSessionService(recruiterPrincipal);
+    const mockConsentService = {
+      createInvitation: vi.fn(),
+    } as unknown as ConsentService;
+
+    const app = createApp({
+      consent: {
+        consentService: mockConsentService,
+        sessionService,
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const missingCsrfResponse = await request(app)
+      .post(`/api/v1/requisitions/${requisitionId}/candidates/${candidateId}/consent-invitations`)
+      .set('Origin', applicationOrigin)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .send({ email: 'candidate@example.com' });
+
+    expect(missingCsrfResponse.status).toBe(403);
+    expect(missingCsrfResponse.body.error).toBe('request_not_allowed');
+
+    const invalidCsrfResponse = await request(app)
+      .post(`/api/v1/requisitions/${requisitionId}/candidates/${candidateId}/consent-invitations`)
+      .set('Origin', applicationOrigin)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('x-csrf-token', 'invalid-csrf-token')
+      .send({ email: 'candidate@example.com' });
+
+    expect(invalidCsrfResponse.status).toBe(403);
+    expect(invalidCsrfResponse.body.error).toBe('request_not_allowed');
+    expect(mockConsentService.createInvitation).not.toHaveBeenCalled();
+  });
+
   it('validates email format on invitation creation', async () => {
     const sessionService = createMockSessionService(recruiterPrincipal);
     const mockConsentService = {
@@ -101,6 +138,7 @@ describe('consent routes integration tests', () => {
       .post(`/api/v1/requisitions/${requisitionId}/candidates/${candidateId}/consent-invitations`)
       .set('Origin', applicationOrigin)
       .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('x-csrf-token', deriveCsrfToken(rawToken))
       .send({ email: 'not-an-email' });
 
     expect(response.status).toBe(400);
@@ -138,6 +176,7 @@ describe('consent routes integration tests', () => {
       .post(`/api/v1/requisitions/${requisitionId}/candidates/${candidateId}/consent-invitations`)
       .set('Origin', applicationOrigin)
       .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('x-csrf-token', deriveCsrfToken(rawToken))
       .send({ email: 'candidate@example.com' });
 
     expect(response.status).toBe(201);

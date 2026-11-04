@@ -12,6 +12,22 @@ import {
   type ScorecardCriterionDefinition,
 } from './assessment.js';
 
+export class WorkerLeaseLostError extends Error {
+  public readonly jobId: string;
+  public readonly workerId: string;
+
+  constructor(
+    jobId: string,
+    workerId: string,
+    message = 'Worker lease expired or was lost before completion',
+  ) {
+    super(message);
+    this.name = 'WorkerLeaseLostError';
+    this.jobId = jobId;
+    this.workerId = workerId;
+  }
+}
+
 export interface WorkerJobProcessorOptions {
   workerId?: string;
   leaseDurationSeconds?: number;
@@ -129,15 +145,15 @@ export class WorkerJobProcessor {
               pj.status = 'RETRYABLE_FAILURE'
               AND pj.attempts < 3
               AND (
-                (pj.attempts = 1 AND pj.updated_at + INTERVAL '30 seconds' <= NOW())
+                (pj.attempts = 1 AND pj.updated_at + INTERVAL '30 seconds' <= clock_timestamp())
                 OR
-                (pj.attempts = 2 AND pj.updated_at + INTERVAL '120 seconds' <= NOW())
+                (pj.attempts = 2 AND pj.updated_at + INTERVAL '120 seconds' <= clock_timestamp())
               )
             )
             OR (
               pj.status = 'PROCESSING'
               AND pj.lease_expires_at IS NOT NULL
-              AND pj.lease_expires_at <= NOW()
+              AND pj.lease_expires_at <= clock_timestamp()
             )
           )
           ORDER BY pj.created_at ASC
@@ -210,7 +226,23 @@ export class WorkerJobProcessor {
           captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
           requisitionId: candidateJob.requisition_id,
         },
-        select: { id: true },
+        select: {
+          id: true,
+          candidateId: true,
+          confirmationName: true,
+          noticeTextHash: true,
+          candidate: {
+            select: {
+              id: true,
+              candidateCode: true,
+              profiles: {
+                orderBy: { profileVersion: 'desc' },
+                take: 1,
+                select: { location: true },
+              },
+            },
+          },
+        },
       });
 
       if (!activeConsent) {
@@ -235,7 +267,7 @@ export class WorkerJobProcessor {
             attempts = attempts + 1,
             locked_by = ${this.workerId},
             lease_token = ${leaseToken}::uuid,
-            lease_expires_at = NOW() + (${leaseMinutes} * INTERVAL '1 minute'),
+            lease_expires_at = clock_timestamp() + (${leaseMinutes} * INTERVAL '1 minute'),
             started_at = NOW(),
             updated_at = NOW()
         WHERE id = ${candidateJob.id}::uuid
@@ -266,6 +298,7 @@ export class WorkerJobProcessor {
       return {
         ...claimedRecord,
         leaseToken,
+        activeConsent,
       };
     });
 
@@ -288,13 +321,14 @@ export class WorkerJobProcessor {
         try {
           const renewed = await this.database.$executeRaw(Prisma.sql`
             UPDATE "processing_jobs"
-            SET lease_expires_at = NOW() + (${leaseMinutes} * INTERVAL '1 minute'),
+            SET lease_expires_at = clock_timestamp() + (${leaseMinutes} * INTERVAL '1 minute'),
                 updated_at = NOW()
             WHERE id = ${claimed.id}::uuid
               AND status = 'PROCESSING'
+              AND locked_by = ${this.workerId}
               AND lease_token = ${leaseToken}::uuid
               AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > NOW()
+              AND lease_expires_at > clock_timestamp()
           `);
 
           if (renewed === 0) {
@@ -331,6 +365,10 @@ export class WorkerJobProcessor {
         heartbeatTimer = null;
       }
 
+      if (err instanceof WorkerLeaseLostError) {
+        return true;
+      }
+
       // 4. Phase 4 — Short Transaction: Fenced failure recording and retry scheduling
       const errorMessage = (err as Error).message || 'Processing failed';
       const willFail = claimed.attempts >= 3;
@@ -348,9 +386,10 @@ export class WorkerJobProcessor {
               updated_at = NOW()
           WHERE id = ${claimed.id}::uuid
             AND status = 'PROCESSING'
+            AND locked_by = ${this.workerId}
             AND lease_token = ${leaseToken}::uuid
             AND lease_expires_at IS NOT NULL
-            AND lease_expires_at > NOW()
+            AND lease_expires_at > clock_timestamp()
         `);
 
         if (updated > 0 && willFail && claimed.jobType === 'EXTRACT_TEXT') {
@@ -408,7 +447,11 @@ export class WorkerJobProcessor {
               lease_token = NULL,
               updated_at = NOW()
           WHERE id = ${claimed.id}::uuid
+            AND status = 'PROCESSING'
+            AND locked_by = ${this.workerId}
             AND lease_token = ${leaseToken}::uuid
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > clock_timestamp()
         `);
         return;
       }
@@ -423,9 +466,10 @@ export class WorkerJobProcessor {
             updated_at = NOW()
         WHERE id = ${claimed.id}::uuid
           AND status = 'PROCESSING'
+          AND locked_by = ${this.workerId}
           AND lease_token = ${leaseToken}::uuid
           AND lease_expires_at IS NOT NULL
-          AND lease_expires_at > NOW()
+          AND lease_expires_at > clock_timestamp()
       `);
 
       if (updated === 0) {
@@ -470,7 +514,28 @@ export class WorkerJobProcessor {
   }
 
   private async handleAssessCandidate(
-    claimed: { id: string; batch: { requisitionId: string } | null; attempts: number },
+    claimed: {
+      id: string;
+      batch: { requisitionId: string } | null;
+      attempts: number;
+      activeConsent?:
+        | {
+            id: string;
+            candidateId?: string | undefined;
+            confirmationName?: string | null | undefined;
+            noticeTextHash?: string | null | undefined;
+            candidate?:
+              | {
+                  id: string;
+                  candidateCode: string;
+                  profiles?: Array<{ location: string | null }> | undefined;
+                }
+              | null
+              | undefined;
+          }
+        | null
+        | undefined;
+    },
     resumeDoc: { id: string; organizationId: string; candidateId?: string | undefined },
     leaseToken: string,
     isLeaseLost: () => boolean,
@@ -531,11 +596,74 @@ export class WorkerJobProcessor {
       };
     });
 
+    // Revalidate requisition-specific active HIRING_USE consent before provider execution
+    // and load the confirmed candidate name + candidate profile identifiers from the authoritative consent scope.
+    const preProviderConsent = this.database.candidateConsent?.findFirst
+      ? await this.database.candidateConsent.findFirst({
+          where: {
+            organizationId: resumeDoc.organizationId,
+            ...(resumeDoc.candidateId ? { candidateId: resumeDoc.candidateId } : {}),
+            candidate: {
+              resumes: {
+                some: { id: resumeDoc.id },
+              },
+            },
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            withdrawnAt: null,
+            policyVersion: { not: '' },
+            captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+            requisitionId: claimed.batch.requisitionId,
+          },
+          select: {
+            id: true,
+            candidateId: true,
+            confirmationName: true,
+            noticeTextHash: true,
+            candidate: {
+              select: {
+                id: true,
+                candidateCode: true,
+                profiles: {
+                  orderBy: { profileVersion: 'desc' },
+                  take: 1,
+                  select: { location: true },
+                },
+              },
+            },
+          },
+        })
+      : claimed.activeConsent;
+
+    if (!preProviderConsent) {
+      // Consent is missing, withdrawn, or not scoped to this requisition: hold job and do NOT invoke provider
+      await this.database.$transaction(async (tx) => {
+        await tx.$executeRaw(Prisma.sql`
+          UPDATE "processing_jobs"
+          SET status = 'HELD_FOR_AUTHORIZATION',
+              lease_expires_at = NULL,
+              locked_by = NULL,
+              lease_token = NULL,
+              updated_at = NOW()
+          WHERE id = ${claimed.id}::uuid
+            AND status = 'PROCESSING'
+            AND locked_by = ${this.workerId}
+            AND lease_token = ${leaseToken}::uuid
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > clock_timestamp()
+        `);
+      });
+      return;
+    }
+
+    const targetCandidateId = preProviderConsent.candidateId ?? resumeDoc.candidateId;
     const candidate =
-      this.database.candidate && resumeDoc.candidateId
+      typeof this.database.candidate?.findFirst === 'function' &&
+      targetCandidateId &&
+      (!preProviderConsent.candidate?.candidateCode || !preProviderConsent.confirmationName)
         ? await this.database.candidate.findFirst({
             where: {
-              id: resumeDoc.candidateId,
+              id: targetCandidateId,
               organizationId: resumeDoc.organizationId,
             },
             include: {
@@ -549,6 +677,7 @@ export class WorkerJobProcessor {
                   purpose: 'HIRING_USE',
                   status: 'ACTIVE',
                   withdrawnAt: null,
+                  policyVersion: { not: '' },
                 },
                 take: 1,
               },
@@ -556,12 +685,32 @@ export class WorkerJobProcessor {
           })
         : null;
 
+    const confirmedName =
+      preProviderConsent.confirmationName ??
+      claimed.activeConsent?.confirmationName ??
+      candidate?.consents?.[0]?.confirmationName ??
+      null;
+
     const candidateNames: string[] = [];
-    if (candidate?.consents[0]?.confirmationName) {
-      candidateNames.push(candidate.consents[0].confirmationName);
+    if (typeof confirmedName === 'string' && confirmedName.trim().length > 0) {
+      candidateNames.push(confirmedName.trim());
     }
-    const candidateAddress = candidate?.profiles[0]?.location ?? undefined;
-    const extraIdentifiers: string[] = candidate?.candidateCode ? [candidate.candidateCode] : [];
+
+    const candidateAddress =
+      preProviderConsent.candidate?.profiles?.[0]?.location ??
+      claimed.activeConsent?.candidate?.profiles?.[0]?.location ??
+      candidate?.profiles?.[0]?.location ??
+      undefined;
+
+    const resolvedCandidateCode =
+      preProviderConsent.candidate?.candidateCode ??
+      claimed.activeConsent?.candidate?.candidateCode ??
+      candidate?.candidateCode ??
+      null;
+    const extraIdentifiers: string[] =
+      typeof resolvedCandidateCode === 'string' && resolvedCandidateCode.trim().length > 0
+        ? [resolvedCandidateCode.trim()]
+        : [];
 
     const redacted = redactResumeText(extraction.extractedText, {
       candidateNames,
@@ -590,18 +739,39 @@ export class WorkerJobProcessor {
     const summary = calculateAssessmentSummary(criteriaDefs, verifiedResults);
 
     await this.database.$transaction(async (tx) => {
-      const leaseCheck = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      const leaseLock = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT id FROM "processing_jobs"
         WHERE id = ${claimed.id}::uuid
+          AND status = 'PROCESSING'
           AND locked_by = ${this.workerId}
           AND lease_token = ${leaseToken}::uuid
-          AND lease_expires_at > NOW()
-          AND status = 'PROCESSING'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
         FOR UPDATE
       `);
 
-      if (leaseCheck.length === 0) {
-        return;
+      if (leaseLock.length === 0) {
+        throw new WorkerLeaseLostError(claimed.id, this.workerId);
+      }
+
+      // Separately verify lease validity against actual wall-clock time AFTER the row lock has been acquired,
+      // because PostgreSQL's IndexScan may evaluate WHERE predicates before LockRows finishes waiting on a row lock.
+      const postLockLeaseCheck = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT id FROM "processing_jobs"
+        WHERE id = ${claimed.id}::uuid
+          AND status = 'PROCESSING'
+          AND locked_by = ${this.workerId}
+          AND lease_token = ${leaseToken}::uuid
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
+      `);
+
+      if (postLockLeaseCheck.length === 0) {
+        throw new WorkerLeaseLostError(
+          claimed.id,
+          this.workerId,
+          'Worker lease expired while waiting for processing_jobs row lock',
+        );
       }
 
       const stillConsented = await tx.candidateConsent.findFirst({
@@ -629,7 +799,11 @@ export class WorkerJobProcessor {
               lease_token = NULL,
               updated_at = NOW()
           WHERE id = ${claimed.id}::uuid
+            AND status = 'PROCESSING'
+            AND locked_by = ${this.workerId}
             AND lease_token = ${leaseToken}::uuid
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > clock_timestamp()
         `);
         return;
       }
@@ -748,7 +922,7 @@ export class WorkerJobProcessor {
         }
       }
 
-      await tx.$executeRaw(Prisma.sql`
+      const updatedCount = await tx.$executeRaw(Prisma.sql`
         UPDATE "processing_jobs"
         SET status = 'SUCCEEDED',
             finished_at = NOW(),
@@ -758,8 +932,19 @@ export class WorkerJobProcessor {
             updated_at = NOW()
         WHERE id = ${claimed.id}::uuid
           AND status = 'PROCESSING'
+          AND locked_by = ${this.workerId}
           AND lease_token = ${leaseToken}::uuid
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
       `);
+
+      if (updatedCount === 0) {
+        throw new WorkerLeaseLostError(
+          claimed.id,
+          this.workerId,
+          'Fenced job completion failed: lease expired or was superseded during transaction',
+        );
+      }
 
       await tx.auditLog.create({
         data: {
