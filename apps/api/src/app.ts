@@ -21,6 +21,10 @@ import {
   createConsentRouter,
   type ConsentRouterDependencies,
 } from './modules/consent/consent.routes.js';
+import {
+  createAssessmentRouter,
+  type AssessmentRouterDependencies,
+} from './modules/assessments/assessment.routes.js';
 
 export interface AppDependencies {
   databaseHealthChecker?: DatabaseHealthChecker;
@@ -29,6 +33,7 @@ export interface AppDependencies {
   scorecards?: ScorecardRouterDependencies;
   resumes?: ResumeRouterDependencies;
   consent?: ConsentRouterDependencies;
+  assessments?: AssessmentRouterDependencies;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -52,6 +57,9 @@ export function createApp(dependencies: AppDependencies = {}): Express {
   }
   if (dependencies.consent) {
     app.use('/api/v1', createConsentRouter(dependencies.consent));
+  }
+  if (dependencies.assessments) {
+    app.use('/api/v1', createAssessmentRouter(dependencies.assessments));
   }
 
   app.get('/api/v1/health', (_request, response) => {

@@ -21,6 +21,8 @@ import { createResumeService } from './modules/resumes/resume.service.js';
 import { createConsentRepository } from './modules/consent/consent.repository.js';
 import { createConsentService } from './modules/consent/consent.service.js';
 import { DefaultEmailDeliveryService } from './modules/consent/consent.email.js';
+import { createAssessmentRepository } from './modules/assessments/assessment.repository.js';
+import { createAssessmentService } from './modules/assessments/assessment.service.js';
 
 const environment = loadEnvironment();
 let sessionService: SessionService | undefined;
@@ -34,6 +36,8 @@ let resumeRepository: ReturnType<typeof createResumeRepository> | undefined;
 let resumeService: ReturnType<typeof createResumeService> | undefined;
 let consentRepository: ReturnType<typeof createConsentRepository> | undefined;
 let consentService: ReturnType<typeof createConsentService> | undefined;
+let assessmentRepository: ReturnType<typeof createAssessmentRepository> | undefined;
+let assessmentService: ReturnType<typeof createAssessmentService> | undefined;
 const emailDeliveryService = new DefaultEmailDeliveryService();
 const extractionProvider = createOpenAiCompatibleProvider({
   apiKey: environment.aiApiKey,
@@ -109,6 +113,12 @@ function getConsentService(): ReturnType<typeof createConsentService> {
   return consentService;
 }
 
+function getAssessmentService(): ReturnType<typeof createAssessmentService> {
+  assessmentRepository ??= createAssessmentRepository();
+  assessmentService ??= createAssessmentService(assessmentRepository);
+  return assessmentService;
+}
+
 const server = createServer(
   createApp({
     auth: {
@@ -165,6 +175,16 @@ const server = createServer(
         declineConsent: (...args) => getConsentService().declineConsent(...args),
         requestWithdrawal: (...args) => getConsentService().requestWithdrawal(...args),
         confirmWithdrawal: (...args) => getConsentService().confirmWithdrawal(...args),
+      },
+      sessionService: lazySessionService,
+      applicationOrigin: environment.appOrigin,
+      isProduction: environment.nodeEnv === 'production',
+    },
+    assessments: {
+      service: {
+        enqueue: (...args) => getAssessmentService().enqueue(...args),
+        getById: (...args) => getAssessmentService().getById(...args),
+        list: (...args) => getAssessmentService().list(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
