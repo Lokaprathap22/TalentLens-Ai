@@ -144,6 +144,8 @@ async function createTestFixture(client: AnyPrismaClient): Promise<TestFixture> 
       });
     }
 
+    await c.candidateConsent.deleteMany({ where: { organizationId: orgId } });
+
     if (candidateIds.length > 0) {
       await c.candidate.deleteMany({
         where: { id: { in: candidateIds } },
@@ -182,7 +184,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
     await pgClient.$disconnect();
   });
 
-  describe('Test 1: Batch, Candidate, Resume, and ProcessingJob Creation', () => {
+  describe('Milestone 5 Integration Tests — Worker Leases, Recovery & Authorization Gating', () => {
     let fixture: TestFixture;
 
     beforeAll(async () => {
@@ -193,67 +195,665 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
       await fixture.cleanup(pgClient);
     });
 
-    it('creates batch, candidate, resume document and queued jobs atomically in PostgreSQL 17', async () => {
-      const file1Sha = randomUUID().replace(/-/g, '');
-      const file2Sha = randomUUID().replace(/-/g, '');
-
-      const result = await repository.createResumeBatch(
+    it('1. Holds upload jobs when authorization is missing and initializes lease fields as null', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
         fixture.principal,
         fixture.requisitionId,
         [
           {
-            storageKey: '2026-11/test1.pdf',
-            fileName: 'test1.pdf',
+            storageKey: '2026-11/held-test.pdf',
+            fileName: 'held-test.pdf',
             fileType: 'PDF',
             mimeType: 'application/pdf',
             sizeBytes: 1024,
-            sha256: file1Sha,
-          },
-          {
-            storageKey: '2026-11/test2.docx',
-            fileName: 'test2.docx',
-            fileType: 'DOCX',
-            mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            sizeBytes: 2048,
-            sha256: file2Sha,
+            sha256: fileSha,
           },
         ],
-        { totalUploaded: 2, duplicates: 0, rejected: 0 },
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
       );
 
-      expect(result.batchId).toBeDefined();
-      expect(result.accepted).toHaveLength(2);
-
-      // Verify rows in PostgreSQL
-      const batch = await pgClient.processingBatch.findUnique({
-        where: { id: result.batchId },
+      const job = await pgClient.processingJob.findFirst({
+        where: { batchId: batchResult.batchId },
       });
-      expect(batch).toBeDefined();
-      expect(batch?.totalFiles).toBe(2);
-      expect(batch?.status).toBe('CREATED');
 
-      const jobs = await pgClient.processingJob.findMany({
-        where: { batchId: result.batchId },
-      });
-      expect(jobs).toHaveLength(2);
-      expect(
-        jobs.every(
-          (j: { status: string; jobType: string }) =>
-            j.status === 'QUEUED' && j.jobType === 'EXTRACT_TEXT',
-        ),
-      ).toBe(true);
+      expect(job).toBeDefined();
+      expect(job?.status).toBe('HELD_FOR_AUTHORIZATION');
+      expect(job?.leaseExpiresAt).toBeNull();
+      expect(job?.lockedBy).toBeNull();
+      expect(job?.leaseToken).toBeNull();
+      expect(job?.attempts).toBe(0);
+    });
 
-      const candidates = await pgClient.candidate.findMany({
-        where: { organizationId: fixture.organizationId },
-      });
-      expect(candidates).toHaveLength(2);
-      expect(candidates[0]?.candidateCode).toMatch(/^CAN-[A-F0-9]{8}$/);
+    it('2. Ensures held jobs cannot be claimed by worker queries', async () => {
+      const claimed = await repository.claimNextProcessingJob('worker-test-1');
+      expect(claimed).toBeNull();
+    });
 
-      const resumes = await pgClient.resumeDocument.findMany({
-        where: { organizationId: fixture.organizationId },
+    it('3. Enables release path on genuine active HIRING_USE consent and rejects revoked consent', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/auth-release.pdf',
+            fileName: 'auth-release.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: fileSha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candidateId = batchResult.accepted[0]!.candidateId;
+
+      // Attempt release without consent -> fails
+      const unconsentedRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+      );
+      expect(unconsentedRelease.releasedCount).toBe(0);
+      expect(unconsentedRelease.reason).toBe('NO_ACTIVE_VALID_CONSENT');
+
+      // Add revoked consent -> fails
+      const revokedConsent = await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+          withdrawnAt: new Date(), // Revoked!
+        },
       });
-      expect(resumes).toHaveLength(2);
-      expect(resumes.every((r: { parseStatus: string }) => r.parseStatus === 'PENDING')).toBe(true);
+
+      const revokedRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+      );
+      expect(revokedRelease.releasedCount).toBe(0);
+
+      // Attempt release with empty policy version -> fails
+      await pgClient.candidateConsent.update({
+        where: { id: revokedConsent.id },
+        data: { policyVersion: '' },
+      });
+      const emptyPolicyRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+      );
+      expect(emptyPolicyRelease.releasedCount).toBe(0);
+      expect(emptyPolicyRelease.reason).toBe('NO_ACTIVE_VALID_CONSENT');
+
+      // Now restore valid policy version and active consent
+      await pgClient.candidateConsent.update({
+        where: { id: revokedConsent.id },
+        data: { withdrawnAt: null, policyVersion: 'v1.0' },
+      });
+
+      // Recruiter assigned to a different requisition cannot release jobs for this requisition
+      const unauthorizedRecruiterId = randomUUID();
+      const unauthorizedRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+        unauthorizedRecruiterId,
+      );
+      expect(unauthorizedRelease.releasedCount).toBe(0);
+      expect(unauthorizedRelease.reason).toBe('UNAUTHORIZED_REQUISITION');
+
+      // Authorized recruiter releases jobs successfully!
+      const validRelease = await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candidateId,
+        fixture.principal.userId,
+      );
+      expect(validRelease.releasedCount).toBe(1);
+
+      // Verify status is now QUEUED in PostgreSQL
+      const releasedJob = await pgClient.processingJob.findFirst({
+        where: { batchId: batchResult.batchId },
+      });
+      expect(releasedJob?.status).toBe('QUEUED');
+    });
+
+    it('4. Claims released job atomically establishing lease ownership, UUID token and DB clock expiration', async () => {
+      const claimed = await repository.claimNextProcessingJob('worker-node-alpha', 5);
+      expect(claimed).toBeDefined();
+      expect(claimed?.lockedBy).toBe('worker-node-alpha');
+      expect(claimed?.leaseToken).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      expect(claimed?.attempts).toBe(1);
+      expect(claimed?.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now() + 200_000);
+
+      // Verify in PostgreSQL
+      const dbJob = await pgClient.processingJob.findUnique({
+        where: { id: claimed!.id },
+      });
+      expect(dbJob?.status).toBe('PROCESSING');
+      expect(dbJob?.lockedBy).toBe('worker-node-alpha');
+      expect(dbJob?.leaseToken).toBe(claimed?.leaseToken);
+    });
+
+    it('5. Prevents two workers from claiming the same active lease', async () => {
+      const secondClaim = await repository.claimNextProcessingJob('worker-node-beta', 5);
+      expect(secondClaim).toBeNull();
+    });
+
+    it('6. Heartbeat renewal extends expiration for matching token and rejects old/invalid token', async () => {
+      const job = await pgClient.processingJob.findFirst({
+        where: { status: 'PROCESSING' },
+      });
+      expect(job).toBeDefined();
+
+      // Renewal with wrong token fails
+      const badRenewal = await repository.renewJobLease(job!.id, randomUUID(), 5);
+      expect(badRenewal).toBe(false);
+
+      // Renewal with correct token succeeds
+      const goodRenewal = await repository.renewJobLease(job!.id, job!.leaseToken!, 10);
+      expect(goodRenewal).toBe(true);
+
+      const renewedJob = await pgClient.processingJob.findUnique({
+        where: { id: job!.id },
+      });
+      expect(renewedJob?.leaseExpiresAt?.getTime()).toBeGreaterThan(Date.now() + 500_000);
+    });
+
+    it('7. Ensures active lease cannot be reclaimed while unexpired', async () => {
+      const reclaimAttempt = await repository.claimNextProcessingJob('worker-reclaimer', 5);
+      expect(reclaimAttempt).toBeNull();
+    });
+
+    it('8. Reclaims expired lease with new token and fences out old worker from completing', async () => {
+      const activeJob = await pgClient.processingJob.findFirst({
+        where: { status: 'PROCESSING' },
+      });
+      expect(activeJob).toBeDefined();
+      const oldLeaseToken = activeJob!.leaseToken!;
+
+      // Simulate lease expiration by setting leaseExpiresAt in the past
+      await pgClient.processingJob.update({
+        where: { id: activeJob!.id },
+        data: {
+          leaseExpiresAt: new Date(Date.now() - 30_000), // expired 30s ago
+        },
+      });
+
+      // Another worker reclaims the expired job!
+      const reclaimed = await repository.claimNextProcessingJob('worker-new-owner', 5);
+      expect(reclaimed).toBeDefined();
+      expect(reclaimed?.id).toBe(activeJob!.id);
+      expect(reclaimed?.lockedBy).toBe('worker-new-owner');
+      expect(reclaimed?.leaseToken).not.toBe(oldLeaseToken);
+      expect(reclaimed?.attempts).toBe(2);
+
+      // Old worker tries to complete using old token -> FENCED OUT!
+      const parserResult: ParserResult = {
+        extractedText: 'Stale extraction from fenced worker.',
+        pageMapJson: { pageCount: 1 },
+        parser: 'talentlens-pdf-v1',
+        ocrUsed: false,
+        qualityStatus: 'COMPLETE',
+      };
+
+      const oldComplete = await repository.completeProcessingJob(
+        reclaimed!.id,
+        reclaimed!.resumeDocumentId,
+        reclaimed!.organizationId,
+        parserResult,
+        oldLeaseToken, // Stale token!
+      );
+      expect(oldComplete).toBe(false);
+
+      // Verify no extraction was created by the old worker
+      const extractions = await pgClient.documentExtraction.findMany({
+        where: { resumeDocumentId: reclaimed!.resumeDocumentId },
+      });
+      expect(extractions).toHaveLength(0);
+    });
+
+    it('9. Completes job with current lease token, persists extraction, and clears lease fields idempotently', async () => {
+      const currentJob = await pgClient.processingJob.findFirst({
+        where: { status: 'PROCESSING' },
+      });
+      expect(currentJob).toBeDefined();
+
+      const parserResult: ParserResult = {
+        extractedText: 'Valid extracted text from current lease holder.',
+        pageMapJson: { pageCount: 1 },
+        parser: 'talentlens-pdf-v1',
+        ocrUsed: false,
+        qualityStatus: 'COMPLETE',
+      };
+
+      const completed = await repository.completeProcessingJob(
+        currentJob!.id,
+        currentJob!.resumeDocumentId!,
+        currentJob!.organizationId,
+        parserResult,
+        currentJob!.leaseToken!,
+      );
+      expect(completed).toBe(true);
+
+      const dbJob = await pgClient.processingJob.findUnique({
+        where: { id: currentJob!.id },
+      });
+      expect(dbJob?.status).toBe('SUCCEEDED');
+      expect(dbJob?.leaseToken).toBeNull();
+      expect(dbJob?.lockedBy).toBeNull();
+      expect(dbJob?.leaseExpiresAt).toBeNull();
+
+      const extraction = await pgClient.documentExtraction.findFirst({
+        where: { resumeDocumentId: currentJob!.resumeDocumentId! },
+      });
+      expect(extraction).toBeDefined();
+      expect(extraction?.extractedText).toBe(parserResult.extractedText);
+
+      // Idempotency: re-completing does not duplicate extractions
+      const duplicateComplete = await repository.completeProcessingJob(
+        currentJob!.id,
+        currentJob!.resumeDocumentId!,
+        currentJob!.organizationId,
+        parserResult,
+        currentJob!.leaseToken!,
+      );
+      expect(duplicateComplete).toBe(false); // Already SUCCEEDED, leaseToken cleared
+
+      const count = await pgClient.documentExtraction.count({
+        where: { resumeDocumentId: currentJob!.resumeDocumentId! },
+      });
+      expect(count).toBe(1);
+    });
+
+    it('9b. Cannot renew, complete, or fail an expired lease even with matching token (no token resurrection)', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/expired-lease-tests.pdf',
+            fileName: 'expired-lease-tests.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: fileSha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candidateId = batchResult.accepted[0]!.candidateId;
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+      await repository.releaseHeldProcessingJobs(fixture.organizationId, candidateId);
+
+      const job = await repository.claimNextProcessingJob('worker-expiration-tester', 5);
+      expect(job).toBeDefined();
+      const token = job!.leaseToken;
+
+      // Force lease to be expired in the past
+      await pgClient.processingJob.update({
+        where: { id: job!.id },
+        data: { leaseExpiresAt: new Date(Date.now() - 10_000) },
+      });
+
+      // 1. Heartbeat renewal must fail on expired lease!
+      const renewResult = await repository.renewJobLease(job!.id, token, 5);
+      expect(renewResult).toBe(false);
+
+      // 2. Completion must fail on expired lease!
+      const parserResult: ParserResult = {
+        extractedText: 'Should not persist on expired lease.',
+        pageMapJson: { pageCount: 1 },
+        parser: 'talentlens-pdf-v1',
+        ocrUsed: false,
+        qualityStatus: 'COMPLETE',
+      };
+      const completeResult = await repository.completeProcessingJob(
+        job!.id,
+        job!.resumeDocumentId,
+        job!.organizationId,
+        parserResult,
+        token,
+      );
+      expect(completeResult).toBe(false);
+
+      // Extraction must NOT have been persisted
+      const extractions = await pgClient.documentExtraction.findMany({
+        where: { resumeDocumentId: job!.resumeDocumentId },
+      });
+      expect(extractions).toHaveLength(0);
+
+      // 3. Failure recording must also fail on expired lease!
+      const failResult = await repository.failProcessingJob(
+        job!.id,
+        job!.resumeDocumentId,
+        'Should not record on expired lease',
+        false,
+        token,
+      );
+      expect(failResult).toBe(false);
+
+      // Clean up the expired job by reclaiming it and completing it
+      const reclaimed = await repository.claimNextProcessingJob('cleanup-worker', 5);
+      expect(reclaimed).toBeDefined();
+      expect(reclaimed!.id).toBe(job!.id);
+      await repository.completeProcessingJob(
+        reclaimed!.id,
+        reclaimed!.resumeDocumentId,
+        reclaimed!.organizationId,
+        parserResult,
+        reclaimed!.leaseToken,
+      );
+    });
+
+    it('10. Enforces retry backoff on RETRYABLE_FAILURE jobs', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/retry-backoff-test.pdf',
+            fileName: 'retry-backoff-test.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: fileSha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candidateId = batchResult.accepted[0]!.candidateId;
+
+      // Add consent and release
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+
+      await repository.releaseHeldProcessingJobs(fixture.organizationId, candidateId);
+
+      // Attempt 1: claim
+      const job1 = await repository.claimNextProcessingJob('worker-retry', 5);
+      expect(job1).toBeDefined();
+      expect(job1?.attempts).toBe(1);
+
+      // Fail attempt 1
+      await repository.failProcessingJob(
+        job1!.id,
+        job1!.resumeDocumentId,
+        'Transient parser error',
+        false,
+        job1!.leaseToken,
+      );
+
+      // Immediately after failure, not eligible due to 30s backoff
+      const immediate = await repository.claimNextProcessingJob('worker-retry', 5);
+      expect(immediate).toBeNull();
+
+      // Fast-forward 35 seconds
+      await pgClient.processingJob.update({
+        where: { id: job1!.id },
+        data: { updatedAt: new Date(Date.now() - 35_000) },
+      });
+
+      // Attempt 2: claimable
+      const job2 = await repository.claimNextProcessingJob('worker-retry', 5);
+      expect(job2).toBeDefined();
+      expect(job2?.attempts).toBe(2);
+
+      // Fail attempt 2
+      await repository.failProcessingJob(
+        job2!.id,
+        job2!.resumeDocumentId,
+        'Transient parser error 2',
+        false,
+        job2!.leaseToken,
+      );
+
+      // Fast-forward 125 seconds
+      await pgClient.processingJob.update({
+        where: { id: job2!.id },
+        data: { updatedAt: new Date(Date.now() - 125_000) },
+      });
+
+      // Attempt 3: claimable
+      const job3 = await repository.claimNextProcessingJob('worker-retry', 5);
+      expect(job3).toBeDefined();
+      expect(job3?.attempts).toBe(3);
+
+      // Fail attempt 3 permanently
+      await repository.failProcessingJob(
+        job3!.id,
+        job3!.resumeDocumentId,
+        'Max attempts reached',
+        false,
+        job3!.leaseToken,
+      );
+
+      const failedJob = await pgClient.processingJob.findUnique({
+        where: { id: job3!.id },
+      });
+      expect(failedJob?.status).toBe('FAILED');
+      expect(failedJob?.lastErrorCode).toBe('Max attempts reached');
+    });
+
+    it('11. Transitions stale expired job with attempts >= 3 to FAILED on recovery', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/exhausted-stale.pdf',
+            fileName: 'exhausted-stale.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: fileSha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candidateId = batchResult.accepted[0]!.candidateId;
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+      await repository.releaseHeldProcessingJobs(fixture.organizationId, candidateId);
+
+      const job = await repository.claimNextProcessingJob('worker-exhaust', 5);
+      expect(job).toBeDefined();
+
+      // Simulate that this job had 3 attempts and expired
+      await pgClient.processingJob.update({
+        where: { id: job!.id },
+        data: {
+          attempts: 3,
+          leaseExpiresAt: new Date(Date.now() - 30_000), // expired
+        },
+      });
+
+      // Claiming should detect attempts >= 3 on stale recovery and fail it!
+      const reclaim = await repository.claimNextProcessingJob('worker-exhaust', 5);
+      expect(reclaim).toBeNull();
+
+      const failedJob = await pgClient.processingJob.findUnique({
+        where: { id: job!.id },
+      });
+      expect(failedJob?.status).toBe('FAILED');
+      expect(failedJob?.lastErrorCode).toBe('STALE_LEASE_EXPIRED_MAX_ATTEMPTS_EXHAUSTED');
+
+      const failedResume = await pgClient.resumeDocument.findUnique({
+        where: { id: job!.resumeDocumentId },
+      });
+      expect(failedResume?.parseStatus).toBe('FAILED');
+    });
+
+    it('12. Holds job and discards extraction when consent is revoked during processing', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/revocation-in-flight.pdf',
+            fileName: 'revocation-in-flight.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: fileSha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candidateId = batchResult.accepted[0]!.candidateId;
+      const consent = await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: 'v1.0',
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+      await repository.releaseHeldProcessingJobs(fixture.organizationId, candidateId);
+
+      const job = await repository.claimNextProcessingJob('worker-revocation', 5);
+      expect(job).toBeDefined();
+
+      // Candidate withdraws consent while worker is in flight!
+      await pgClient.candidateConsent.update({
+        where: { id: consent.id },
+        data: { withdrawnAt: new Date() },
+      });
+
+      // Worker attempts to complete
+      const parserResult: ParserResult = {
+        extractedText: 'Should never be stored due to revoked consent.',
+        pageMapJson: { pageCount: 1 },
+        parser: 'talentlens-pdf-v1',
+        ocrUsed: false,
+        qualityStatus: 'COMPLETE',
+      };
+
+      const completeResult = await repository.completeProcessingJob(
+        job!.id,
+        job!.resumeDocumentId,
+        job!.organizationId,
+        parserResult,
+        job!.leaseToken,
+      );
+      expect(completeResult).toBe(false);
+
+      // Verify job is back in HELD_FOR_AUTHORIZATION with lease cleared
+      const heldJob = await pgClient.processingJob.findUnique({
+        where: { id: job!.id },
+      });
+      expect(heldJob?.status).toBe('HELD_FOR_AUTHORIZATION');
+      expect(heldJob?.leaseToken).toBeNull();
+      expect(heldJob?.lockedBy).toBeNull();
+      expect(heldJob?.leaseExpiresAt).toBeNull();
+
+      // Verify NO extraction was created
+      const extraction = await pgClient.documentExtraction.findFirst({
+        where: { resumeDocumentId: job!.resumeDocumentId },
+      });
+      expect(extraction).toBeNull();
+    });
+
+    it('13. Migration consistency: legacy queued job lacking valid consent is transitioned to HELD_FOR_AUTHORIZATION on claim', async () => {
+      const fileSha = randomUUID().replace(/-/g, '');
+      const batchResult = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            storageKey: '2026-11/legacy-queued.pdf',
+            fileName: 'legacy-queued.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: fileSha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candidateId = batchResult.accepted[0]!.candidateId;
+      const job = await pgClient.processingJob.findFirst({
+        where: { batchId: batchResult.batchId },
+      });
+      expect(job).toBeDefined();
+
+      // Simulate a legacy job that remained QUEUED from before the migration,
+      // but whose candidate consent has an empty policyVersion
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: '', // Invalid empty policy version!
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedAt: new Date(),
+        },
+      });
+
+      // Manually simulate a legacy job in QUEUED status
+      await pgClient.processingJob.update({
+        where: { id: job!.id },
+        data: { status: 'QUEUED' },
+      });
+
+      // Worker attempts to claim it
+      const claimed = await repository.claimNextProcessingJob('worker-claim-tester', 5);
+      // Must NOT return the job for processing!
+      expect(claimed).toBeNull();
+
+      // Verify that claim-time authorization check safely transitioned it to HELD_FOR_AUTHORIZATION!
+      const dbJob = await pgClient.processingJob.findUnique({
+        where: { id: job!.id },
+      });
+      expect(dbJob?.status).toBe('HELD_FOR_AUTHORIZATION');
+      expect(dbJob?.leaseToken).toBeNull();
+      expect(dbJob?.leaseExpiresAt).toBeNull();
     });
   });
 
@@ -360,6 +960,25 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
       );
       expect(res.accepted).toHaveLength(2);
 
+      // In Milestone 5, authorize candidates and release held jobs so workers can claim them
+      for (const item of res.accepted) {
+        await pgClient.candidateConsent.create({
+          data: {
+            organizationId: fixture.principal.organizationId,
+            candidateId: item.candidateId,
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            policyVersion: '1.0',
+            captureMethod: 'RECRUITER_RECORDED',
+            capturedAt: new Date(),
+          },
+        });
+        await repository.releaseHeldProcessingJobs(
+          fixture.principal.organizationId,
+          item.candidateId,
+        );
+      }
+
       // Race two workers concurrently claiming next job
       const [job1, job2] = await Promise.all([
         repository.claimNextProcessingJob(),
@@ -396,7 +1015,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
     });
 
     it('completes processing job, creates DocumentExtraction record, and updates ResumeDocument status', async () => {
-      await repository.createResumeBatch(
+      const res = await repository.createResumeBatch(
         fixture.principal,
         fixture.requisitionId,
         [
@@ -411,6 +1030,25 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         ],
         { totalUploaded: 1, duplicates: 0, rejected: 0 },
       );
+
+      // In Milestone 5, authorize candidates and release held jobs
+      for (const item of res.accepted) {
+        await pgClient.candidateConsent.create({
+          data: {
+            organizationId: fixture.principal.organizationId,
+            candidateId: item.candidateId,
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            policyVersion: '1.0',
+            captureMethod: 'RECRUITER_RECORDED',
+            capturedAt: new Date(),
+          },
+        });
+        await repository.releaseHeldProcessingJobs(
+          fixture.principal.organizationId,
+          item.candidateId,
+        );
+      }
 
       const job = await repository.claimNextProcessingJob();
       expect(job).toBeDefined();
@@ -438,6 +1076,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         job!.resumeDocumentId,
         job!.organizationId,
         parserResult,
+        job!.leaseToken ?? undefined,
       );
 
       // Verify DocumentExtraction row exists in PostgreSQL
@@ -487,7 +1126,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
     });
 
     it('enforces backoff delay on RETRYABLE_FAILURE jobs and exhausts after 3 attempts', async () => {
-      await repository.createResumeBatch(
+      const res = await repository.createResumeBatch(
         fixture.principal,
         fixture.requisitionId,
         [
@@ -503,6 +1142,25 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         { totalUploaded: 1, duplicates: 0, rejected: 0 },
       );
 
+      // In Milestone 5, authorize candidates and release held jobs
+      for (const item of res.accepted) {
+        await pgClient.candidateConsent.create({
+          data: {
+            organizationId: fixture.principal.organizationId,
+            candidateId: item.candidateId,
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            policyVersion: '1.0',
+            captureMethod: 'RECRUITER_RECORDED',
+            capturedAt: new Date(),
+          },
+        });
+        await repository.releaseHeldProcessingJobs(
+          fixture.principal.organizationId,
+          item.candidateId,
+        );
+      }
+
       // Attempt 1: Claim queued job
       const job1 = await repository.claimNextProcessingJob();
       expect(job1).toBeDefined();
@@ -514,6 +1172,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         job1!.resumeDocumentId,
         'Transient I/O failure',
         false,
+        job1!.leaseToken ?? undefined,
       );
 
       // Immediately after failure, job must NOT be eligible due to 30s backoff!
@@ -539,6 +1198,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         job2!.resumeDocumentId,
         'Transient I/O failure 2',
         false,
+        job2!.leaseToken ?? undefined,
       );
 
       // Immediately after attempt 2 failure, job must NOT be eligible due to 120s backoff!
@@ -563,6 +1223,7 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
         job3!.resumeDocumentId,
         'Permanent exhaustion failure',
         false,
+        job3!.leaseToken ?? undefined,
       );
 
       const exhaustedJob = await pgClient.processingJob.findUnique({

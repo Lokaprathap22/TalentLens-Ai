@@ -429,6 +429,20 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
         fileName: details.fileName,
       };
     },
+
+    async releaseHeldProcessingJobs(
+      principal: AuthenticatedPrincipal,
+      candidateId: string,
+      requisitionId?: string,
+    ): Promise<{ releasedCount: number; reason?: string }> {
+      requireRecruiter(principal);
+      return repository.releaseHeldProcessingJobs(
+        principal.organizationId,
+        candidateId,
+        principal.userId,
+        requisitionId,
+      );
+    },
   };
 }
 

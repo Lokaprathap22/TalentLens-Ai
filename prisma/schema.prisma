@@ -117,6 +117,7 @@ enum ProcessingJobStatus {
   RETRYABLE_FAILURE
   FAILED
   CANCELLED
+  HELD_FOR_AUTHORIZATION
 }
 
 enum AssessmentStatus {
@@ -602,6 +603,9 @@ model ProcessingJob {
   lastErrorCode    String?             @map("last_error_code")
   startedAt        DateTime?           @map("started_at")
   finishedAt       DateTime?           @map("finished_at")
+  leaseExpiresAt   DateTime?           @map("lease_expires_at")
+  lockedBy         String?             @map("locked_by")
+  leaseToken       String?             @map("lease_token") @db.Uuid
   createdAt        DateTime            @default(now()) @map("created_at")
   updatedAt        DateTime            @updatedAt @map("updated_at")
 
@@ -611,6 +615,7 @@ model ProcessingJob {
   @@unique([batchId, resumeDocumentId, jobType], map: "processing_jobs_idempotency_key")
   @@index([status, createdAt])
   @@index([batchId, status])
+  @@index([status, leaseExpiresAt])
   @@map("processing_jobs")
 }
 

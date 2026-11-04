@@ -51,6 +51,9 @@ export interface ClaimedJob {
   resumeDocumentId: string;
   jobType: string;
   attempts: number;
+  leaseToken: string;
+  lockedBy: string;
+  leaseExpiresAt: Date;
   resumeDocument: {
     id: string;
     objectKey: string;
@@ -110,21 +113,40 @@ export interface ResumeRepository {
     createdAt: Date;
   } | null>;
 
-  claimNextProcessingJob(): Promise<ClaimedJob | null>;
+  claimNextProcessingJob(
+    workerId?: string,
+    leaseDurationMinutes?: number,
+  ): Promise<ClaimedJob | null>;
+
+  renewJobLease(jobId: string, leaseToken: string, extensionMinutes?: number): Promise<boolean>;
 
   completeProcessingJob(
     jobId: string,
     resumeDocumentId: string,
     organizationId: string,
     result: ParserResult,
-  ): Promise<void>;
+    leaseToken?: string,
+  ): Promise<boolean>;
 
   failProcessingJob(
     jobId: string,
     resumeDocumentId: string,
     errorMessage: string,
     isPermanent: boolean,
-  ): Promise<void>;
+    leaseToken?: string,
+  ): Promise<boolean>;
+
+  releaseHeldProcessingJobs(
+    organizationId: string,
+    candidateId: string,
+    recruiterId?: string,
+    requisitionId?: string,
+  ): Promise<{ releasedCount: number; reason?: string }>;
+
+  holdProcessingJobsForRevokedConsent(
+    organizationId: string,
+    candidateId: string,
+  ): Promise<{ heldCount: number }>;
 }
 
 export function createResumeRepository(
@@ -197,14 +219,28 @@ export function createResumeRepository(
             },
           });
 
-          // 3. Create the ProcessingJob
+          // 3. Create the ProcessingJob (held for authorization unless genuine active consent exists)
+          const activeConsent = await tx.candidateConsent.findFirst({
+            where: {
+              organizationId: principal.organizationId,
+              candidateId: candidate.id,
+              purpose: 'HIRING_USE',
+              status: 'ACTIVE',
+              withdrawnAt: null,
+              policyVersion: { not: '' },
+            },
+            select: { id: true },
+          });
+
+          const initialJobStatus = activeConsent ? 'QUEUED' : 'HELD_FOR_AUTHORIZATION';
+
           await tx.processingJob.create({
             data: {
               batchId: batch.id,
               organizationId: principal.organizationId,
               resumeDocumentId: resume.id,
               jobType: 'EXTRACT_TEXT',
-              status: 'QUEUED',
+              status: initialJobStatus,
               attempts: 0,
             },
           });
@@ -387,23 +423,39 @@ export function createResumeRepository(
       };
     },
 
-    async claimNextProcessingJob() {
+    async claimNextProcessingJob(workerId = `worker-${randomUUID()}`, leaseDurationMinutes = 5) {
       return database.$transaction(async (tx) => {
-        // Atomic skip-locked claim with database-backed exponential backoff on retryable failures
-        const jobs = await tx.$queryRaw<Array<{ id: string }>>(
+        // Atomic skip-locked claim with database-clock retry backoff and stale-job lease recovery
+        const jobs = await tx.$queryRaw<
+          Array<{
+            id: string;
+            status: string;
+            attempts: number;
+            resume_document_id: string | null;
+            organization_id: string;
+          }>
+        >(
           Prisma.sql`
-            SELECT id FROM "processing_jobs"
-            WHERE (status = 'QUEUED')
-               OR (
-                 status = 'RETRYABLE_FAILURE'
-                 AND attempts < 3
-                 AND (
-                   (attempts = 1 AND updated_at + INTERVAL '30 seconds' <= NOW())
-                   OR
-                   (attempts = 2 AND updated_at + INTERVAL '120 seconds' <= NOW())
-                 )
-               )
-            ORDER BY created_at ASC
+            SELECT pj.id, pj.status, pj.attempts, pj.resume_document_id, pj.organization_id
+            FROM "processing_jobs" pj
+            WHERE (
+              (pj.status = 'QUEUED')
+              OR (
+                pj.status = 'RETRYABLE_FAILURE'
+                AND pj.attempts < 3
+                AND (
+                  (pj.attempts = 1 AND pj.updated_at + INTERVAL '30 seconds' <= NOW())
+                  OR
+                  (pj.attempts = 2 AND pj.updated_at + INTERVAL '120 seconds' <= NOW())
+                )
+              )
+              OR (
+                pj.status = 'PROCESSING'
+                AND pj.lease_expires_at IS NOT NULL
+                AND pj.lease_expires_at <= NOW()
+              )
+            )
+            ORDER BY pj.created_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           `,
@@ -413,15 +465,95 @@ export function createResumeRepository(
           return null;
         }
 
-        const jobId = jobs[0].id;
+        const candidateJob = jobs[0];
 
-        const claimed = await tx.processingJob.update({
-          where: { id: jobId },
-          data: {
-            status: 'PROCESSING',
-            startedAt: new Date(),
-            attempts: { increment: 1 },
+        // 1. Stale-job exhaustion check: if already at or over 3 attempts, mark FAILED permanently
+        if (candidateJob.status === 'PROCESSING' && candidateJob.attempts >= 3) {
+          await tx.processingJob.update({
+            where: { id: candidateJob.id },
+            data: {
+              status: 'FAILED',
+              lastErrorCode: 'STALE_LEASE_EXPIRED_MAX_ATTEMPTS_EXHAUSTED',
+              finishedAt: new Date(),
+              leaseExpiresAt: null,
+              lockedBy: null,
+              leaseToken: null,
+            },
+          });
+
+          if (candidateJob.resume_document_id) {
+            await tx.resumeDocument.update({
+              where: { id: candidateJob.resume_document_id },
+              data: { parseStatus: 'FAILED' },
+            });
+          }
+          return null;
+        }
+
+        // 2. Authorization verification: ensure candidate has active HIRING_USE consent
+        if (!candidateJob.resume_document_id) {
+          await tx.processingJob.update({
+            where: { id: candidateJob.id },
+            data: {
+              status: 'FAILED',
+              lastErrorCode: 'MISSING_RESUME_DOCUMENT',
+              finishedAt: new Date(),
+              leaseExpiresAt: null,
+              lockedBy: null,
+              leaseToken: null,
+            },
+          });
+          return null;
+        }
+
+        const activeConsent = await tx.candidateConsent.findFirst({
+          where: {
+            organizationId: candidateJob.organization_id,
+            candidate: {
+              resumes: {
+                some: { id: candidateJob.resume_document_id },
+              },
+            },
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            withdrawnAt: null,
+            policyVersion: { not: '' },
+            captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
           },
+          select: { id: true },
+        });
+
+        if (!activeConsent) {
+          // Authorization not present or revoked: transition job to HELD_FOR_AUTHORIZATION
+          await tx.processingJob.update({
+            where: { id: candidateJob.id },
+            data: {
+              status: 'HELD_FOR_AUTHORIZATION',
+              leaseExpiresAt: null,
+              lockedBy: null,
+              leaseToken: null,
+            },
+          });
+          return null;
+        }
+
+        // 3. Atomically grant lease with fresh UUID token and database clock
+        const leaseToken = randomUUID();
+
+        await tx.$executeRaw(Prisma.sql`
+          UPDATE "processing_jobs"
+          SET status = 'PROCESSING',
+              attempts = attempts + 1,
+              locked_by = ${workerId},
+              lease_token = ${leaseToken}::uuid,
+              lease_expires_at = NOW() + (${leaseDurationMinutes} * INTERVAL '1 minute'),
+              started_at = NOW(),
+              updated_at = NOW()
+          WHERE id = ${candidateJob.id}::uuid
+        `);
+
+        const claimedRecord = await tx.processingJob.findUnique({
+          where: { id: candidateJob.id },
           include: {
             resumeDocument: {
               select: {
@@ -434,44 +566,125 @@ export function createResumeRepository(
           },
         });
 
-        if (!claimed.resumeDocument) {
-          // Corrupt job record without resume
+        if (!claimedRecord || !claimedRecord.resumeDocument) {
           await tx.processingJob.update({
-            where: { id: jobId },
+            where: { id: candidateJob.id },
             data: { status: 'FAILED', lastErrorCode: 'MISSING_RESUME_DOCUMENT' },
           });
           return null;
         }
 
         return {
-          id: claimed.id,
-          batchId: claimed.batchId,
-          organizationId: claimed.organizationId,
-          resumeDocumentId: claimed.resumeDocument.id,
-          jobType: claimed.jobType,
-          attempts: claimed.attempts,
+          id: claimedRecord.id,
+          batchId: claimedRecord.batchId,
+          organizationId: claimedRecord.organizationId,
+          resumeDocumentId: claimedRecord.resumeDocument.id,
+          jobType: claimedRecord.jobType,
+          attempts: claimedRecord.attempts,
+          leaseToken,
+          lockedBy: workerId,
+          leaseExpiresAt: claimedRecord.leaseExpiresAt ?? new Date(),
           resumeDocument: {
-            id: claimed.resumeDocument.id,
-            objectKey: claimed.resumeDocument.objectKey,
-            fileType: claimed.resumeDocument.fileType as ResumeFileType,
-            organizationId: claimed.resumeDocument.organizationId,
+            id: claimedRecord.resumeDocument.id,
+            objectKey: claimedRecord.resumeDocument.objectKey,
+            fileType: claimedRecord.resumeDocument.fileType as ResumeFileType,
+            organizationId: claimedRecord.resumeDocument.organizationId,
           },
         };
       });
     },
 
-    async completeProcessingJob(jobId, resumeDocumentId, organizationId, result) {
-      await database.$transaction(async (tx) => {
-        // Idempotency: skip if job has already succeeded
-        const existingJob = await tx.processingJob.findUnique({
-          where: { id: jobId },
-          select: { status: true },
+    async renewJobLease(jobId, leaseToken, extensionMinutes = 5) {
+      const updated = await database.$executeRaw(Prisma.sql`
+        UPDATE "processing_jobs"
+        SET lease_expires_at = NOW() + (${extensionMinutes} * INTERVAL '1 minute'),
+            updated_at = NOW()
+        WHERE id = ${jobId}::uuid
+          AND status = 'PROCESSING'
+          AND lease_token = ${leaseToken}::uuid
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > NOW()
+      `);
+      return updated > 0;
+    },
+
+    async completeProcessingJob(jobId, resumeDocumentId, organizationId, result, leaseToken) {
+      return database.$transaction(async (tx) => {
+        // 1. Re-verify active authorization
+        const activeConsent = await tx.candidateConsent.findFirst({
+          where: {
+            organizationId,
+            candidate: {
+              resumes: {
+                some: { id: resumeDocumentId },
+              },
+            },
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            withdrawnAt: null,
+            policyVersion: { not: '' },
+            captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+          },
+          select: { id: true },
         });
 
-        if (existingJob?.status === 'SUCCEEDED') {
-          return;
+        if (!activeConsent) {
+          // Authorization revoked during processing: hold job, clear lease, do not persist extraction
+          if (leaseToken) {
+            await tx.$executeRaw(Prisma.sql`
+              UPDATE "processing_jobs"
+              SET status = 'HELD_FOR_AUTHORIZATION',
+                  lease_expires_at = NULL,
+                  locked_by = NULL,
+                  lease_token = NULL,
+                  updated_at = NOW()
+              WHERE id = ${jobId}::uuid
+                AND lease_token = ${leaseToken}::uuid
+            `);
+          }
+          return false;
         }
 
+        // 2. Fenced update conditional on current lease owner and unexpired lease
+        let updatedCount: number;
+        if (leaseToken) {
+          updatedCount = await tx.$executeRaw(Prisma.sql`
+            UPDATE "processing_jobs"
+            SET status = 'SUCCEEDED',
+                finished_at = NOW(),
+                lease_expires_at = NULL,
+                locked_by = NULL,
+                lease_token = NULL,
+                updated_at = NOW()
+            WHERE id = ${jobId}::uuid
+              AND status = 'PROCESSING'
+              AND lease_token = ${leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
+          `);
+        } else {
+          const existingJob = await tx.processingJob.findUnique({
+            where: { id: jobId },
+            select: { status: true },
+          });
+          if (existingJob?.status === 'SUCCEEDED') return true;
+          const res = await tx.processingJob.updateMany({
+            where: {
+              id: jobId,
+              status: 'PROCESSING',
+              OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { gt: new Date() } }],
+            },
+            data: { status: 'SUCCEEDED', finishedAt: new Date() },
+          });
+          updatedCount = res.count;
+        }
+
+        if (updatedCount === 0) {
+          // Fenced out! Another worker took the job or lease was lost
+          return false;
+        }
+
+        // 3. Persist extraction and update resume parseStatus
         const latest = await tx.documentExtraction.aggregate({
           where: { resumeDocumentId, organizationId },
           _max: { version: true },
@@ -504,18 +717,12 @@ export function createResumeRepository(
           data: { parseStatus: targetParseStatus },
         });
 
-        await tx.processingJob.update({
-          where: { id: jobId },
-          data: {
-            status: 'SUCCEEDED',
-            finishedAt: new Date(),
-          },
-        });
+        return true;
       });
     },
 
-    async failProcessingJob(jobId, resumeDocumentId, errorMessage, isPermanent) {
-      await database.$transaction(async (tx) => {
+    async failProcessingJob(jobId, resumeDocumentId, errorMessage, isPermanent, leaseToken) {
+      return database.$transaction(async (tx) => {
         const current = await tx.processingJob.findUnique({
           where: { id: jobId },
           select: { attempts: true },
@@ -523,22 +730,182 @@ export function createResumeRepository(
 
         const attempts = current?.attempts ?? 1;
         const willFail = isPermanent || attempts >= 3;
+        const nextStatus = willFail ? 'FAILED' : 'RETRYABLE_FAILURE';
 
-        await tx.processingJob.update({
-          where: { id: jobId },
-          data: {
-            status: willFail ? 'FAILED' : 'RETRYABLE_FAILURE',
-            lastErrorCode: errorMessage.slice(0, 500),
-            finishedAt: new Date(),
-          },
-        });
+        let updatedCount: number;
+        if (leaseToken) {
+          updatedCount = await tx.$executeRaw(Prisma.sql`
+            UPDATE "processing_jobs"
+            SET status = ${nextStatus}::"ProcessingJobStatus",
+                last_error_code = ${errorMessage.slice(0, 500)},
+                finished_at = NOW(),
+                lease_expires_at = NULL,
+                locked_by = NULL,
+                lease_token = NULL,
+                updated_at = NOW()
+            WHERE id = ${jobId}::uuid
+              AND status = 'PROCESSING'
+              AND lease_token = ${leaseToken}::uuid
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
+          `);
+        } else {
+          const res = await tx.processingJob.updateMany({
+            where: {
+              id: jobId,
+              status: 'PROCESSING',
+              OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { gt: new Date() } }],
+            },
+            data: {
+              status: nextStatus,
+              lastErrorCode: errorMessage.slice(0, 500),
+              finishedAt: new Date(),
+            },
+          });
+          updatedCount = res.count;
+        }
 
-        if (willFail) {
+        if (updatedCount > 0 && willFail) {
           await tx.resumeDocument.update({
             where: { id: resumeDocumentId },
             data: { parseStatus: 'FAILED' },
           });
         }
+
+        return updatedCount > 0;
+      });
+    },
+
+    async releaseHeldProcessingJobs(organizationId, candidateId, recruiterId, requisitionId) {
+      return database.$transaction(async (tx) => {
+        const candidate = await tx.candidate.findFirst({
+          where: { id: candidateId, organizationId },
+          select: { id: true },
+        });
+
+        if (!candidate) {
+          return { releasedCount: 0, reason: 'CANDIDATE_NOT_FOUND' };
+        }
+
+        const validConsent = await tx.candidateConsent.findFirst({
+          where: {
+            organizationId,
+            candidateId,
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            withdrawnAt: null,
+            policyVersion: { not: '' },
+            captureMethod: { in: ['RECRUITER_RECORDED', 'CANDIDATE_PORTAL', 'IMPORTED'] },
+          },
+          select: { id: true },
+        });
+
+        if (!validConsent) {
+          return { releasedCount: 0, reason: 'NO_ACTIVE_VALID_CONSENT' };
+        }
+
+        // Find candidate's held jobs in this organization
+        const heldJobs = await tx.processingJob.findMany({
+          where: {
+            organizationId,
+            status: 'HELD_FOR_AUTHORIZATION',
+            resumeDocument: {
+              candidateId,
+              organizationId,
+            },
+            ...(requisitionId ? { batch: { requisitionId } } : {}),
+          },
+          include: {
+            batch: {
+              select: { requisitionId: true },
+            },
+          },
+        });
+
+        if (heldJobs.length === 0) {
+          return { releasedCount: 0, reason: 'NO_HELD_JOBS_FOUND' };
+        }
+
+        // Verify recruiter assignment to the requisition(s)
+        const targetRequisitionIds = Array.from(
+          new Set(heldJobs.map((j) => j.batch.requisitionId)),
+        );
+        let authorizedRequisitionIds = targetRequisitionIds;
+
+        if (recruiterId) {
+          const accessibleRequisitions = await tx.requisition.findMany({
+            where: {
+              id: { in: targetRequisitionIds },
+              organizationId,
+              assignedRecruiterId: recruiterId,
+            },
+            select: { id: true },
+          });
+
+          authorizedRequisitionIds = accessibleRequisitions.map((r) => r.id);
+          if (authorizedRequisitionIds.length === 0) {
+            return { releasedCount: 0, reason: 'UNAUTHORIZED_REQUISITION' };
+          }
+        }
+
+        const updated = await tx.processingJob.updateMany({
+          where: {
+            organizationId,
+            status: 'HELD_FOR_AUTHORIZATION',
+            batch: {
+              requisitionId: { in: authorizedRequisitionIds },
+            },
+            resumeDocument: {
+              candidateId,
+              organizationId,
+            },
+          },
+          data: {
+            status: 'QUEUED',
+          },
+        });
+
+        if (updated.count > 0) {
+          await tx.auditLog.create({
+            data: {
+              organizationId,
+              action: 'PROCESSING_JOBS_RELEASED_FOR_AUTHORIZATION',
+              resourceType: 'Candidate',
+              resourceId: candidateId,
+              metadataJson: {
+                releasedCount: updated.count,
+                consentId: validConsent.id,
+                requisitionIds: authorizedRequisitionIds,
+                recruiterId: recruiterId ?? null,
+              },
+            },
+          });
+        }
+
+        return { releasedCount: updated.count };
+      });
+    },
+
+    async holdProcessingJobsForRevokedConsent(organizationId, candidateId) {
+      return database.$transaction(async (tx) => {
+        const updated = await tx.processingJob.updateMany({
+          where: {
+            organizationId,
+            status: { in: ['QUEUED', 'PROCESSING'] },
+            resumeDocument: {
+              candidateId,
+              organizationId,
+            },
+          },
+          data: {
+            status: 'HELD_FOR_AUTHORIZATION',
+            leaseExpiresAt: null,
+            lockedBy: null,
+            leaseToken: null,
+          },
+        });
+
+        return { heldCount: updated.count };
       });
     },
   };

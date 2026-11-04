@@ -133,6 +133,8 @@ const server = createServer(
         getResumeDetails: (...args) => getResumeService().getResumeDetails(...args),
         getExtraction: (...args) => getResumeService().getExtraction(...args),
         getResumeFile: (...args) => getResumeService().getResumeFile(...args),
+        releaseHeldProcessingJobs: (...args) =>
+          getResumeService().releaseHeldProcessingJobs(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,

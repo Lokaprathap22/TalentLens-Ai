@@ -389,4 +389,33 @@ describe('Resume Ingestion Service — Security and Ingestion Controls', () => {
     expect(fileData.fileName).toBe('resume-123.pdf');
     expect(fileData.buffer).toBeInstanceOf(Buffer);
   });
+
+  describe('releaseHeldProcessingJobs', () => {
+    it('denies non-recruiter principals', async () => {
+      const mockRepo: Partial<ResumeRepository> = {};
+      const service = createResumeService({ repository: mockRepo as ResumeRepository });
+      await expect(
+        service.releaseHeldProcessingJobs(hiringManagerPrincipal, 'cand-1'),
+      ).rejects.toThrow(ResumeRoleError);
+    });
+
+    it('delegates to repository with authenticated organization ID and candidate ID', async () => {
+      const mockRepo: Partial<ResumeRepository> = {
+        releaseHeldProcessingJobs: vi.fn(async () => ({ releasedCount: 2 })),
+      };
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+      });
+
+      const result = await service.releaseHeldProcessingJobs(recruiterPrincipal, 'cand-123');
+      expect(result.releasedCount).toBe(2);
+      expect(mockRepo.releaseHeldProcessingJobs).toHaveBeenCalledWith(
+        recruiterPrincipal.organizationId,
+        'cand-123',
+        recruiterPrincipal.userId,
+        undefined,
+      );
+    });
+  });
 });

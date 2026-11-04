@@ -81,6 +81,7 @@ function createTestApp(
   };
 
   const service: ResumeService = {
+    releaseHeldProcessingJobs: vi.fn(async () => ({ releasedCount: 1 })),
     uploadResumes: vi.fn(async () => {
       if (options.uploadError) throw options.uploadError;
       return sampleUploadResult;

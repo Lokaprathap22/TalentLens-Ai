@@ -44,7 +44,7 @@ describe('Resume Background Worker Processor', () => {
   });
 
   it('claims and completes a queued text extraction job', async () => {
-    const completeSpy = vi.fn(async () => {});
+    const completeSpy = vi.fn(async () => true);
     const mockRepo: Partial<ResumeRepository> = {
       claimNextProcessingJob: vi.fn(async () => ({
         id: 'job-1',
@@ -53,6 +53,9 @@ describe('Resume Background Worker Processor', () => {
         resumeDocumentId: 'doc-1',
         jobType: 'EXTRACT_TEXT',
         attempts: 1,
+        leaseToken: '00000000-0000-0000-0000-000000000001',
+        lockedBy: 'worker-1',
+        leaseExpiresAt: new Date(Date.now() + 300_000),
         resumeDocument: {
           id: 'doc-1',
           objectKey: '2026-11/test.pdf',
@@ -84,7 +87,7 @@ describe('Resume Background Worker Processor', () => {
   });
 
   it('handles parsing failure by marking retryable or permanent failure', async () => {
-    const failSpy = vi.fn(async () => {});
+    const failSpy = vi.fn(async () => true);
     const failingParser: Partial<ResumeParsingService> = {
       parse: vi.fn(async () => {
         throw new Error('Decompression failure');
@@ -99,6 +102,9 @@ describe('Resume Background Worker Processor', () => {
         resumeDocumentId: 'doc-1',
         jobType: 'EXTRACT_TEXT',
         attempts: 2,
+        leaseToken: '00000000-0000-0000-0000-000000000002',
+        lockedBy: 'worker-1',
+        leaseExpiresAt: new Date(Date.now() + 300_000),
         resumeDocument: {
           id: 'doc-1',
           objectKey: '2026-11/corrupt.pdf',
