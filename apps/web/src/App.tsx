@@ -1,9 +1,12 @@
 import { Compass } from 'lucide-react';
 import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router';
 
+import { AuthProvider } from './app/auth.js';
+import { ProtectedRoute, RoleWorkspaceNoticePage } from './app/protected-route.js';
 import { WorkspaceProvider } from './app/workspace.js';
 import { Card, EmptyState, buttonStyles } from './components/ui/index.js';
-import { sampleWorkspace, unauthenticatedWorkspace } from './dev-fixtures/workspace.fixture.js';
+import { sampleWorkspace } from './dev-fixtures/workspace.fixture.js';
+import { LoginPage } from './features/auth/LoginPage.js';
 import { DashboardPage } from './features/dashboard/DashboardPage.js';
 import { DesignSystemPage } from './features/design-system/DesignSystemPage.js';
 import { AppShell } from './layouts/AppShell.js';
@@ -35,19 +38,54 @@ function NotFoundPage(): React.JSX.Element {
 }
 
 export function AppRoutes(): React.JSX.Element {
-  const workspace = IS_DEV_OR_TEST ? sampleWorkspace : unauthenticatedWorkspace;
-
   return (
-    <WorkspaceProvider value={workspace}>
+    <AuthProvider>
       <Routes>
-        <Route element={<AppShell />}>
-          <Route index element={<Navigate to="/dashboard" replace />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
-          {IS_DEV_OR_TEST ? <Route path="/design-system" element={<DesignSystemPage />} /> : null}
-          <Route path="*" element={<NotFoundPage />} />
+        <Route path="/login" element={<LoginPage />} />
+
+        <Route
+          path="/client-portal"
+          element={
+            <ProtectedRoute allowedRoles={['CLIENT_HIRING_MANAGER']}>
+              <RoleWorkspaceNoticePage role="CLIENT_HIRING_MANAGER" />
+            </ProtectedRoute>
+          }
+        />
+
+        <Route
+          path="/delivery-overview"
+          element={
+            <ProtectedRoute allowedRoles={['DELIVERY_HEAD']}>
+              <RoleWorkspaceNoticePage role="DELIVERY_HEAD" />
+            </ProtectedRoute>
+          }
+        />
+
+        {IS_DEV_OR_TEST ? (
+          <Route
+            path="/dev/preview"
+            element={
+              <WorkspaceProvider value={sampleWorkspace}>
+                <AppShell />
+              </WorkspaceProvider>
+            }
+          >
+            <Route index element={<Navigate to="/dev/preview/dashboard" replace />} />
+            <Route path="dashboard" element={<DashboardPage />} />
+            <Route path="design-system" element={<DesignSystemPage />} />
+          </Route>
+        ) : null}
+
+        <Route element={<ProtectedRoute allowedRoles={['RECRUITER']} />}>
+          <Route element={<AppShell />}>
+            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route path="/dashboard" element={<DashboardPage />} />
+            {IS_DEV_OR_TEST ? <Route path="/design-system" element={<DesignSystemPage />} /> : null}
+            <Route path="*" element={<NotFoundPage />} />
+          </Route>
         </Route>
       </Routes>
-    </WorkspaceProvider>
+    </AuthProvider>
   );
 }
 

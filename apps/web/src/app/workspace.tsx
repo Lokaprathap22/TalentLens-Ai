@@ -1,11 +1,44 @@
 import { createContext, useContext } from 'react';
 import type { ReactNode } from 'react';
 
+import {
+  formatUserRoleLabel,
+  type AuthenticatedUser,
+  type UserRole,
+} from '../features/auth/auth.types.js';
+
 export interface WorkspaceContextValue {
-  user: { name: string; email: string; roleLabel: string };
-  organization: { name: string };
+  user: {
+    id: string;
+    /** Account identity label (email for authenticated sessions; never an invented personal name). */
+    name: string;
+    email: string;
+    role: UserRole;
+    roleLabel: string;
+  };
+  organization: {
+    id: string;
+    name: string;
+  };
   /** True while identity comes from development fixtures rather than the API. */
   isSample: boolean;
+}
+
+export function createAuthenticatedWorkspace(user: AuthenticatedUser): WorkspaceContextValue {
+  return {
+    user: {
+      id: user.userId,
+      name: user.email,
+      email: user.email,
+      role: user.role,
+      roleLabel: formatUserRoleLabel(user.role),
+    },
+    organization: {
+      id: user.organizationId,
+      name: user.organizationName,
+    },
+    isSample: false,
+  };
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
