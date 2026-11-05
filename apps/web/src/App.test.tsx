@@ -459,4 +459,64 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
     ).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Requisitions' })).not.toBeInTheDocument();
   });
+
+  it('18. renders Scorecards directory when clicking Scorecards sidebar link', async () => {
+    mockAuthenticatedSession(RECRUITER_USER);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        requisitions: [
+          {
+            id: '11111111-1111-4111-8111-111111111111',
+            clientId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            clientName: 'Apex Fintech',
+            title: 'Lead Platform Architect',
+            jdText: 'Design distributed cloud architectures with Kubernetes.',
+            status: 'DRAFT',
+            createdAt: '2026-10-12T09:00:00.000Z',
+            updatedAt: '2026-10-15T14:30:00.000Z',
+          },
+        ],
+      }),
+    );
+    const user = userEvent.setup({ delay: null });
+
+    renderAt('/dashboard');
+    expect(await screen.findByRole('heading', { name: 'Dashboard', level: 1 })).toBeInTheDocument();
+
+    const sidebar = screen.getByRole('complementary', { name: 'Sidebar' });
+    const scorecardsNavLink = within(sidebar).getByRole('link', { name: 'Scorecards' });
+    await user.click(scorecardsNavLink);
+
+    expect(
+      await screen.findByRole('heading', { name: 'Scorecards Directory', level: 1 }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText('Lead Platform Architect')).toBeInTheDocument();
+  });
+
+  it('19. redirects non-recruiter roles away from /scorecards', async () => {
+    mockAuthenticatedSession(CLIENT_USER);
+    const { unmount } = renderAt('/scorecards');
+
+    expect(
+      await screen.findByRole('heading', {
+        name: /Client Hiring Manager portal arriving in an upcoming milestone/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Scorecards Directory' })).not.toBeInTheDocument();
+
+    unmount();
+    clearCsrfToken();
+    clearUnauthorizedHandler();
+    fetchMock.mockReset();
+
+    mockAuthenticatedSession(DELIVERY_HEAD_USER);
+    renderAt('/scorecards');
+
+    expect(
+      await screen.findByRole('heading', {
+        name: /Delivery Head workspace arriving in an upcoming milestone/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Scorecards Directory' })).not.toBeInTheDocument();
+  });
 });

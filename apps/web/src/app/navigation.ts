@@ -55,7 +55,7 @@ export const recruiterNavigation: NavSection[] = [
         label: 'Scorecards',
         icon: ClipboardCheck,
         to: '/scorecards',
-        available: false,
+        available: true,
       },
     ],
   },

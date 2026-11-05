@@ -12,6 +12,9 @@ import { DashboardPage } from './features/dashboard/DashboardPage.js';
 import { DesignSystemPage } from './features/design-system/DesignSystemPage.js';
 import { RequisitionDetailPage } from './features/requisitions/RequisitionDetailPage.js';
 import { RequisitionsPage } from './features/requisitions/RequisitionsPage.js';
+import { ScorecardEditorPage } from './features/scorecards/ScorecardEditorPage.js';
+import { ScorecardIndexPage } from './features/scorecards/ScorecardIndexPage.js';
+import { ScorecardsPage } from './features/scorecards/ScorecardsPage.js';
 import { AppShell } from './layouts/AppShell.js';
 import { PageHeader } from './layouts/PageHeader.js';
 
@@ -86,6 +89,12 @@ export function AppRoutes(): React.JSX.Element {
             <Route path="/clients" element={<ClientsPage />} />
             <Route path="/requisitions" element={<RequisitionsPage />} />
             <Route path="/requisitions/:requisitionId" element={<RequisitionDetailPage />} />
+            <Route path="/scorecards" element={<ScorecardIndexPage />} />
+            <Route path="/requisitions/:requisitionId/scorecards" element={<ScorecardsPage />} />
+            <Route
+              path="/requisitions/:requisitionId/scorecards/:versionId"
+              element={<ScorecardEditorPage />}
+            />
             {IS_DEV_OR_TEST ? <Route path="/design-system" element={<DesignSystemPage />} /> : null}
             <Route path="*" element={<NotFoundPage />} />
           </Route>

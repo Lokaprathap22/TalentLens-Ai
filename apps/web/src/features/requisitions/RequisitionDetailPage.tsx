@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Briefcase,
   CheckCircle2,
+  ClipboardCheck,
   Pencil,
   SlidersHorizontal,
   Sparkles,
@@ -191,6 +192,14 @@ export function RequisitionDetailPage(): React.JSX.Element {
               All requisitions
             </Button>
 
+            <Button
+              variant="secondary"
+              onClick={() => navigate(`/requisitions/${requisition.id}/scorecards`)}
+            >
+              <Icon icon={ClipboardCheck} size="sm" />
+              Scorecards
+            </Button>
+
             {isEditable ? (
               <Button variant="secondary" onClick={() => setIsEditOpen(true)}>
                 <Icon icon={Pencil} size="sm" />
@@ -254,7 +263,16 @@ export function RequisitionDetailPage(): React.JSX.Element {
                     from the job description. Opening without an approved scorecard is blocked by
                     the server.
                   </p>
-                  <div className="mt-3">
+                  <div className="mt-3 flex flex-col gap-2">
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => navigate(`/requisitions/${requisition.id}/scorecards`)}
+                      className="w-full"
+                    >
+                      <Icon icon={ClipboardCheck} size="xs" />
+                      Manage scorecards
+                    </Button>
                     <Button
                       variant="secondary"
                       size="sm"
@@ -295,6 +313,20 @@ export function RequisitionDetailPage(): React.JSX.Element {
                   </p>
                 </div>
               )}
+
+              {requisition.status !== 'DRAFT' ? (
+                <div className="pt-1">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => navigate(`/requisitions/${requisition.id}/scorecards`)}
+                    className="w-full"
+                  >
+                    <Icon icon={ClipboardCheck} size="xs" />
+                    View scorecard criteria
+                  </Button>
+                </div>
+              ) : null}
             </CardBody>
           </Card>
 

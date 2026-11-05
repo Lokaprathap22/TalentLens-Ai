@@ -51,6 +51,17 @@ const catalogue = {
     ACTIVE: { label: 'Active', tone: 'success' },
     INACTIVE: { label: 'Inactive', tone: 'neutral' },
   },
+  scorecard: {
+    DRAFT: { label: 'Draft', tone: 'warning' },
+    APPROVED: { label: 'Approved', tone: 'success' },
+    ARCHIVED: { label: 'Archived', tone: 'neutral' },
+  },
+  evidenceVerification: {
+    PENDING_RECRUITER_REVIEW: { label: 'Pending Review', tone: 'warning' },
+    VERIFIED: { label: 'Verified', tone: 'success' },
+    UNVERIFIED: { label: 'Unverified', tone: 'danger' },
+    REJECTED: { label: 'Rejected', tone: 'neutral' },
+  },
 } as const satisfies Record<string, Record<string, StatusDescriptor>>;
 
 type Catalogue = typeof catalogue;
