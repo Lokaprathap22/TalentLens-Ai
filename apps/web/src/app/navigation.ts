@@ -48,7 +48,7 @@ export const recruiterNavigation: NavSection[] = [
         label: 'Requisitions',
         icon: Briefcase,
         to: '/requisitions',
-        available: false,
+        available: true,
       },
       {
         id: 'scorecards',

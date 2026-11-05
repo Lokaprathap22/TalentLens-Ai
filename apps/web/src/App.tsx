@@ -10,6 +10,8 @@ import { LoginPage } from './features/auth/LoginPage.js';
 import { ClientsPage } from './features/clients/ClientsPage.js';
 import { DashboardPage } from './features/dashboard/DashboardPage.js';
 import { DesignSystemPage } from './features/design-system/DesignSystemPage.js';
+import { RequisitionDetailPage } from './features/requisitions/RequisitionDetailPage.js';
+import { RequisitionsPage } from './features/requisitions/RequisitionsPage.js';
 import { AppShell } from './layouts/AppShell.js';
 import { PageHeader } from './layouts/PageHeader.js';
 
@@ -82,6 +84,8 @@ export function AppRoutes(): React.JSX.Element {
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<DashboardPage />} />
             <Route path="/clients" element={<ClientsPage />} />
+            <Route path="/requisitions" element={<RequisitionsPage />} />
+            <Route path="/requisitions/:requisitionId" element={<RequisitionDetailPage />} />
             {IS_DEV_OR_TEST ? <Route path="/design-system" element={<DesignSystemPage />} /> : null}
             <Route path="*" element={<NotFoundPage />} />
           </Route>

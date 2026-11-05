@@ -10,7 +10,7 @@ export type { Column } from './data-table.js';
 export { ConfirmDialog, Dialog } from './dialog.js';
 export { DropdownMenu } from './dropdown-menu.js';
 export type { MenuEntry } from './dropdown-menu.js';
-export { Field, Input, Select } from './form-controls.js';
+export { Field, Input, Select, Textarea } from './form-controls.js';
 export { Icon } from './icon.js';
 export { IconButton } from './icon-button.js';
 export { Pagination } from './pagination.js';

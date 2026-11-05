@@ -1,5 +1,10 @@
 import { useId } from 'react';
-import type { InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from 'react';
+import type {
+  InputHTMLAttributes,
+  ReactNode,
+  SelectHTMLAttributes,
+  TextareaHTMLAttributes,
+} from 'react';
 import { ChevronDown } from 'lucide-react';
 
 import { cn } from '../../lib/cn.js';
@@ -12,10 +17,10 @@ const controlBorder = 'border-border-strong';
 
 interface FieldProps {
   label: string;
-  hint?: string;
-  error?: string;
+  hint?: string | undefined;
+  error?: string | undefined;
   /** Visually hide the label while keeping it for assistive technology. */
-  hideLabel?: boolean;
+  hideLabel?: boolean | undefined;
   children: (ids: { id: string; describedBy: string | undefined; invalid: boolean }) => ReactNode;
 }
 
@@ -49,6 +54,17 @@ type InputProps = InputHTMLAttributes<HTMLInputElement>;
 
 export function Input({ className, ...rest }: InputProps): React.JSX.Element {
   return <input className={cn(control, controlBorder, 'h-8 px-2.5', className)} {...rest} />;
+}
+
+type TextareaProps = TextareaHTMLAttributes<HTMLTextAreaElement>;
+
+export function Textarea({ className, ...rest }: TextareaProps): React.JSX.Element {
+  return (
+    <textarea
+      className={cn(control, controlBorder, 'min-h-24 p-2.5 resize-y', className)}
+      {...rest}
+    />
+  );
 }
 
 interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
