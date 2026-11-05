@@ -14,7 +14,7 @@ import {
   type ScorecardRecord,
   type ScorecardRepository,
 } from './scorecard.repository.js';
-import type { UpdateScorecardInput } from './scorecard.schemas.js';
+import type { CreateScorecardDraftInput, UpdateScorecardInput } from './scorecard.schemas.js';
 import {
   criterionContainsDisallowedAttribute,
   containsDisallowedAttribute,
@@ -228,6 +228,9 @@ function validateApproval(record: ScorecardRecord): void {
   ) {
     throw new ScorecardDisallowedCriterionError();
   }
+  if (!activeCriteria.every((criterion) => criterion.weight > 0)) {
+    throw new ScorecardInvalidError();
+  }
   const total = activeCriteria.reduce((sum, criterion) => sum + criterion.weight, 0);
   if (Math.abs(total - 100) > 0.0001) throw new ScorecardInvalidError();
   if (!activeCriteria.some((criterion) => criterion.requirementType === 'MUST_HAVE')) {
@@ -250,14 +253,64 @@ export function createScorecardService(dependencies: ScorecardServiceDependencie
     async generate(
       principal: AuthenticatedPrincipal,
       requisitionId: string,
+      options?: CreateScorecardDraftInput,
     ): Promise<ScorecardDto> {
       requireRecruiter(principal);
+      if (options?.mode !== undefined && options?.cloneFromVersionId !== undefined) {
+        throw new ScorecardInvalidError();
+      }
+
       const requisition = await repository.findAuthorizedRequisition(
         principal.organizationId,
         principal.userId,
         requisitionId,
       );
       if (!requisition) throw new ScorecardNotFoundError();
+
+      if (options?.mode === 'manual') {
+        if (!repository.createManualDraft) {
+          throw new ScorecardInvalidError();
+        }
+        return toDto(await repository.createManualDraft(principal, requisition));
+      }
+
+      if (options?.cloneFromVersionId !== undefined) {
+        if (!repository.cloneDraft) {
+          throw new ScorecardInvalidError();
+        }
+        const cloned = await repository.cloneDraft(
+          principal,
+          requisition,
+          options.cloneFromVersionId,
+          (rawEvidence) => {
+            if (
+              !rawEvidence ||
+              typeof rawEvidence.sourceQuote !== 'string' ||
+              rawEvidence.sourceQuote.length === 0
+            ) {
+              return null;
+            }
+            const verified = verifyEvidence(
+              {
+                sourceQuote: rawEvidence.sourceQuote,
+                sourceStart: null,
+                sourceEnd: null,
+                verificationStatus: 'PENDING_RECRUITER_REVIEW',
+              },
+              requisition.jdText,
+            );
+            return {
+              sourceQuote: verified.sourceQuote,
+              sourceStart: verified.sourceStart,
+              sourceEnd: verified.sourceEnd,
+              verificationStatus: verified.verificationStatus,
+            };
+          },
+        );
+        if (!cloned) throw new ScorecardNotFoundError();
+        return toDto(cloned);
+      }
+
       if (!requisition.jdText.trim()) throw new ScorecardMissingJdError();
 
       const extraction = await dependencies.extractionProvider.extract({

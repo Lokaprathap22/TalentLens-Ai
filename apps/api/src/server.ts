@@ -153,6 +153,7 @@ const server = createServer(
         list: (...args) => getRequisitionService().list(...args),
         get: (...args) => getRequisitionService().get(...args),
         update: (...args) => getRequisitionService().update(...args),
+        transitionStatus: (...args) => getRequisitionService().transitionStatus(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
@@ -231,6 +232,8 @@ const server = createServer(
         respondToInterviewAsClient: (...args) =>
           getWorkflowService().respondToInterviewAsClient(...args),
         listAuthorizedClients: (...args) => getWorkflowService().listAuthorizedClients(...args),
+        createClient: (...args) => getWorkflowService().createClient(...args),
+        updateClient: (...args) => getWorkflowService().updateClient(...args),
         getCandidateTimeline: (...args) => getWorkflowService().getCandidateTimeline(...args),
       },
       sessionService: lazySessionService,

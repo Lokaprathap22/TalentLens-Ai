@@ -20,7 +20,11 @@ import {
   type ScorecardService,
 } from './scorecard.service.js';
 import { ScorecardCriterionScopeError } from './scorecard.repository.js';
-import { emptyGenerationSchema, updateScorecardSchema } from './scorecard.schemas.js';
+import {
+  createScorecardDraftSchema,
+  emptyGenerationSchema,
+  updateScorecardSchema,
+} from './scorecard.schemas.js';
 
 const uuidSchema = z.string().uuid();
 
@@ -79,14 +83,20 @@ export function createScorecardRouter(dependencies: ScorecardRouterDependencies)
     requireCsrf,
     async (request, response) => {
       const requisitionId = parseUuid(request.params.requisitionId);
-      if (!requisitionId || !emptyGenerationSchema.safeParse(request.body).success) {
+      const parsedBody = createScorecardDraftSchema.safeParse(request.body);
+      if (!requisitionId || !parsedBody.success) {
         response.status(400).json({ error: 'invalid_request' });
         return;
       }
       try {
         const principal = response.locals.authPrincipal as AuthenticatedPrincipal;
+        const hasExplicitOptions =
+          parsedBody.data.mode !== undefined || parsedBody.data.cloneFromVersionId !== undefined;
+        const scorecard = hasExplicitOptions
+          ? await dependencies.service.generate(principal, requisitionId, parsedBody.data)
+          : await dependencies.service.generate(principal, requisitionId);
         response.status(201).json({
-          scorecard: await dependencies.service.generate(principal, requisitionId),
+          scorecard,
         });
       } catch (error) {
         handleError(error, response);

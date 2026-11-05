@@ -12,9 +12,15 @@ import {
   RequisitionClientNotFoundError,
   RequisitionNotFoundError,
   RequisitionRoleError,
+  RequisitionScorecardNotApprovedError,
+  RequisitionStatusTransitionError,
   type RequisitionService,
 } from './requisition.service.js';
-import { createRequisitionSchema, updateRequisitionSchema } from './requisition.schemas.js';
+import {
+  createRequisitionSchema,
+  transitionRequisitionStatusSchema,
+  updateRequisitionSchema,
+} from './requisition.schemas.js';
 
 const requisitionIdSchema = z.string().uuid();
 
@@ -127,6 +133,48 @@ export function createRequisitionRouter(dependencies: RequisitionRouterDependenc
       }
       if (error instanceof RequisitionRoleError) {
         response.status(403).json({ error: 'forbidden' });
+        return;
+      }
+      response.status(503).json({ error: 'service_unavailable' });
+    }
+  });
+
+  router.post('/:id/status', sameOrigin, requireCsrf, async (request, response) => {
+    const parsedId = requisitionIdSchema.safeParse(request.params.id);
+    if (!parsedId.success) {
+      response.status(400).json({ error: 'invalid_request' });
+      return;
+    }
+    const requisitionId = parsedId.data;
+
+    const parsed = transitionRequisitionStatusSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).json({ error: 'invalid_request' });
+      return;
+    }
+
+    try {
+      const principal = response.locals.authPrincipal as AuthenticatedPrincipal;
+      const requisition = await dependencies.service.transitionStatus(
+        principal,
+        requisitionId,
+        parsed.data,
+      );
+      response.status(200).json({ requisition });
+    } catch (error) {
+      if (error instanceof RequisitionNotFoundError) {
+        response.status(404).json({ error: 'not_found' });
+        return;
+      }
+      if (error instanceof RequisitionRoleError) {
+        response.status(403).json({ error: 'forbidden' });
+        return;
+      }
+      if (
+        error instanceof RequisitionStatusTransitionError ||
+        error instanceof RequisitionScorecardNotApprovedError
+      ) {
+        response.status(400).json({ error: 'invalid_request' });
         return;
       }
       response.status(503).json({ error: 'service_unavailable' });

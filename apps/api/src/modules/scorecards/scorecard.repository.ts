@@ -50,6 +50,16 @@ export interface ScorecardRepository {
     requisition: AuthorizedRequisition,
     extraction: JdExtractionOutput,
   ): Promise<ScorecardRecord>;
+  createManualDraft?(
+    principal: AuthenticatedPrincipal,
+    requisition: AuthorizedRequisition,
+  ): Promise<ScorecardRecord>;
+  cloneDraft?(
+    principal: AuthenticatedPrincipal,
+    requisition: AuthorizedRequisition,
+    sourceScorecardId: string,
+    transformEvidence: (evidence: Record<string, unknown> | null) => Record<string, unknown> | null,
+  ): Promise<ScorecardRecord | null>;
   list(
     organizationId: string,
     recruiterId: string,
@@ -182,6 +192,54 @@ function extractionMetadata(extraction: JdExtractionOutput) {
   });
 }
 
+function emptyExtractionMetadata() {
+  return scorecardMetadataSchema.parse({
+    contractVersion: 1,
+    extractionSchemaVersion: 'jd-extraction-v2',
+    jobTitle: null,
+    requiredSkills: [],
+    preferredSkills: [],
+    educationRequirements: [],
+    certifications: [],
+    domainExperience: [],
+    experience: {
+      minimumYears: null,
+      maximumYears: null,
+      requirement: null,
+    },
+    compensation: null,
+    notice: null,
+    otherRequirements: [],
+    warnings: [],
+  });
+}
+
+function emptyScorecardWeights() {
+  return {
+    contractVersion: 1 as const,
+    scoring: {},
+    extraction: emptyExtractionMetadata(),
+  };
+}
+
+function normalizedClonedWeights(rawWeights: Prisma.JsonValue): Prisma.InputJsonValue {
+  if (scorecardWeightsSchema.safeParse(rawWeights).success) {
+    return jsonInput(jsonRecord(rawWeights));
+  }
+  const rawRecord = jsonRecord(rawWeights);
+  const scoring =
+    typeof rawRecord.scoring === 'object' &&
+    rawRecord.scoring !== null &&
+    !Array.isArray(rawRecord.scoring)
+      ? (rawRecord.scoring as Record<string, unknown>)
+      : {};
+  return jsonInput({
+    contractVersion: 1,
+    scoring,
+    extraction: emptyExtractionMetadata(),
+  });
+}
+
 export function isScorecardVersionConflict(target: unknown): boolean {
   if (Array.isArray(target)) {
     const fields = target.map((item) => String(item).toLowerCase());
@@ -292,6 +350,161 @@ export function createScorecardRepository(
                 },
               },
             });
+            return toRecord(createdWithCriteria);
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        ),
+      );
+    },
+
+    async createManualDraft(principal, requisition) {
+      return withConcurrencyRetry(() =>
+        database.$transaction(
+          async (transaction) => {
+            await lockRequisitionRow(transaction, requisition.id);
+            const latest = await transaction.scorecardVersion.aggregate({
+              where: {
+                requisitionId: requisition.id,
+                organizationId: principal.organizationId,
+              },
+              _max: { version: true },
+            });
+            const version = (latest._max.version ?? 0) + 1;
+            const created = await transaction.scorecardVersion.create({
+              data: {
+                organizationId: principal.organizationId,
+                requisitionId: requisition.id,
+                version,
+                weightsJson: emptyScorecardWeights(),
+                criteria: { create: [] },
+              },
+            });
+            const createdWithCriteria = await transaction.scorecardVersion.findUniqueOrThrow({
+              where: { id: created.id },
+              select: scorecardSelect,
+            });
+            await transaction.auditLog.create({
+              data: {
+                organizationId: principal.organizationId,
+                actorId: principal.userId,
+                action: 'SCORECARD_DRAFT_CREATED_MANUAL',
+                resourceType: 'ScorecardVersion',
+                resourceId: createdWithCriteria.id,
+                requisitionId: requisition.id,
+                metadataJson: {
+                  version: createdWithCriteria.version,
+                  mode: 'manual',
+                  criterionCount: 0,
+                },
+              },
+            });
+            return toRecord(createdWithCriteria);
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        ),
+      );
+    },
+
+    async cloneDraft(principal, requisition, sourceScorecardId, transformEvidence) {
+      return withConcurrencyRetry(() =>
+        database.$transaction(
+          async (transaction) => {
+            await lockRequisitionRow(transaction, requisition.id);
+            const source = await transaction.scorecardVersion.findFirst({
+              where: {
+                ...scope(requisition.id, principal.organizationId, principal.userId),
+                id: sourceScorecardId,
+              },
+              select: {
+                id: true,
+                requisitionId: true,
+                version: true,
+                status: true,
+                weightsJson: true,
+                criteria: {
+                  orderBy: { displayOrder: 'asc' as const },
+                  select: criterionSelect,
+                },
+              },
+            });
+            if (!source) {
+              return null;
+            }
+
+            const latest = await transaction.scorecardVersion.aggregate({
+              where: {
+                requisitionId: requisition.id,
+                organizationId: principal.organizationId,
+              },
+              _max: { version: true },
+            });
+            const version = (latest._max.version ?? 0) + 1;
+
+            const clonedCriteria = source.criteria.map((criterion) => {
+              const rule = jsonRecord(criterion.ruleJson);
+              const description = typeof rule.description === 'string' ? rule.description : '';
+              const rawEvidence =
+                typeof rule.evidence === 'object' &&
+                rule.evidence !== null &&
+                !Array.isArray(rule.evidence)
+                  ? (rule.evidence as Record<string, unknown>)
+                  : null;
+              const groundedEvidence = transformEvidence(rawEvidence);
+              const nextRule: Record<string, unknown> = {
+                ...rule,
+                description,
+              };
+              if (groundedEvidence !== null) {
+                nextRule.evidence = groundedEvidence;
+              } else {
+                delete nextRule.evidence;
+              }
+
+              return {
+                key: criterion.key,
+                label: criterion.label,
+                category: criterion.category,
+                requirementType: criterion.requirementType,
+                weight: Number(criterion.weight),
+                active: criterion.active,
+                displayOrder: criterion.displayOrder,
+                ruleJson: jsonInput(nextRule),
+              };
+            });
+
+            const created = await transaction.scorecardVersion.create({
+              data: {
+                organizationId: principal.organizationId,
+                requisitionId: requisition.id,
+                version,
+                weightsJson: normalizedClonedWeights(source.weightsJson),
+                criteria: { create: clonedCriteria },
+              },
+            });
+
+            const createdWithCriteria = await transaction.scorecardVersion.findUniqueOrThrow({
+              where: { id: created.id },
+              select: scorecardSelect,
+            });
+
+            await transaction.auditLog.create({
+              data: {
+                organizationId: principal.organizationId,
+                actorId: principal.userId,
+                action: 'SCORECARD_DRAFT_CLONED',
+                resourceType: 'ScorecardVersion',
+                resourceId: createdWithCriteria.id,
+                requisitionId: requisition.id,
+                metadataJson: {
+                  version: createdWithCriteria.version,
+                  mode: 'clone',
+                  clonedFromVersionId: source.id,
+                  clonedFromVersion: source.version,
+                  criterionCount: clonedCriteria.length,
+                },
+              },
+            });
+
             return toRecord(createdWithCriteria);
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
@@ -485,6 +698,7 @@ export function createScorecardRepository(
           if (
             !current ||
             current.criteria.length === 0 ||
+            !current.criteria.every((criterion) => Number(criterion.weight) > 0) ||
             !current.criteria.some((criterion) => criterion.requirementType === 'MUST_HAVE') ||
             !criteriaAreVerified ||
             !metadataIsValid ||

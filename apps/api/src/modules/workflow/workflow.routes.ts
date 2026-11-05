@@ -11,17 +11,22 @@ import type { AuthenticatedPrincipal, SessionService } from '../auth/session.ser
 import type { AuthorizationService } from '../authorization/authorization.service.js';
 import {
   candidateTimelineQuerySchema,
+  createClientSchema,
   listCandidatesQuerySchema,
+  listClientsQuerySchema,
   proposeAlternativeInterviewSchema,
   proposeInterviewSchema,
   recordReviewSchema,
   rejectInterviewProposalSchema,
   shortlistCandidateSchema,
   submitCandidateSchema,
+  updateClientSchema,
   clientFeedbackSchema,
 } from './workflow.schemas.js';
 import {
   WorkflowCandidateNotFoundError,
+  WorkflowClientConflictError,
+  WorkflowClientNotFoundError,
   WorkflowClientUnauthorizedError,
   WorkflowConsentMissingClientSharingError,
   WorkflowConsentRequiredError,
@@ -57,9 +62,12 @@ function handleWorkflowError(error: unknown, response: Response): void {
   if (
     error instanceof WorkflowCandidateNotFoundError ||
     error instanceof WorkflowSubmissionNotFoundError ||
-    error instanceof WorkflowInterviewNotFoundError
+    error instanceof WorkflowInterviewNotFoundError ||
+    error instanceof WorkflowClientNotFoundError
   ) {
     response.status(404).json({ error: 'not_found', message: error.message });
+  } else if (error instanceof WorkflowClientConflictError) {
+    response.status(409).json({ error: 'conflict', message: error.message });
   } else if (
     error instanceof WorkflowRequisitionAccessDeniedError ||
     error instanceof WorkflowClientUnauthorizedError
@@ -111,11 +119,77 @@ export function createWorkflowRouter(dependencies: WorkflowRouterDependencies): 
     '/clients',
     requireSession,
     requireRecruiterOrClientHiringManager,
-    async (_request, response) => {
+    async (request, response) => {
+      const queryParsed = listClientsQuerySchema.safeParse(request.query);
+      if (!queryParsed.success) {
+        response.status(400).json({ error: 'invalid_request', details: queryParsed.error.issues });
+        return;
+      }
+
       try {
         const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
-        const clients = await dependencies.service.listAuthorizedClients(principal);
+        const clients = queryParsed.data.includeInactive
+          ? await dependencies.service.listAuthorizedClients(principal, { includeInactive: true })
+          : await dependencies.service.listAuthorizedClients(principal);
         response.status(200).json({ clients });
+      } catch (error) {
+        handleWorkflowError(error, response);
+      }
+    },
+  );
+
+  // 0b. Create a new client (Recruiter only)
+  router.post(
+    '/clients',
+    requireSession,
+    requireRecruiter,
+    sameOrigin,
+    requireCsrf,
+    async (request, response) => {
+      const bodyParsed = createClientSchema.safeParse(request.body);
+      if (!bodyParsed.success) {
+        response.status(400).json({ error: 'invalid_request', details: bodyParsed.error.issues });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const client = await dependencies.service.createClient(principal, bodyParsed.data);
+        response.status(201).json({ client });
+      } catch (error) {
+        handleWorkflowError(error, response);
+      }
+    },
+  );
+
+  // 0c. Update an existing client (Recruiter only)
+  router.patch(
+    '/clients/:clientId',
+    requireSession,
+    requireRecruiter,
+    sameOrigin,
+    requireCsrf,
+    async (request, response) => {
+      const clientId = parseUuid(request.params['clientId']);
+      if (!clientId) {
+        response.status(400).json({ error: 'invalid_request', message: 'Invalid client ID' });
+        return;
+      }
+
+      const bodyParsed = updateClientSchema.safeParse(request.body);
+      if (!bodyParsed.success) {
+        response.status(400).json({ error: 'invalid_request', details: bodyParsed.error.issues });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const client = await dependencies.service.updateClient(
+          principal,
+          clientId,
+          bodyParsed.data,
+        );
+        response.status(200).json({ client });
       } catch (error) {
         handleWorkflowError(error, response);
       }

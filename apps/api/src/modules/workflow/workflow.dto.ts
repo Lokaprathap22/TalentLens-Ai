@@ -232,6 +232,8 @@ export interface AuthorizedClientDto {
   id: string;
   name: string;
   status: string;
+  createdAt?: string | undefined;
+  updatedAt?: string | undefined;
   membershipId?: string | undefined;
   membershipRole?: string | undefined;
 }

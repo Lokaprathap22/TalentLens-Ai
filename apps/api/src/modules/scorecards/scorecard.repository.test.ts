@@ -596,4 +596,150 @@ describe('scorecard repository — approve lifecycle', () => {
     expect(result).toBeNull();
     expect(transaction.scorecardVersion.updateMany).not.toHaveBeenCalled();
   });
+
+  it('creates an empty manual draft in a serializable transaction with row locking and audit log', async () => {
+    const emptyDraft = {
+      ...scorecardRecord('DRAFT'),
+      version: 2,
+      criteria: [],
+    };
+    const transaction = {
+      $queryRaw: vi.fn(async () => []),
+      scorecardVersion: {
+        aggregate: vi.fn(async () => ({ _max: { version: 1 } })),
+        create: vi.fn(async () => emptyDraft),
+        findUniqueOrThrow: vi.fn(async () => emptyDraft),
+      },
+      auditLog: { create: vi.fn(async () => undefined) },
+    };
+    const database = {
+      $transaction: vi.fn(async (callback: (client: typeof transaction) => Promise<unknown>) =>
+        callback(transaction),
+      ),
+    } as unknown as PrismaClient;
+    const repository = createScorecardRepository(database);
+
+    const created = await repository.createManualDraft!(principal, {
+      id: 'requisition-a',
+      title: 'Engineer',
+      jdText: 'TypeScript',
+    });
+
+    expect(transaction.$queryRaw).toHaveBeenCalled();
+    expect(transaction.scorecardVersion.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          organizationId: 'organization-a',
+          requisitionId: 'requisition-a',
+          version: 2,
+          criteria: { create: [] },
+        }),
+      }),
+    );
+    expect(transaction.auditLog.create).toHaveBeenCalledWith({
+      data: {
+        organizationId: 'organization-a',
+        actorId: 'recruiter-a',
+        action: 'SCORECARD_DRAFT_CREATED_MANUAL',
+        resourceType: 'ScorecardVersion',
+        resourceId: 'scorecard-a',
+        requisitionId: 'requisition-a',
+        metadataJson: {
+          version: 2,
+          mode: 'manual',
+          criterionCount: 0,
+        },
+      },
+    });
+    expect(created.version).toBe(2);
+    expect(created.criteria).toEqual([]);
+  });
+
+  it('clones an existing scorecard version in a serializable transaction with row locking and audit log', async () => {
+    const sourceRecord = scorecardRecord('APPROVED');
+    const clonedRecord = {
+      ...scorecardRecord('DRAFT'),
+      id: 'scorecard-cloned',
+      version: 2,
+      approvedById: null,
+      approvedAt: null,
+    };
+    const transaction = {
+      $queryRaw: vi.fn(async () => []),
+      scorecardVersion: {
+        findFirst: vi.fn(async () => sourceRecord),
+        aggregate: vi.fn(async () => ({ _max: { version: 1 } })),
+        create: vi.fn(async () => clonedRecord),
+        findUniqueOrThrow: vi.fn(async () => clonedRecord),
+      },
+      auditLog: { create: vi.fn(async () => undefined) },
+    };
+    const database = {
+      $transaction: vi.fn(async (callback: (client: typeof transaction) => Promise<unknown>) =>
+        callback(transaction),
+      ),
+    } as unknown as PrismaClient;
+    const repository = createScorecardRepository(database);
+
+    const result = await repository.cloneDraft!(
+      principal,
+      { id: 'requisition-a', title: 'Engineer', jdText: 'TypeScript' },
+      'scorecard-a',
+      (ev) =>
+        ev
+          ? {
+              ...ev,
+              verificationStatus: 'PENDING_RECRUITER_REVIEW',
+            }
+          : null,
+    );
+
+    expect(transaction.$queryRaw).toHaveBeenCalled();
+    expect(transaction.scorecardVersion.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          organizationId: 'organization-a',
+          requisitionId: 'requisition-a',
+          version: 2,
+          criteria: {
+            create: [
+              expect.objectContaining({
+                key: 'skill-1',
+                label: 'TypeScript',
+                category: 'SKILL',
+                requirementType: 'MUST_HAVE',
+                weight: 100,
+                active: true,
+                displayOrder: 0,
+                ruleJson: expect.objectContaining({
+                  evidence: expect.objectContaining({
+                    verificationStatus: 'PENDING_RECRUITER_REVIEW',
+                  }),
+                }),
+              }),
+            ],
+          },
+        }),
+      }),
+    );
+    expect(transaction.auditLog.create).toHaveBeenCalledWith({
+      data: {
+        organizationId: 'organization-a',
+        actorId: 'recruiter-a',
+        action: 'SCORECARD_DRAFT_CLONED',
+        resourceType: 'ScorecardVersion',
+        resourceId: 'scorecard-cloned',
+        requisitionId: 'requisition-a',
+        metadataJson: {
+          version: 2,
+          mode: 'clone',
+          clonedFromVersionId: 'scorecard-a',
+          clonedFromVersion: 1,
+          criterionCount: 1,
+        },
+      },
+    });
+    expect(result?.status).toBe('DRAFT');
+    expect(result?.approvedById).toBeNull();
+  });
 });

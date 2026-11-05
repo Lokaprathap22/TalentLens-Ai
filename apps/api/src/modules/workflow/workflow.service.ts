@@ -17,6 +17,7 @@ import type { InterviewFormat, ReviewDecision, SubmissionStatus } from './workfl
 export * from './workflow.errors.js';
 import {
   WorkflowCandidateNotFoundError,
+  WorkflowClientNotFoundError,
   WorkflowClientUnauthorizedError,
   WorkflowConsentMissingClientSharingError,
   WorkflowConsentRequiredError,
@@ -27,6 +28,7 @@ import {
   WorkflowShortlistRequiredError,
   WorkflowSubmissionNotFoundError,
 } from './workflow.errors.js';
+import type { CreateClientInput, UpdateClientInput } from './workflow.schemas.js';
 
 export interface WorkflowService {
   listCandidatesForRequisition(
@@ -173,7 +175,21 @@ export interface WorkflowService {
     status: string;
   }>;
 
-  listAuthorizedClients(principal: AuthenticatedPrincipal): Promise<AuthorizedClientDto[]>;
+  listAuthorizedClients(
+    principal: AuthenticatedPrincipal,
+    options?: { includeInactive?: boolean | undefined },
+  ): Promise<AuthorizedClientDto[]>;
+
+  createClient(
+    principal: AuthenticatedPrincipal,
+    input: CreateClientInput,
+  ): Promise<AuthorizedClientDto>;
+
+  updateClient(
+    principal: AuthenticatedPrincipal,
+    clientId: string,
+    input: UpdateClientInput,
+  ): Promise<AuthorizedClientDto>;
 
   getCandidateTimeline(
     principal: AuthenticatedPrincipal,
@@ -835,18 +851,95 @@ export function createWorkflowService(repository: WorkflowRepository): WorkflowS
       );
     },
 
-    async listAuthorizedClients(principal) {
+    async listAuthorizedClients(principal, options) {
       if (principal.role !== 'RECRUITER' && principal.role !== 'CLIENT_HIRING_MANAGER') {
         throw new WorkflowClientUnauthorizedError();
       }
       if (!repository.listAuthorizedClients) {
         return [];
       }
-      return repository.listAuthorizedClients(
+      const includeInactive = principal.role === 'RECRUITER' && options?.includeInactive === true;
+      const records = includeInactive
+        ? await repository.listAuthorizedClients(
+            principal.organizationId,
+            principal.userId,
+            principal.role,
+            { includeInactive: true },
+          )
+        : await repository.listAuthorizedClients(
+            principal.organizationId,
+            principal.userId,
+            principal.role,
+          );
+
+      return records.map((c) => ({
+        id: c.id,
+        name: c.name,
+        status: c.status,
+        ...(c.createdAt !== undefined
+          ? {
+              createdAt:
+                c.createdAt instanceof Date ? c.createdAt.toISOString() : String(c.createdAt),
+            }
+          : {}),
+        ...(c.updatedAt !== undefined
+          ? {
+              updatedAt:
+                c.updatedAt instanceof Date ? c.updatedAt.toISOString() : String(c.updatedAt),
+            }
+          : {}),
+        ...(c.membershipId !== undefined ? { membershipId: c.membershipId } : {}),
+        ...(c.membershipRole !== undefined ? { membershipRole: c.membershipRole } : {}),
+      }));
+    },
+
+    async createClient(principal, input) {
+      requireRecruiter(principal);
+
+      if (!repository.createClient) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      const created = await repository.createClient(
         principal.organizationId,
         principal.userId,
-        principal.role,
+        input,
       );
+
+      return {
+        id: created.id,
+        name: created.name,
+        status: created.status,
+        createdAt: created.createdAt.toISOString(),
+        updatedAt: created.updatedAt.toISOString(),
+      };
+    },
+
+    async updateClient(principal, clientId, input) {
+      requireRecruiter(principal);
+
+      if (!repository.updateClient) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      const updated = await repository.updateClient(
+        principal.organizationId,
+        principal.userId,
+        clientId,
+        input,
+      );
+
+      if (!updated) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      return {
+        id: updated.id,
+        name: updated.name,
+        status: updated.status,
+        createdAt: updated.createdAt.toISOString(),
+        updatedAt: updated.updatedAt.toISOString(),
+      };
     },
 
     async getCandidateTimeline(principal, requisitionId, candidateId, options) {

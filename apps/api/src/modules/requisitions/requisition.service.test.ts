@@ -10,8 +10,12 @@ import {
   RequisitionClientNotFoundError,
   RequisitionNotFoundError,
   RequisitionRoleError,
+  RequisitionScorecardNotApprovedError,
+  RequisitionStatusTransitionError,
   createRequisitionService,
+  isValidRequisitionStatusTransition,
 } from './requisition.service.js';
+import type { RequisitionStatus } from './requisition.dto.js';
 
 const recruiter: AuthenticatedPrincipal = {
   userId: 'recruiter-a',
@@ -45,6 +49,11 @@ function createService(
     listAssigned: vi.fn(async () => (requisition ? [requisition] : [])),
     findAssigned: vi.fn(async () => requisition),
     updateDraft: vi.fn(async () => requisition),
+    transitionStatus: vi.fn(async (_principal, _id, status) =>
+      requisition
+        ? { status: 'ok' as const, record: { ...requisition, status } }
+        : { status: 'not_found' as const },
+    ),
   };
   return { repository, service: createRequisitionService({ repository }) };
 }
@@ -129,5 +138,69 @@ describe('requisition service', () => {
 
     const { service } = createService();
     await expect(service.list(clientManager)).rejects.toBeInstanceOf(RequisitionRoleError);
+    await expect(
+      service.transitionStatus(clientManager, 'requisition-a', { status: 'OPEN' }),
+    ).rejects.toBeInstanceOf(RequisitionRoleError);
+  });
+
+  describe('status lifecycle state machine (isValidRequisitionStatusTransition & transitionStatus)', () => {
+    it('validates every allowed and prohibited status transition in the state machine', () => {
+      const allStatuses: RequisitionStatus[] = ['DRAFT', 'OPEN', 'PAUSED', 'CLOSED', 'FILLED'];
+      const expectedAllowed = new Set([
+        'DRAFT->OPEN',
+        'OPEN->PAUSED',
+        'OPEN->CLOSED',
+        'OPEN->FILLED',
+        'PAUSED->OPEN',
+        'PAUSED->CLOSED',
+        'PAUSED->FILLED',
+      ]);
+
+      for (const from of allStatuses) {
+        for (const to of allStatuses) {
+          const key = `${from}->${to}`;
+          expect(isValidRequisitionStatusTransition(from, to)).toBe(expectedAllowed.has(key));
+        }
+      }
+    });
+
+    it('transitions status when repository returns ok', async () => {
+      const { service, repository } = createService();
+      const result = await service.transitionStatus(recruiter, 'requisition-a', { status: 'OPEN' });
+      expect(result.status).toBe('OPEN');
+      expect(repository.transitionStatus).toHaveBeenCalledWith(recruiter, 'requisition-a', 'OPEN');
+    });
+
+    it('throws RequisitionNotFoundError when repository returns not_found', async () => {
+      const { service, repository } = createService();
+      vi.mocked(repository.transitionStatus).mockResolvedValueOnce({ status: 'not_found' });
+
+      await expect(
+        service.transitionStatus(recruiter, 'requisition-a', { status: 'OPEN' }),
+      ).rejects.toBeInstanceOf(RequisitionNotFoundError);
+    });
+
+    it('throws RequisitionScorecardNotApprovedError when DRAFT->OPEN lacks approved scorecard', async () => {
+      const { service, repository } = createService();
+      vi.mocked(repository.transitionStatus).mockResolvedValueOnce({
+        status: 'scorecard_not_approved',
+      });
+
+      await expect(
+        service.transitionStatus(recruiter, 'requisition-a', { status: 'OPEN' }),
+      ).rejects.toBeInstanceOf(RequisitionScorecardNotApprovedError);
+    });
+
+    it('throws RequisitionStatusTransitionError when transition is prohibited or stale', async () => {
+      const { service, repository } = createService();
+      vi.mocked(repository.transitionStatus).mockResolvedValueOnce({
+        status: 'invalid_transition',
+        currentStatus: 'CLOSED',
+      });
+
+      await expect(
+        service.transitionStatus(recruiter, 'requisition-a', { status: 'OPEN' }),
+      ).rejects.toBeInstanceOf(RequisitionStatusTransitionError);
+    });
   });
 });

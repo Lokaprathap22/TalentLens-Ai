@@ -1070,5 +1070,92 @@ describe('workflow.service', () => {
       expect(timeline.items[0]?.toStage).toBe('RECRUITER_SHORTLISTED');
       expect(timeline.items[0]?.createdAt).toBe(eventDate.toISOString());
     });
+
+    it('listAuthorizedClients forwards includeInactive=true for RECRUITER but never for CLIENT_HIRING_MANAGER', async () => {
+      const now = new Date('2026-11-05T00:00:00.000Z');
+      const mockRepo: Partial<WorkflowRepository> = {
+        listAuthorizedClients: vi.fn().mockResolvedValue([
+          {
+            id: clientId,
+            name: 'Acme Corp',
+            status: 'INACTIVE',
+            createdAt: now,
+            updatedAt: now,
+          },
+        ]),
+      };
+      const service = createWorkflowService(mockRepo as WorkflowRepository);
+
+      const recruiterClients = await service.listAuthorizedClients(recruiterPrincipal, {
+        includeInactive: true,
+      });
+      expect(recruiterClients[0]?.createdAt).toBe(now.toISOString());
+      expect(recruiterClients[0]?.updatedAt).toBe(now.toISOString());
+      expect(mockRepo.listAuthorizedClients).toHaveBeenCalledWith(
+        recruiterPrincipal.organizationId,
+        recruiterPrincipal.userId,
+        'RECRUITER',
+        { includeInactive: true },
+      );
+
+      vi.mocked(mockRepo.listAuthorizedClients!).mockClear();
+      await service.listAuthorizedClients(clientPrincipal, { includeInactive: true });
+      expect(mockRepo.listAuthorizedClients).toHaveBeenCalledWith(
+        clientPrincipal.organizationId,
+        clientPrincipal.userId,
+        'CLIENT_HIRING_MANAGER',
+      );
+    });
+
+    it('createClient and updateClient enforce recruiter role and return formatted client DTOs', async () => {
+      const now = new Date('2026-11-05T00:00:00.000Z');
+      const mockRepo: Partial<WorkflowRepository> = {
+        createClient: vi.fn().mockResolvedValue({
+          id: clientId,
+          name: 'Acme Corp',
+          status: 'ACTIVE',
+          createdAt: now,
+          updatedAt: now,
+        }),
+        updateClient: vi
+          .fn()
+          .mockResolvedValueOnce({
+            id: clientId,
+            name: 'Acme Updated',
+            status: 'INACTIVE',
+            createdAt: now,
+            updatedAt: now,
+          })
+          .mockResolvedValueOnce(null),
+      };
+      const service = createWorkflowService(mockRepo as WorkflowRepository);
+
+      await expect(service.createClient(clientPrincipal, { name: 'Forbidden' })).rejects.toThrow(
+        WorkflowRequisitionAccessDeniedError,
+      );
+
+      await expect(
+        service.updateClient(clientPrincipal, clientId, { status: 'INACTIVE' }),
+      ).rejects.toThrow(WorkflowRequisitionAccessDeniedError);
+
+      const created = await service.createClient(recruiterPrincipal, { name: 'Acme Corp' });
+      expect(created).toEqual({
+        id: clientId,
+        name: 'Acme Corp',
+        status: 'ACTIVE',
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      });
+
+      const updated = await service.updateClient(recruiterPrincipal, clientId, {
+        name: 'Acme Updated',
+        status: 'INACTIVE',
+      });
+      expect(updated.status).toBe('INACTIVE');
+
+      await expect(
+        service.updateClient(recruiterPrincipal, 'missing-id', { status: 'ACTIVE' }),
+      ).rejects.toThrow('Client not found');
+    });
   });
 });

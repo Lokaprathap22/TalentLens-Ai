@@ -83,6 +83,20 @@ export class WorkflowClientUnauthorizedError extends Error {
   }
 }
 
+export class WorkflowClientNotFoundError extends Error {
+  constructor(message = 'Client not found') {
+    super(message);
+    this.name = 'WorkflowClientNotFoundError';
+  }
+}
+
+export class WorkflowClientConflictError extends Error {
+  constructor(message = 'A client with this name already exists in the organization') {
+    super(message);
+    this.name = 'WorkflowClientConflictError';
+  }
+}
+
 export class WorkflowInterviewNotFoundError extends Error {
   constructor(message = 'Interview proposal record not found') {
     super(message);

@@ -120,3 +120,29 @@ export const candidateTimelineQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   offset: z.coerce.number().int().min(0).default(0),
 });
+
+export const listClientsQuerySchema = z.object({
+  includeInactive: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((value) => value === 'true'),
+});
+
+export const createClientSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+  })
+  .strict();
+
+export const updateClientSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    status: z.enum(['ACTIVE', 'INACTIVE']).optional(),
+  })
+  .strict()
+  .refine((data) => data.name !== undefined || data.status !== undefined, {
+    message: 'At least one field (name or status) must be provided.',
+  });
+
+export type CreateClientInput = z.infer<typeof createClientSchema>;
+export type UpdateClientInput = z.infer<typeof updateClientSchema>;

@@ -13,6 +13,7 @@ import { redactCandidateIdentifiers } from '../assessments/assessment.redactor.j
 import { evaluateFeedbackFairness } from './feedback.fairness.js';
 import { isValidIanaTimezone } from './workflow.schemas.js';
 import {
+  WorkflowClientConflictError,
   WorkflowConsentRequiredError,
   WorkflowInterviewNotFoundError,
   WorkflowInterviewStateError,
@@ -22,6 +23,23 @@ import {
   WorkflowSubmissionNotFoundError,
   WorkflowSubmissionStateError,
 } from './workflow.errors.js';
+
+function normalizeClientDisplayName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ');
+}
+
+function normalizeClientLookupName(name: string): string {
+  return normalizeClientDisplayName(name).toLocaleLowerCase('en-US');
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'P2002'
+  );
+}
 
 export interface WorkflowRepository {
   findAuthorizedRequisition(
@@ -441,15 +459,43 @@ export interface WorkflowRepository {
     organizationId: string,
     userId: string,
     role: UserRole,
+    options?: { includeInactive?: boolean | undefined },
   ): Promise<
     Array<{
       id: string;
       name: string;
       status: string;
+      createdAt?: Date | string | undefined;
+      updatedAt?: Date | string | undefined;
       membershipId?: string | undefined;
       membershipRole?: string | undefined;
     }>
   >;
+
+  createClient?(
+    organizationId: string,
+    recruiterId: string,
+    input: { name: string },
+  ): Promise<{
+    id: string;
+    name: string;
+    status: string;
+    createdAt: Date;
+    updatedAt: Date;
+  }>;
+
+  updateClient?(
+    organizationId: string,
+    recruiterId: string,
+    clientId: string,
+    input: { name?: string | undefined; status?: 'ACTIVE' | 'INACTIVE' | undefined },
+  ): Promise<{
+    id: string;
+    name: string;
+    status: string;
+    createdAt: Date;
+    updatedAt: Date;
+  } | null>;
 
   getCandidateTimeline?(
     organizationId: string,
@@ -2399,18 +2445,21 @@ export function createWorkflowRepository(
       });
     },
 
-    async listAuthorizedClients(organizationId, userId, role) {
+    async listAuthorizedClients(organizationId, userId, role, options) {
       if (role === 'RECRUITER') {
+        const includeInactive = options?.includeInactive === true;
         const clients = await database.client.findMany({
           where: {
             organizationId,
-            status: 'ACTIVE',
+            ...(includeInactive ? {} : { status: 'ACTIVE' }),
           },
           orderBy: { name: 'asc' },
           select: {
             id: true,
             name: true,
             status: true,
+            createdAt: true,
+            updatedAt: true,
           },
         });
         return clients;
@@ -2433,6 +2482,8 @@ export function createWorkflowRepository(
                 id: true,
                 name: true,
                 status: true,
+                createdAt: true,
+                updatedAt: true,
               },
             },
           },
@@ -2445,12 +2496,151 @@ export function createWorkflowRepository(
           id: m.client.id,
           name: m.client.name,
           status: m.client.status,
+          createdAt: m.client.createdAt,
+          updatedAt: m.client.updatedAt,
           membershipId: m.id,
           membershipRole: m.role,
         }));
       }
 
       return [];
+    },
+
+    async createClient(organizationId, recruiterId, input) {
+      const displayName = normalizeClientDisplayName(input.name);
+      const normalizedName = normalizeClientLookupName(input.name);
+
+      try {
+        return await database.$transaction(async (tx) => {
+          const created = await tx.client.create({
+            data: {
+              organizationId,
+              name: displayName,
+              normalizedName,
+              status: 'ACTIVE',
+            },
+            select: {
+              id: true,
+              name: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          });
+
+          await tx.auditLog.create({
+            data: {
+              organizationId,
+              actorId: recruiterId,
+              action: 'CLIENT_CREATED',
+              resourceType: 'Client',
+              resourceId: created.id,
+              clientId: created.id,
+              metadataJson: {
+                name: created.name,
+                status: created.status,
+              },
+            },
+          });
+
+          return created;
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          throw new WorkflowClientConflictError();
+        }
+        throw error;
+      }
+    },
+
+    async updateClient(organizationId, recruiterId, clientId, input) {
+      const data: {
+        name?: string;
+        normalizedName?: string;
+        status?: 'ACTIVE' | 'INACTIVE';
+      } = {};
+
+      if (input.name !== undefined) {
+        data.name = normalizeClientDisplayName(input.name);
+        data.normalizedName = normalizeClientLookupName(input.name);
+      }
+      if (input.status !== undefined) {
+        data.status = input.status;
+      }
+
+      try {
+        return await database.$transaction(async (tx) => {
+          const existing = await tx.client.findFirst({
+            where: {
+              id: clientId,
+              organizationId,
+            },
+            select: {
+              id: true,
+              name: true,
+              status: true,
+            },
+          });
+
+          if (!existing) {
+            return null;
+          }
+
+          const updatedCount = await tx.client.updateMany({
+            where: {
+              id: clientId,
+              organizationId,
+            },
+            data,
+          });
+
+          if (updatedCount.count !== 1) {
+            return null;
+          }
+
+          const updated = await tx.client.findFirst({
+            where: {
+              id: clientId,
+              organizationId,
+            },
+            select: {
+              id: true,
+              name: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          });
+
+          if (!updated) {
+            return null;
+          }
+
+          await tx.auditLog.create({
+            data: {
+              organizationId,
+              actorId: recruiterId,
+              action: 'CLIENT_UPDATED',
+              resourceType: 'Client',
+              resourceId: updated.id,
+              clientId: updated.id,
+              metadataJson: {
+                previousName: existing.name,
+                name: updated.name,
+                previousStatus: existing.status,
+                status: updated.status,
+              },
+            },
+          });
+
+          return updated;
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          throw new WorkflowClientConflictError();
+        }
+        throw error;
+      }
     },
 
     async getCandidateTimeline(organizationId, recruiterId, requisitionId, candidateId, options) {

@@ -600,4 +600,176 @@ describe.skipIf(!RUN_INTEGRATION)('scorecard repository — PostgreSQL 17 integr
       expect(true).toBe(true);
     });
   });
+
+  // ── Test F — Manual & Cloned Scorecard Drafts + Requisition Status Lifecycle (M9.3 Step 1) ──
+
+  describe('Test F — Manual & Cloned Scorecard Drafts and Requisition Status Lifecycle', () => {
+    it('creates manual and cloned drafts concurrently without duplicate versions, preserves source, resets verification, and enforces DRAFT->OPEN scorecard approval', async () => {
+      const { createRequisitionRepository } =
+        await import('../requisitions/requisition.repository.js');
+      const { createScorecardService } = await import('./scorecard.service.js');
+
+      const fixture = await createTestFixture(pgClient);
+      const otherFixture = await createTestFixture(pgClient);
+      try {
+        // Set fixture requisition to DRAFT initially to test DRAFT -> OPEN
+        await pgClient.requisition.update({
+          where: { id: fixture.requisitionId },
+          data: { status: 'DRAFT' },
+        });
+
+        const reqRepo = createRequisitionRepository(pgClient);
+        const scService = createScorecardService({
+          repository: createScorecardRepository(pgClient),
+          extractionProvider: {
+            extract: async () => {
+              throw new Error('AI provider must not be called in manual or clone mode');
+            },
+          },
+        });
+
+        // 1. DRAFT -> OPEN without an approved scorecard must be rejected
+        const blockedOpen = await reqRepo.transitionStatus(
+          fixture.principal,
+          fixture.requisitionId,
+          'OPEN',
+        );
+        expect(blockedOpen).toEqual({ status: 'scorecard_not_approved' });
+
+        // 2. Concurrent manual draft creation produces distinct versions (1 and 2)
+        const [manual1, manual2] = await Promise.all([
+          scService.generate(fixture.principal, fixture.requisitionId, { mode: 'manual' }),
+          scService.generate(fixture.principal, fixture.requisitionId, { mode: 'manual' }),
+        ]);
+        const versions = [manual1.version, manual2.version].sort((a, b) => a - b);
+        expect(versions).toEqual([1, 2]);
+        expect(manual1.status).toBe('DRAFT');
+        expect(manual1.criteria).toEqual([]);
+
+        // 3. Add a verified criterion to manual1 and approve it
+        await scService.update(fixture.principal, fixture.requisitionId, manual1.id, {
+          criteria: [
+            {
+              key: 'skill-ts',
+              label: 'TypeScript',
+              description: 'TypeScript experience',
+              category: 'SKILL',
+              requirementType: 'MUST_HAVE',
+              weight: 100,
+              displayOrder: 0,
+              active: true,
+              evidence: {
+                sourceQuote: 'TypeScript experience',
+                sourceStart: null,
+                sourceEnd: null,
+                verificationStatus: 'VERIFIED',
+              },
+            },
+          ],
+        });
+
+        const approvedV1 = await scService.approve(
+          fixture.principal,
+          fixture.requisitionId,
+          manual1.id,
+        );
+        expect(approvedV1.status).toBe('APPROVED');
+        expect(approvedV1.criteria[0]?.evidence?.verificationStatus).toBe('VERIFIED');
+
+        // 4. Reject cloning from another requisition
+        await expect(
+          scService.generate(otherFixture.principal, otherFixture.requisitionId, {
+            cloneFromVersionId: approvedV1.id,
+          }),
+        ).rejects.toThrow('Scorecard not found');
+
+        // 5. Update the requisition JD while still DRAFT so we can test clone quote grounding + outdated quote handling
+        await pgClient.requisition.update({
+          where: { id: fixture.requisitionId },
+          data: {
+            jdText: 'Updated JD prefix: we require TypeScript experience for backend engineering.',
+          },
+        });
+
+        // 6. Clone from approvedV1 -> creates version 3 in DRAFT with new criterion IDs and PENDING_RECRUITER_REVIEW
+        const clonedV3 = await scService.generate(fixture.principal, fixture.requisitionId, {
+          cloneFromVersionId: approvedV1.id,
+        });
+        expect(clonedV3.version).toBe(3);
+        expect(clonedV3.status).toBe('DRAFT');
+        expect(clonedV3.approvedById).toBeNull();
+        expect(clonedV3.approvedAt).toBeNull();
+        expect(clonedV3.criteria).toHaveLength(1);
+        expect(clonedV3.criteria[0]?.id).not.toBe(approvedV1.criteria[0]?.id);
+        expect(clonedV3.criteria[0]?.evidence?.verificationStatus).toBe('PENDING_RECRUITER_REVIEW');
+        expect(clonedV3.criteria[0]?.evidence?.sourceStart).toBe(30);
+        expect(clonedV3.criteria[0]?.evidence?.sourceEnd).toBe(51);
+
+        // Source version approvedV1 remains APPROVED and untouched
+        const sourceCheck = await scService.get(
+          fixture.principal,
+          fixture.requisitionId,
+          approvedV1.id,
+        );
+        expect(sourceCheck.status).toBe('APPROVED');
+        expect(sourceCheck.criteria[0]?.evidence?.verificationStatus).toBe('VERIFIED');
+
+        // 7. Now transition requisition DRAFT -> OPEN -> PAUSED -> OPEN -> FILLED
+        const openRes = await reqRepo.transitionStatus(
+          fixture.principal,
+          fixture.requisitionId,
+          'OPEN',
+        );
+        expect(openRes.status).toBe('ok');
+        if (openRes.status === 'ok') {
+          expect(openRes.record.status).toBe('OPEN');
+        }
+
+        const pauseRes = await reqRepo.transitionStatus(
+          fixture.principal,
+          fixture.requisitionId,
+          'PAUSED',
+        );
+        expect(pauseRes.status).toBe('ok');
+
+        const reopenRes = await reqRepo.transitionStatus(
+          fixture.principal,
+          fixture.requisitionId,
+          'OPEN',
+        );
+        expect(reopenRes.status).toBe('ok');
+
+        const fillRes = await reqRepo.transitionStatus(
+          fixture.principal,
+          fixture.requisitionId,
+          'FILLED',
+        );
+        expect(fillRes.status).toBe('ok');
+
+        // Reopening FILLED must be rejected
+        const invalidReopen = await reqRepo.transitionStatus(
+          fixture.principal,
+          fixture.requisitionId,
+          'OPEN',
+        );
+        expect(invalidReopen).toEqual({
+          status: 'invalid_transition',
+          currentStatus: 'FILLED',
+        });
+
+        // 8. Verify audit logs for manual draft, cloned draft, and requisition status transitions
+        const audits = await pgClient.auditLog.findMany({
+          where: { organizationId: fixture.organizationId },
+          orderBy: { createdAt: 'asc' },
+        });
+        const actions = audits.map((a: { action: string }) => a.action);
+        expect(actions).toContain('SCORECARD_DRAFT_CREATED_MANUAL');
+        expect(actions).toContain('SCORECARD_DRAFT_CLONED');
+        expect(actions).toContain('REQUISITION_STATUS_TRANSITIONED');
+      } finally {
+        await fixture.cleanup(pgClient);
+        await otherFixture.cleanup(pgClient);
+      }
+    });
+  });
 });

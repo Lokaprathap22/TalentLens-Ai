@@ -154,6 +154,56 @@ describe('scorecard routes', () => {
     expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId);
   });
 
+  it('supports explicit AI, manual, and clone draft creation modes and rejects contradictory inputs', async () => {
+    const { app, service } = createTestApp();
+    const sourceVersionId = '223e4567-e89b-42d3-a456-426614174000';
+
+    // Explicit AI mode
+    const aiRes = await authorizedPost(
+      app,
+      `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+    ).send({ mode: 'ai' });
+    expect(aiRes.status).toBe(201);
+    expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId, { mode: 'ai' });
+
+    // Manual mode
+    const manualRes = await authorizedPost(
+      app,
+      `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+    ).send({ mode: 'manual' });
+    expect(manualRes.status).toBe(201);
+    expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId, { mode: 'manual' });
+
+    // Clone mode
+    const cloneRes = await authorizedPost(
+      app,
+      `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+    ).send({ cloneFromVersionId: sourceVersionId });
+    expect(cloneRes.status).toBe(201);
+    expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId, {
+      cloneFromVersionId: sourceVersionId,
+    });
+
+    vi.mocked(service.generate).mockClear();
+
+    // Contradictory inputs rejected with 400
+    for (const invalidBody of [
+      { mode: 'ai', cloneFromVersionId: sourceVersionId },
+      { mode: 'manual', cloneFromVersionId: sourceVersionId },
+      { cloneFromVersionId: 'not-a-uuid' },
+      { mode: 'invalid' },
+      { extra: 'field' },
+    ]) {
+      const badRes = await authorizedPost(
+        app,
+        `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+      ).send(invalidBody);
+      expect(badRes.status).toBe(400);
+    }
+
+    expect(service.generate).not.toHaveBeenCalled();
+  });
+
   it('rejects status and approver injection in edits', async () => {
     const { app, service } = createTestApp();
 
