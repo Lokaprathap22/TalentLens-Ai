@@ -58,3 +58,19 @@ export function formatTimeRange(startIso: string, endIso: string, timeZone: stri
       .find((part) => part.type === 'timeZoneName')?.value ?? timeZone;
   return `${time.format(new Date(startIso))}–${time.format(new Date(endIso))} ${zone}`;
 }
+
+const shortDateFormatter = new Intl.DateTimeFormat(LOCALE, {
+  day: 'numeric',
+  month: 'short',
+  year: 'numeric',
+  timeZone: 'UTC',
+});
+
+/** Locale-aware calendar date such as "5 Nov 2026" (UTC-stable across environments). */
+export function formatShortDate(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) {
+    return '—';
+  }
+  return shortDateFormatter.format(parsed);
+}

@@ -344,4 +344,59 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
     expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/v1/auth/csrf');
     expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/v1/auth/csrf');
   });
+
+  it('14. allows authenticated RECRUITER to navigate to /clients via sidebar and blocks non-recruiter roles', async () => {
+    mockAuthenticatedSession(RECRUITER_USER);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        clients: [
+          {
+            id: '11111111-1111-4111-8111-111111111111',
+            name: 'Apex Fintech',
+            status: 'ACTIVE',
+            createdAt: '2026-10-12T09:00:00.000Z',
+            updatedAt: '2026-10-15T14:30:00.000Z',
+          },
+        ],
+      }),
+    );
+    const user = userEvent.setup({ delay: null });
+
+    renderAt('/dashboard');
+    expect(await screen.findByRole('heading', { name: 'Dashboard', level: 1 })).toBeInTheDocument();
+
+    const sidebar = screen.getByRole('complementary', { name: 'Sidebar' });
+    const clientsNavLink = within(sidebar).getByRole('link', { name: 'Clients' });
+    await user.click(clientsNavLink);
+
+    expect(await screen.findByRole('heading', { name: 'Clients', level: 1 })).toBeInTheDocument();
+    expect(await screen.findByText('Apex Fintech')).toBeInTheDocument();
+  });
+
+  it('15. redirects CLIENT_HIRING_MANAGER and DELIVERY_HEAD away from /clients', async () => {
+    mockAuthenticatedSession(CLIENT_USER);
+    const { unmount } = renderAt('/clients');
+
+    expect(
+      await screen.findByRole('heading', {
+        name: /Client Hiring Manager portal arriving in an upcoming milestone/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Clients' })).not.toBeInTheDocument();
+
+    unmount();
+    clearCsrfToken();
+    clearUnauthorizedHandler();
+    fetchMock.mockReset();
+
+    mockAuthenticatedSession(DELIVERY_HEAD_USER);
+    renderAt('/clients');
+
+    expect(
+      await screen.findByRole('heading', {
+        name: /Delivery Head workspace arriving in an upcoming milestone/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Clients' })).not.toBeInTheDocument();
+  });
 });

@@ -69,7 +69,7 @@ export const recruiterNavigation: NavSection[] = [
   {
     id: 'relationships',
     label: 'Relationships',
-    items: [{ id: 'clients', label: 'Clients', icon: Building2, to: '/clients', available: false }],
+    items: [{ id: 'clients', label: 'Clients', icon: Building2, to: '/clients', available: true }],
   },
   {
     id: 'coordination',

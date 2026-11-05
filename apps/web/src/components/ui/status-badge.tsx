@@ -47,6 +47,10 @@ const catalogue = {
     CLOSED: { label: 'Closed', tone: 'neutral' },
     FILLED: { label: 'Filled', tone: 'accent' },
   },
+  client: {
+    ACTIVE: { label: 'Active', tone: 'success' },
+    INACTIVE: { label: 'Inactive', tone: 'neutral' },
+  },
 } as const satisfies Record<string, Record<string, StatusDescriptor>>;
 
 type Catalogue = typeof catalogue;

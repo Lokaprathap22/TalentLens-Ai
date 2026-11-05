@@ -7,6 +7,7 @@ import { WorkspaceProvider } from './app/workspace.js';
 import { Card, EmptyState, buttonStyles } from './components/ui/index.js';
 import { sampleWorkspace } from './dev-fixtures/workspace.fixture.js';
 import { LoginPage } from './features/auth/LoginPage.js';
+import { ClientsPage } from './features/clients/ClientsPage.js';
 import { DashboardPage } from './features/dashboard/DashboardPage.js';
 import { DesignSystemPage } from './features/design-system/DesignSystemPage.js';
 import { AppShell } from './layouts/AppShell.js';
@@ -80,6 +81,7 @@ export function AppRoutes(): React.JSX.Element {
           <Route element={<AppShell />}>
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/clients" element={<ClientsPage />} />
             {IS_DEV_OR_TEST ? <Route path="/design-system" element={<DesignSystemPage />} /> : null}
             <Route path="*" element={<NotFoundPage />} />
           </Route>
