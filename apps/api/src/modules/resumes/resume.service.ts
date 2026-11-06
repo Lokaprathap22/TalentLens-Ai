@@ -12,6 +12,7 @@ import {
   type ResumeRepository,
 } from './resume.repository.js';
 import { createDocumentStorageService, LocalDocumentStorageService } from './resume.storage.js';
+import { createResumeScanner, type ResumeScanner } from './resume.scanner.js';
 import { parseMultipartUpload, type ParsedUploadedFile } from './resume.multipart.js';
 import {
   DocxTextExtractor,
@@ -69,11 +70,13 @@ export class ExtractionNotFoundError extends Error {
 export interface ResumeServiceDependencies {
   repository?: ResumeRepository;
   storageService?: DocumentStorageService;
+  scanner?: ResumeScanner;
 }
 
 export function createResumeService(dependencies: ResumeServiceDependencies = {}) {
   const repository = dependencies.repository ?? createResumeRepository();
   const storageService = dependencies.storageService ?? createDocumentStorageService();
+  const scanner = dependencies.scanner ?? createResumeScanner();
   const docxExtractor = new DocxTextExtractor();
 
   function requireRecruiter(principal: AuthenticatedPrincipal): void {
@@ -116,9 +119,11 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
 
       try {
         for (const file of uploadedFiles) {
+          let fileBuffer: Buffer;
+
           // 1. Structure & format pre-validation
           try {
-            const fileBuffer = await (async () => {
+            fileBuffer = await (async () => {
               const fs = await import('node:fs/promises');
               return fs.readFile(file.tempPath);
             })();
@@ -164,6 +169,41 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             rejected.push({
               fileName: file.sanitizedFileName,
               reason: 'Failed to inspect file structure',
+              status: 'REJECTED',
+            });
+            continue;
+          }
+
+          // 1b. Antivirus malware scan boundary
+          try {
+            const scanResult = await scanner.scan(fileBuffer, file.sanitizedFileName);
+            if (scanResult.status === 'INFECTED') {
+              rejected.push({
+                fileName: file.sanitizedFileName,
+                reason: `Malware detected: ${scanResult.threatName ?? 'Malicious content'}`,
+                status: 'REJECTED',
+              });
+              continue;
+            }
+            if (scanResult.status === 'ERROR') {
+              const nodeEnv = process.env['NODE_ENV'];
+              const isProductionOrStaging = nodeEnv === 'production' || nodeEnv === 'staging';
+              const failClosed =
+                process.env['SCANNER_FAIL_CLOSED'] !== 'false' || isProductionOrStaging;
+
+              if (failClosed) {
+                rejected.push({
+                  fileName: file.sanitizedFileName,
+                  reason: `Antivirus scanner unavailable: ${scanResult.errorMessage ?? 'Scanner error'}; upload quarantined`,
+                  status: 'REJECTED',
+                });
+                continue;
+              }
+            }
+          } catch (scanErr: unknown) {
+            rejected.push({
+              fileName: file.sanitizedFileName,
+              reason: `Antivirus scanning exception: ${(scanErr as Error)?.message ?? 'Scanner error'}; upload quarantined`,
               status: 'REJECTED',
             });
             continue;

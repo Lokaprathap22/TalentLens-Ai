@@ -624,4 +624,65 @@ describe('api-client foundation (M9.2A Step 2)', () => {
     const emptyBodyResult = await apiClient.get('/requisitions');
     expect(emptyBodyResult).toBeUndefined();
   });
+
+  it('23. strictly restricts CSRF/401 exemptions to exact public POST routes without wildcard leakage', async () => {
+    const onUnauthorizedCallback = vi.fn();
+    setUnauthorizedHandler(onUnauthorizedCallback);
+
+    const publicPostEndpoints = [
+      '/consent/inspect',
+      '/consent/accept',
+      '/consent/decline',
+      '/consent/withdraw/request',
+      '/consent/withdraw/confirm',
+      '/auth/login',
+    ];
+
+    for (const endpoint of publicPostEndpoints) {
+      // 1. Success does not require prior CSRF token
+      fetchMock.mockResolvedValueOnce(jsonResponse({ success: true }));
+      await apiClient.post(endpoint, { token: 'test-token' });
+      const lastCall = fetchMock.mock.calls[fetchMock.mock.calls.length - 1];
+      const headers = (lastCall?.[1]?.headers as Record<string, string>) ?? {};
+      expect(headers[CSRF_HEADER_NAME]).toBeUndefined();
+
+      // 2. 401 on public endpoints does NOT invoke unauthorized recruiter handler
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ error: 'unauthorized', message: 'Token invalid' }, { status: 401 }),
+      );
+      await expect(apiClient.post(endpoint, { token: 'invalid' })).rejects.toMatchObject({
+        status: 401,
+      });
+      expect(onUnauthorizedCallback).not.toHaveBeenCalled();
+    }
+
+    // Protected / non-exempt routes must enforce CSRF token and trigger 401 handler
+    const protectedRoutes = [
+      {
+        method: 'post' as const,
+        path: '/requisitions/req-1/candidates/cand-1/consent-invitations',
+      },
+      { method: 'post' as const, path: '/consent/arbitrary-admin-route' },
+      { method: 'get' as const, path: '/consent/inspect' },
+    ];
+
+    for (const route of protectedRoutes) {
+      if (route.method === 'post') {
+        // Without CSRF token in memory, attempting protected state-changing call fetches CSRF first
+        fetchMock.mockResolvedValueOnce(jsonResponse({ csrfToken: 'fetched-csrf' }));
+      }
+      // Protected call returns 401
+      fetchMock.mockResolvedValueOnce(jsonResponse({ error: 'unauthenticated' }, { status: 401 }));
+
+      if (route.method === 'post') {
+        await expect(apiClient.post(route.path, {})).rejects.toMatchObject({ status: 401 });
+      } else {
+        await expect(apiClient.get(route.path)).rejects.toMatchObject({ status: 401 });
+      }
+
+      expect(onUnauthorizedCallback).toHaveBeenCalled();
+      onUnauthorizedCallback.mockClear();
+      clearCsrfToken();
+    }
+  });
 });

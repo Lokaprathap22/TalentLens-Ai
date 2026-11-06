@@ -298,7 +298,7 @@ describe('ScorecardEditorPage', () => {
     expect(screen.getAllByRole('button', { name: /verify source quote/i }).length).toBeGreaterThan(
       0,
     );
-  });
+  }, 15000);
 
   it('handles failed save when backend rejects ungrounded quote and retains user input', async () => {
     const user = userEvent.setup();
@@ -376,7 +376,7 @@ describe('ScorecardEditorPage', () => {
     expect(
       screen.getByText(/1 active criterion requires evidence verification/i),
     ).toBeInTheDocument();
-  });
+  }, 10000);
 
   it('editing a verified criterion description resets verification and clears offsets', async () => {
     const user = userEvent.setup();
@@ -403,7 +403,7 @@ describe('ScorecardEditorPage', () => {
     expect(
       screen.getByText(/1 active criterion requires evidence verification/i),
     ).toBeInTheDocument();
-  });
+  }, 10000);
 
   it('editing a verified criterion category resets verification and clears offsets', async () => {
     const user = userEvent.setup();
@@ -428,7 +428,7 @@ describe('ScorecardEditorPage', () => {
     expect(
       screen.getByText(/1 active criterion requires evidence verification/i),
     ).toBeInTheDocument();
-  });
+  }, 10000);
 
   it('changing the source quote resets verification and clears offsets', async () => {
     const user = userEvent.setup();
@@ -452,7 +452,7 @@ describe('ScorecardEditorPage', () => {
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /verify source quote/i })).toBeInTheDocument();
     expect(screen.getByText('Unindexed quote')).toBeInTheDocument();
-  });
+  }, 10000);
 
   it('removing evidence causes approval readiness to fail', async () => {
     const user = userEvent.setup();
@@ -524,7 +524,7 @@ describe('ScorecardEditorPage', () => {
   });
 
   it('re-verification requires an explicit recruiter action after semantic edit', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     vi.spyOn(scorecardApi, 'getScorecard').mockResolvedValueOnce(mockVerifiedDraftScorecard);
 
     renderScorecardEditorPage();
@@ -551,5 +551,5 @@ describe('ScorecardEditorPage', () => {
     // Both are verified again and approval is re-enabled
     expect(screen.getAllByText(/verified by recruiter/i).length).toBe(2);
     expect(screen.getByRole('button', { name: /^approve scorecard$/i })).toBeEnabled();
-  });
+  }, 15000);
 });

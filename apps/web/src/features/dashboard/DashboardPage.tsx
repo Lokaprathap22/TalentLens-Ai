@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router';
+import { useNavigate, useSearchParams } from 'react-router';
 
 import {
   Badge,
@@ -493,13 +493,13 @@ function RequisitionsCard({
           <EmptyState
             icon={Briefcase}
             title="No active requisitions"
-            description="Create a requisition and attach a versioned scorecard in M9.2 to start evaluating candidates."
+            description="Create a requisition and attach an approved scorecard to start evaluating candidates."
           />
         }
       />
       <CardFooter className="flex items-center justify-between">
         <span>Scorecards are version-locked per requisition assessment.</span>
-        <Badge tone="neutral">Requisitions workspace · M9.2</Badge>
+        <Badge tone="neutral">Requisitions workspace</Badge>
       </CardFooter>
     </Card>
   );
@@ -661,12 +661,16 @@ function CandidatePreviewDialog({
   candidate: ReviewQueueItem | null;
   onClose: () => void;
 }): React.JSX.Element {
+  const navigate = useNavigate();
   const state = candidate ? evidenceState(candidate) : 'NOT_ASSESSED';
-  const canSubmitToClient =
-    candidate !== null &&
-    candidate.consent === 'ACTIVE' &&
-    state === 'COMPLETE' &&
-    candidate.score !== null;
+  const hasWorkspaceTarget = Boolean(candidate?.requisitionId && candidate?.candidateId);
+
+  const handleOpenWorkspace = (): void => {
+    onClose();
+    if (candidate?.requisitionId && candidate?.candidateId) {
+      void navigate(`/requisitions/${candidate.requisitionId}/candidates/${candidate.candidateId}`);
+    }
+  };
 
   return (
     <Dialog
@@ -686,15 +690,14 @@ function CandidatePreviewDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={!canSubmitToClient}
-            onClick={onClose}
+            onClick={hasWorkspaceTarget ? handleOpenWorkspace : onClose}
             title={
-              canSubmitToClient
-                ? 'Full review & submission workspace arrives in M9.2'
+              hasWorkspaceTarget
+                ? 'Open full candidate details and evidence evaluation workspace'
                 : 'Active consent and verified scorecard evidence are required before shortlist or submission'
             }
           >
-            Open full evidence review (M9.2)
+            {hasWorkspaceTarget ? 'Open candidate workspace' : 'Open full evidence review'}
           </Button>
         </>
       }
@@ -880,6 +883,7 @@ export function DashboardPage(): React.JSX.Element {
               >
                 {(
                   [
+                    { id: 'live', label: 'Live' },
                     { id: 'sample', label: 'Sample' },
                     { id: 'empty', label: 'Empty' },
                     { id: 'loading', label: 'Loading' },
@@ -929,7 +933,7 @@ export function DashboardPage(): React.JSX.Element {
               production metrics.
             </span>
           </p>
-          <span className="shrink-0 font-mono text-2xs text-fg-subtle">M9.1 fixture seam</span>
+          <span className="shrink-0 font-mono text-2xs text-fg-subtle">Dev preview</span>
         </div>
       ) : null}
 

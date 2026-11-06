@@ -245,6 +245,14 @@ enum DeletionRequestStatus {
   REJECTED
 }
 
+enum EmailDeliveryStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  PERMANENTLY_REJECTED
+}
+
 model Organization {
   id             String   @id @default(uuid()) @db.Uuid
   name           String
@@ -274,6 +282,7 @@ model Organization {
   pipelineEvents       PipelineEvent[]
   consentInvitations   ConsentInvitation[]
   consentWithdrawalRequests ConsentWithdrawalRequest[]
+  emailOutboxRecords   EmailOutbox[]               @relation("OrganizationEmailOutbox")
 
   @@unique([normalizedName])
   @@map("organizations")
@@ -1033,4 +1042,39 @@ model AuditLog {
   @@index([organizationId, createdAt])
   @@index([clientId, createdAt])
   @@map("audit_logs")
+}
+
+model EmailOutbox {
+  id               String              @id @default(uuid()) @db.Uuid
+  organizationId   String?             @map("organization_id") @db.Uuid
+  idempotencyKey   String              @unique @map("idempotency_key")
+  messageType      String              @map("message_type")
+  recipientEmail   String?             @map("recipient_email")
+  recipientRole    String              @map("recipient_role")
+  subject          String?             @map("subject")
+  html             String?             @map("html") @db.Text
+  text             String?             @map("text") @db.Text
+  payloadJson      Json?               @map("payload_json")
+  encryptedPayload String?             @map("encrypted_payload") @db.Text
+  keyId            String?             @map("key_id")
+  status           EmailDeliveryStatus @default(PENDING) @map("status")
+  attempts       Int                 @default(0) @map("attempts")
+  maxAttempts    Int                 @default(3) @map("max_attempts")
+  nextAttemptAt  DateTime?           @map("next_attempt_at")
+  leaseToken     String?             @map("lease_token") @db.Uuid
+  leaseExpiresAt DateTime?           @map("lease_expires_at")
+  lockedBy       String?             @map("locked_by")
+  lastError      String?             @map("last_error") @db.Text
+  lastErrorCode  String?             @map("last_error_code")
+  sentAt         DateTime?           @map("sent_at")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+
+  organization   Organization?       @relation("OrganizationEmailOutbox", fields: [organizationId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextAttemptAt])
+  @@index([status, leaseExpiresAt])
+  @@index([recipientEmail])
+  @@index([organizationId, createdAt])
+  @@map("email_outbox")
 }

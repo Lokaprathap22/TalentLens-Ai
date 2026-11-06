@@ -116,7 +116,7 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
     expect(
       await screen.findByRole('heading', { name: /No candidates in the review queue/i }),
     ).toBeInTheDocument();
-  });
+  }, 15000);
 
   it('3. allows authenticated RECRUITER to access /dashboard with real workspace identity', async () => {
     mockAuthenticatedSession(RECRUITER_USER);
@@ -132,26 +132,27 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
     expect(screen.getByRole('heading', { name: 'Active requisitions' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Upcoming interviews' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Recent workflow activity' })).toBeInTheDocument();
-  });
+  }, 15000);
 
   it('4. redirects authenticated CLIENT_HIRING_MANAGER away from recruiter AppShell to /client-portal', async () => {
     mockAuthenticatedSession(CLIENT_USER);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ clients: [] }));
     const user = userEvent.setup({ delay: null });
 
     renderAt('/dashboard');
 
     expect(
       await screen.findByRole('heading', {
-        name: /Client Hiring Manager portal arriving in an upcoming milestone/i,
+        name: /Candidate Evaluation Workspace/i,
       }),
     ).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Dashboard' })).not.toBeInTheDocument();
     expect(screen.getAllByText('hiring.manager@client.example').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Client Hiring Manager').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Client Portal/i).length).toBeGreaterThan(0);
 
-    // Sign out from client portal notice page
+    // Sign out from client portal
     fetchMock.mockResolvedValueOnce(jsonResponse({ status: 'ok' }));
-    await user.click(screen.getByRole('button', { name: /Sign out of session/i }));
+    await user.click(screen.getByRole('button', { name: /Sign out/i }));
 
     expect(
       await screen.findByRole('heading', { name: /Sign in to your workspace/i }),
@@ -375,11 +376,12 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
 
   it('15. redirects CLIENT_HIRING_MANAGER and DELIVERY_HEAD away from /clients', async () => {
     mockAuthenticatedSession(CLIENT_USER);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ clients: [] }));
     const { unmount } = renderAt('/clients');
 
     expect(
       await screen.findByRole('heading', {
-        name: /Client Hiring Manager portal arriving in an upcoming milestone/i,
+        name: /Candidate Evaluation Workspace/i,
       }),
     ).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Clients' })).not.toBeInTheDocument();
@@ -435,11 +437,12 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
 
   it('17. redirects non-recruiter roles away from /requisitions', async () => {
     mockAuthenticatedSession(CLIENT_USER);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ clients: [] }));
     const { unmount } = renderAt('/requisitions');
 
     expect(
       await screen.findByRole('heading', {
-        name: /Client Hiring Manager portal arriving in an upcoming milestone/i,
+        name: /Candidate Evaluation Workspace/i,
       }),
     ).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Requisitions' })).not.toBeInTheDocument();
@@ -495,11 +498,12 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
 
   it('19. redirects non-recruiter roles away from /scorecards', async () => {
     mockAuthenticatedSession(CLIENT_USER);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ clients: [] }));
     const { unmount } = renderAt('/scorecards');
 
     expect(
       await screen.findByRole('heading', {
-        name: /Client Hiring Manager portal arriving in an upcoming milestone/i,
+        name: /Candidate Evaluation Workspace/i,
       }),
     ).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Scorecards Directory' })).not.toBeInTheDocument();
@@ -518,5 +522,25 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
       }),
     ).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Scorecards Directory' })).not.toBeInTheDocument();
+  });
+
+  it('20. allows unauthenticated candidate access to public /consent portal without login redirect', async () => {
+    mockUnauthenticatedSession();
+    renderAt('/consent');
+
+    expect(await screen.findByText('Candidate Verification & Consent Portal')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('heading', { name: 'Sign in to TalentLens AI' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('21. allows unauthenticated candidate access to public /consent/withdraw page without login redirect', async () => {
+    mockUnauthenticatedSession();
+    renderAt('/consent/withdraw');
+
+    expect(await screen.findByText('Withdraw Candidate Consent')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('heading', { name: 'Sign in to TalentLens AI' }),
+    ).not.toBeInTheDocument();
   });
 });

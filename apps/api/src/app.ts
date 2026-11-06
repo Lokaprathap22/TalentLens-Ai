@@ -70,7 +70,7 @@ export function createApp(dependencies: AppDependencies = {}): Express {
     app.use('/api/v1', createWorkflowRouter(dependencies.workflow));
   }
 
-  app.get('/api/v1/health', (_request, response) => {
+  app.get(['/api/v1/health', '/api/health'], (_request, response) => {
     const payload = healthResponseSchema.parse({
       status: 'ok',
       service: 'talentlens-api',
@@ -80,7 +80,7 @@ export function createApp(dependencies: AppDependencies = {}): Express {
     response.json(payload);
   });
 
-  app.get('/api/v1/health/ready', async (_request, response) => {
+  app.get(['/api/v1/health/ready', '/api/health/ready'], async (_request, response) => {
     try {
       await databaseHealthChecker();
       response.status(200).json({
@@ -94,6 +94,31 @@ export function createApp(dependencies: AppDependencies = {}): Express {
       });
     }
   });
+
+  // Return clean JSON 404 for unmapped API endpoints
+  app.use('/api', (_request, response) => {
+    response.status(404).json({ error: 'not_found' });
+  });
+
+  // Global error handler: prevent HTML error responses and stack trace leakage
+  app.use(
+    (
+      error: unknown,
+      _request: express.Request,
+      response: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      if (
+        error instanceof SyntaxError &&
+        'status' in error &&
+        (error as { status?: number }).status === 400
+      ) {
+        response.status(400).json({ error: 'invalid_json' });
+        return;
+      }
+      response.status(500).json({ error: 'internal_error' });
+    },
+  );
 
   return app;
 }

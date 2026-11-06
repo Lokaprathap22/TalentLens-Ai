@@ -197,14 +197,29 @@ export function resolveApiUrl(path: string): string {
   return `${API_BASE_PATH}${trimmed}`;
 }
 
+const PUBLIC_UNAUTHENTICATED_POST_ROUTES: ReadonlySet<string> = new Set([
+  '/auth/login',
+  '/consent/inspect',
+  '/consent/accept',
+  '/consent/decline',
+  '/consent/withdraw/request',
+  '/consent/withdraw/confirm',
+]);
+
 function isCsrfExemptRequest(method: HttpMethod, path: string): boolean {
+  if (method !== 'POST') {
+    return false;
+  }
   const pathname = extractPathWithoutQuery(path.trim());
-  return method === 'POST' && pathname === '/auth/login';
+  return PUBLIC_UNAUTHENTICATED_POST_ROUTES.has(pathname);
 }
 
-function isLoginEndpoint(method: HttpMethod, path: string): boolean {
+function isPublicUnauthenticatedEndpoint(method: HttpMethod, path: string): boolean {
+  if (method !== 'POST') {
+    return false;
+  }
   const pathname = extractPathWithoutQuery(path.trim());
-  return method === 'POST' && pathname === '/auth/login';
+  return PUBLIC_UNAUTHENTICATED_POST_ROUTES.has(pathname);
 }
 
 function isSafeClientMessage(message: unknown): message is string {
@@ -370,7 +385,7 @@ export async function apiRequest<T = unknown>(
   }
 
   if (!response.ok) {
-    if (response.status === 401 && !isLoginEndpoint(method, path)) {
+    if (response.status === 401 && !isPublicUnauthenticatedEndpoint(method, path)) {
       clearCsrfToken();
       unauthorizedHandler?.();
     }

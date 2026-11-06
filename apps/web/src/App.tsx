@@ -7,7 +7,12 @@ import { WorkspaceProvider } from './app/workspace.js';
 import { Card, EmptyState, buttonStyles } from './components/ui/index.js';
 import { sampleWorkspace } from './dev-fixtures/workspace.fixture.js';
 import { LoginPage } from './features/auth/LoginPage.js';
+import { CandidateDetailPage } from './features/candidates/CandidateDetailPage.js';
+import { CandidatesPage } from './features/candidates/CandidatesPage.js';
+import { ClientPortalPage } from './features/client-portal/ClientPortalPage.js';
 import { ClientsPage } from './features/clients/ClientsPage.js';
+import { ConsentPortalPage } from './features/consent/ConsentPortalPage.js';
+import { ConsentWithdrawalPage } from './features/consent/ConsentWithdrawalPage.js';
 import { DashboardPage } from './features/dashboard/DashboardPage.js';
 import { DesignSystemPage } from './features/design-system/DesignSystemPage.js';
 import { RequisitionDetailPage } from './features/requisitions/RequisitionDetailPage.js';
@@ -48,12 +53,14 @@ export function AppRoutes(): React.JSX.Element {
     <AuthProvider>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/consent" element={<ConsentPortalPage />} />
+        <Route path="/consent/withdraw" element={<ConsentWithdrawalPage />} />
 
         <Route
           path="/client-portal"
           element={
             <ProtectedRoute allowedRoles={['CLIENT_HIRING_MANAGER']}>
-              <RoleWorkspaceNoticePage role="CLIENT_HIRING_MANAGER" />
+              <ClientPortalPage />
             </ProtectedRoute>
           }
         />
@@ -90,6 +97,11 @@ export function AppRoutes(): React.JSX.Element {
             <Route path="/requisitions" element={<RequisitionsPage />} />
             <Route path="/requisitions/:requisitionId" element={<RequisitionDetailPage />} />
             <Route path="/scorecards" element={<ScorecardIndexPage />} />
+            <Route path="/requisitions/:requisitionId/candidates" element={<CandidatesPage />} />
+            <Route
+              path="/requisitions/:requisitionId/candidates/:candidateId"
+              element={<CandidateDetailPage />}
+            />
             <Route path="/requisitions/:requisitionId/scorecards" element={<ScorecardsPage />} />
             <Route
               path="/requisitions/:requisitionId/scorecards/:versionId"

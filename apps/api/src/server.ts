@@ -20,7 +20,12 @@ import { createResumeRepository } from './modules/resumes/resume.repository.js';
 import { createResumeService } from './modules/resumes/resume.service.js';
 import { createConsentRepository } from './modules/consent/consent.repository.js';
 import { createConsentService } from './modules/consent/consent.service.js';
-import { DefaultEmailDeliveryService } from './modules/consent/consent.email.js';
+import {
+  NullEmailProvider,
+  SmtpEmailProvider,
+  TransactionalEmailService,
+} from './modules/email/index.js';
+import { initializeIdempotencySecret, initializeKeyRing } from './modules/email/email.crypto.js';
 import { createAssessmentRepository } from './modules/assessments/assessment.repository.js';
 import { createAssessmentService } from './modules/assessments/assessment.service.js';
 import { createWorkflowRepository } from './modules/workflow/workflow.repository.js';
@@ -28,6 +33,10 @@ import { createWorkflowService } from './modules/workflow/workflow.service.js';
 import { createAuthorizationService } from './modules/authorization/authorization.service.js';
 
 const environment = loadEnvironment();
+
+// Validate fail-closed cryptographic configuration on API startup
+initializeIdempotencySecret();
+initializeKeyRing();
 let sessionService: SessionService | undefined;
 let sessionRepository: SessionRepository | undefined;
 let authRepository: AuthRepository | undefined;
@@ -44,7 +53,20 @@ let assessmentService: ReturnType<typeof createAssessmentService> | undefined;
 let workflowRepository: ReturnType<typeof createWorkflowRepository> | undefined;
 let workflowService: ReturnType<typeof createWorkflowService> | undefined;
 let authorizationService: ReturnType<typeof createAuthorizationService> | undefined;
-const emailDeliveryService = new DefaultEmailDeliveryService();
+const emailDeliveryService = environment.smtpHost
+  ? new TransactionalEmailService({
+      provider: new SmtpEmailProvider({
+        host: environment.smtpHost,
+        port: environment.smtpPort ?? 587,
+        user: environment.smtpUser,
+        pass: environment.smtpPass,
+        fromAddress: environment.emailFrom ?? 'no-reply@talentlens.ai',
+      }),
+      fromAddress: environment.emailFrom ?? 'no-reply@talentlens.ai',
+    })
+  : new TransactionalEmailService({
+      provider: new NullEmailProvider(),
+    });
 const extractionProvider = createOpenAiCompatibleProvider({
   apiKey: environment.aiApiKey,
   baseUrl: environment.aiBaseUrl,

@@ -8,7 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:tests": "tsc -p tsconfig.test.json",
-    "test": "vitest run --config vitest.config.ts"
+    "test": "vitest run --config vitest.config.ts",
+    "bootstrap": "tsx src/scripts/bootstrap.ts"
   },
   "dependencies": {
     "@talentlens/assessment-engine": "0.1.0",

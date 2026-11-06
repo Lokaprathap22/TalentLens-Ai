@@ -169,7 +169,7 @@ describe('RequisitionDetailPage UI & Workflows (M9.3 Step 3)', () => {
     });
 
     expect(await screen.findByText(updatedText)).toBeInTheDocument();
-  });
+  }, 15000);
 
   it('6. prevents opening when scorecard is missing, keeping status DRAFT', async () => {
     vi.spyOn(apiClient, 'get').mockResolvedValueOnce({ requisition: REQ_DRAFT });

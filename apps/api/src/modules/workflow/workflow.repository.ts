@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   getDatabaseClient,
   type ClientDecisionType,
@@ -10,6 +11,12 @@ import {
   type UserRole,
 } from '@talentlens/database';
 import { redactCandidateIdentifiers } from '../assessments/assessment.redactor.js';
+import { createEmailIdempotencyKey, encryptEmailPayload } from '../email/email.crypto.js';
+import {
+  renderClientFeedback,
+  renderClientSubmission,
+  renderInterviewNotification,
+} from '../email/email.templates.js';
 import { evaluateFeedbackFairness } from './feedback.fairness.js';
 import { isValidIanaTimezone } from './workflow.schemas.js';
 import {
@@ -331,6 +338,16 @@ export interface WorkflowRepository {
       timezone: string | null;
       createdAt: Date;
     }>;
+    interviews?: Array<{
+      id: string;
+      startAt: string;
+      endAt: string;
+      timezone: string;
+      format: string;
+      status: string;
+      reason: string | null;
+      createdAt: string;
+    }>;
   } | null>;
 
   listSubmissionsForClient(
@@ -386,6 +403,16 @@ export interface WorkflowRepository {
       proposedAt: Date | null;
       timezone: string | null;
       createdAt: Date;
+    }>;
+    interviews?: Array<{
+      id: string;
+      startAt: string;
+      endAt: string;
+      timezone: string;
+      format: string;
+      status: string;
+      reason: string | null;
+      createdAt: string;
     }>;
   } | null>;
 
@@ -1195,6 +1222,70 @@ export function createWorkflowRepository(
           },
         });
 
+        // Enqueue transactional email notifications to active client hiring managers
+        const clientManagers = await tx.clientMembership.findMany({
+          where: { clientId, organizationId, status: 'ACTIVE' },
+          include: { user: { select: { email: true } } },
+        });
+
+        if (clientManagers.length > 0) {
+          const [cand, req] = await Promise.all([
+            tx.candidate.findUnique({
+              where: { id: candidateId },
+              select: { candidateCode: true },
+            }),
+            tx.requisition.findUnique({
+              where: { id: requisitionId },
+              select: { title: true, client: { select: { name: true } } },
+            }),
+          ]);
+
+          const appOrigin = process.env['APP_ORIGIN'] ?? 'http://localhost:5173';
+          const rendered = renderClientSubmission({
+            clientName: req?.client?.name ?? 'Client',
+            requisitionTitle: req?.title ?? 'Requisition',
+            candidateRef: cand?.candidateCode ?? 'Candidate',
+            portalUrl: `${appOrigin}/portal/submissions/${submission.id}`,
+          });
+
+          for (const manager of clientManagers) {
+            const outboxId = randomUUID();
+            const idempotencyKey = createEmailIdempotencyKey(
+              'client_submission',
+              manager.user.email,
+              submission.id,
+            );
+            const { encryptedPayload, keyId } = encryptEmailPayload(
+              {
+                recipientEmail: manager.user.email.trim().toLowerCase(),
+                subject: rendered.subject,
+                html: rendered.html,
+                text: rendered.text,
+              },
+              { recordId: outboxId, idempotencyKey },
+            );
+
+            await tx.emailOutbox.create({
+              data: {
+                id: outboxId,
+                organizationId,
+                idempotencyKey,
+                messageType: 'client_submission',
+                recipientEmail: null,
+                recipientRole: 'CLIENT_HIRING_MANAGER',
+                subject: null,
+                html: null,
+                text: null,
+                encryptedPayload,
+                keyId,
+                status: 'PENDING',
+                attempts: 0,
+                maxAttempts: 3,
+              },
+            });
+          }
+        }
+
         return submission;
       });
     },
@@ -1260,6 +1351,9 @@ export function createWorkflowRepository(
           decisions: {
             orderBy: { createdAt: 'desc' },
           },
+          interviewProposals: {
+            orderBy: { createdAt: 'desc' },
+          },
         },
       });
       if (!record) return null;
@@ -1281,6 +1375,16 @@ export function createWorkflowRepository(
         submittedAt: record.submittedAt,
         updatedAt: record.updatedAt,
         feedbackHistory: record.decisions,
+        interviews: record.interviewProposals.map((ip) => ({
+          id: ip.id,
+          startAt: ip.startAt.toISOString(),
+          endAt: ip.endAt.toISOString(),
+          timezone: ip.timezone,
+          format: ip.format,
+          status: ip.status,
+          reason: ip.reason,
+          createdAt: ip.createdAt.toISOString(),
+        })),
       };
     },
 
@@ -1543,7 +1647,21 @@ export function createWorkflowRepository(
             clientId,
             organizationId,
           },
-          select: { id: true, requisitionId: true, candidateId: true, status: true },
+          select: {
+            id: true,
+            requisitionId: true,
+            candidateId: true,
+            status: true,
+            requisition: {
+              select: {
+                title: true,
+                assignedRecruiter: { select: { email: true } },
+              },
+            },
+            candidate: {
+              select: { candidateCode: true },
+            },
+          },
         });
 
         if (!submission) {
@@ -1640,6 +1758,69 @@ export function createWorkflowRepository(
           },
         });
 
+        // Enqueue transactional email notification to assigned recruiter
+        const [req, cand] = await Promise.all([
+          tx.requisition.findUnique({
+            where: { id: submission.requisitionId },
+            include: {
+              assignedRecruiter: { select: { email: true } },
+              createdBy: { select: { email: true } },
+            },
+          }),
+          tx.candidate.findUnique({
+            where: { id: submission.candidateId },
+            select: { candidateCode: true },
+          }),
+        ]);
+
+        const recruiterEmail = req?.assignedRecruiter?.email ?? req?.createdBy?.email;
+        if (recruiterEmail) {
+          const appOrigin = process.env['APP_ORIGIN'] ?? 'http://localhost:5173';
+          const rendered = renderClientFeedback({
+            recruiterName: 'Recruiter',
+            requisitionTitle: req?.title ?? 'Requisition',
+            candidateCode: cand?.candidateCode ?? 'Candidate',
+            decision,
+            reason: reason ?? undefined,
+            dashboardUrl: `${appOrigin}/requisitions/${submission.requisitionId}/candidates/${submission.candidateId}`,
+          });
+
+          const outboxId = randomUUID();
+          const idempotencyKey = createEmailIdempotencyKey(
+            'client_feedback',
+            recruiterEmail,
+            `${submission.id}:${decisionRecord.id}`,
+          );
+          const { encryptedPayload, keyId } = encryptEmailPayload(
+            {
+              recipientEmail: recruiterEmail.trim().toLowerCase(),
+              subject: rendered.subject,
+              html: rendered.html,
+              text: rendered.text,
+            },
+            { recordId: outboxId, idempotencyKey },
+          );
+
+          await tx.emailOutbox.create({
+            data: {
+              id: outboxId,
+              organizationId,
+              idempotencyKey,
+              messageType: 'client_feedback',
+              recipientEmail: null,
+              recipientRole: 'RECRUITER',
+              subject: null,
+              html: null,
+              text: null,
+              encryptedPayload,
+              keyId,
+              status: 'PENDING',
+              attempts: 0,
+              maxAttempts: 3,
+            },
+          });
+        }
+
         return decisionRecord;
       });
     },
@@ -1715,7 +1896,21 @@ export function createWorkflowRepository(
             clientId,
             organizationId,
           },
-          select: { id: true, requisitionId: true, candidateId: true, status: true },
+          select: {
+            id: true,
+            requisitionId: true,
+            candidateId: true,
+            status: true,
+            requisition: {
+              select: {
+                title: true,
+                assignedRecruiter: { select: { email: true } },
+              },
+            },
+            candidate: {
+              select: { candidateCode: true },
+            },
+          },
         });
 
         if (!submission) {
@@ -1832,6 +2027,53 @@ export function createWorkflowRepository(
           },
         });
 
+        const recruiterEmail = submission.requisition.assignedRecruiter?.email;
+        if (recruiterEmail) {
+          const outboxId = randomUUID();
+          const idempotencyKey = createEmailIdempotencyKey(
+            'interview_notification',
+            recruiterEmail,
+            `${proposal.id}:PROPOSED`,
+          );
+          const rendered = renderInterviewNotification({
+            recipientRole: 'RECRUITER',
+            candidateCode: submission.candidate.candidateCode,
+            requisitionTitle: submission.requisition.title,
+            format: proposal.format,
+            scheduledAt: proposal.startAt.toISOString(),
+            timezone: proposal.timezone,
+          });
+
+          const { encryptedPayload, keyId } = encryptEmailPayload(
+            {
+              recipientEmail: recruiterEmail.trim().toLowerCase(),
+              subject: rendered.subject,
+              html: rendered.html,
+              text: rendered.text,
+            },
+            { recordId: outboxId, idempotencyKey },
+          );
+
+          await tx.emailOutbox.create({
+            data: {
+              id: outboxId,
+              organizationId,
+              idempotencyKey,
+              messageType: 'interview_notification',
+              recipientEmail: null,
+              recipientRole: 'RECRUITER',
+              subject: null,
+              html: null,
+              text: null,
+              encryptedPayload,
+              keyId,
+              status: 'PENDING',
+              attempts: 0,
+              maxAttempts: 3,
+            },
+          });
+        }
+
         return {
           id: proposal.id,
           decision: decisionRecord.decision,
@@ -1858,7 +2100,7 @@ export function createWorkflowRepository(
       return database.$transaction(async (tx) => {
         const requisition = await tx.requisition.findFirst({
           where: { id: requisitionId, organizationId, assignedRecruiterId: recruiterId },
-          select: { id: true, clientId: true },
+          select: { id: true, clientId: true, title: true },
         });
         if (!requisition) {
           throw new WorkflowRequisitionAccessDeniedError();
@@ -1866,7 +2108,12 @@ export function createWorkflowRepository(
 
         const submission = await tx.candidateSubmission.findFirst({
           where: { id: submissionId, requisitionId, organizationId },
-          select: { id: true, candidateId: true, status: true },
+          select: {
+            id: true,
+            candidateId: true,
+            status: true,
+            candidate: { select: { candidateCode: true } },
+          },
         });
         if (!submission) {
           throw new WorkflowSubmissionNotFoundError();
@@ -2000,6 +2247,57 @@ export function createWorkflowRepository(
               },
             },
           });
+
+          const clientManagers = await tx.clientMembership.findMany({
+            where: { clientId: requisition.clientId, organizationId, status: 'ACTIVE' },
+            include: { user: { select: { email: true } } },
+          });
+
+          for (const manager of clientManagers) {
+            const outboxId = randomUUID();
+            const idempotencyKey = createEmailIdempotencyKey(
+              'interview_notification',
+              manager.user.email,
+              `${proposal.id}:ACCEPTED`,
+            );
+            const rendered = renderInterviewNotification({
+              recipientRole: 'CLIENT_HIRING_MANAGER',
+              candidateCode: submission.candidate?.candidateCode ?? 'Candidate',
+              requisitionTitle: requisition.title,
+              format: proposal.format,
+              scheduledAt: proposal.startAt.toISOString(),
+              timezone: proposal.timezone,
+            });
+
+            const { encryptedPayload, keyId } = encryptEmailPayload(
+              {
+                recipientEmail: manager.user.email.trim().toLowerCase(),
+                subject: rendered.subject,
+                html: rendered.html,
+                text: rendered.text,
+              },
+              { recordId: outboxId, idempotencyKey },
+            );
+
+            await tx.emailOutbox.create({
+              data: {
+                id: outboxId,
+                organizationId,
+                idempotencyKey,
+                messageType: 'interview_notification',
+                recipientEmail: null,
+                recipientRole: 'CLIENT_HIRING_MANAGER',
+                subject: null,
+                html: null,
+                text: null,
+                encryptedPayload,
+                keyId,
+                status: 'PENDING',
+                attempts: 0,
+                maxAttempts: 3,
+              },
+            });
+          }
         } else if (action === 'REJECT') {
           if (!proposal) {
             throw new WorkflowInterviewNotFoundError();
@@ -2153,6 +2451,57 @@ export function createWorkflowRepository(
             },
           });
 
+          const clientManagers = await tx.clientMembership.findMany({
+            where: { clientId: requisition.clientId, organizationId, status: 'ACTIVE' },
+            include: { user: { select: { email: true } } },
+          });
+
+          for (const manager of clientManagers) {
+            const outboxId = randomUUID();
+            const idempotencyKey = createEmailIdempotencyKey(
+              'interview_notification',
+              manager.user.email,
+              `${altProposal.id}:PROPOSED`,
+            );
+            const rendered = renderInterviewNotification({
+              recipientRole: 'CLIENT_HIRING_MANAGER',
+              candidateCode: submission.candidate?.candidateCode ?? 'Candidate',
+              requisitionTitle: requisition.title,
+              format: altProposal.format,
+              scheduledAt: altProposal.startAt.toISOString(),
+              timezone: altProposal.timezone,
+            });
+
+            const { encryptedPayload, keyId } = encryptEmailPayload(
+              {
+                recipientEmail: manager.user.email.trim().toLowerCase(),
+                subject: rendered.subject,
+                html: rendered.html,
+                text: rendered.text,
+              },
+              { recordId: outboxId, idempotencyKey },
+            );
+
+            await tx.emailOutbox.create({
+              data: {
+                id: outboxId,
+                organizationId,
+                idempotencyKey,
+                messageType: 'interview_notification',
+                recipientEmail: null,
+                recipientRole: 'CLIENT_HIRING_MANAGER',
+                subject: null,
+                html: null,
+                text: null,
+                encryptedPayload,
+                keyId,
+                status: 'PENDING',
+                attempts: 0,
+                maxAttempts: 3,
+              },
+            });
+          }
+
           return { success: true, action, proposalId: altProposal.id };
         } else if (action === 'COMPLETE') {
           if (!proposal) {
@@ -2269,7 +2618,21 @@ export function createWorkflowRepository(
             clientId,
             organizationId,
           },
-          select: { id: true, requisitionId: true, candidateId: true, status: true },
+          select: {
+            id: true,
+            requisitionId: true,
+            candidateId: true,
+            status: true,
+            requisition: {
+              select: {
+                title: true,
+                assignedRecruiter: { select: { email: true } },
+              },
+            },
+            candidate: {
+              select: { candidateCode: true },
+            },
+          },
         });
 
         if (!submission) {
@@ -2392,6 +2755,53 @@ export function createWorkflowRepository(
             },
           });
 
+          const recruiterEmail = submission.requisition.assignedRecruiter?.email;
+          if (recruiterEmail) {
+            const outboxId = randomUUID();
+            const idempotencyKey = createEmailIdempotencyKey(
+              'interview_notification',
+              recruiterEmail,
+              `${proposal.id}:ACCEPTED`,
+            );
+            const rendered = renderInterviewNotification({
+              recipientRole: 'RECRUITER',
+              candidateCode: submission.candidate.candidateCode,
+              requisitionTitle: submission.requisition.title,
+              format: proposal.format,
+              scheduledAt: proposal.startAt.toISOString(),
+              timezone: proposal.timezone,
+            });
+
+            const { encryptedPayload, keyId } = encryptEmailPayload(
+              {
+                recipientEmail: recruiterEmail.trim().toLowerCase(),
+                subject: rendered.subject,
+                html: rendered.html,
+                text: rendered.text,
+              },
+              { recordId: outboxId, idempotencyKey },
+            );
+
+            await tx.emailOutbox.create({
+              data: {
+                id: outboxId,
+                organizationId,
+                idempotencyKey,
+                messageType: 'interview_notification',
+                recipientEmail: null,
+                recipientRole: 'RECRUITER',
+                subject: null,
+                html: null,
+                text: null,
+                encryptedPayload,
+                keyId,
+                status: 'PENDING',
+                attempts: 0,
+                maxAttempts: 3,
+              },
+            });
+          }
+
           return {
             success: true,
             action: 'ACCEPT',
@@ -2434,6 +2844,53 @@ export function createWorkflowRepository(
               },
             },
           });
+
+          const recruiterEmail = submission.requisition.assignedRecruiter?.email;
+          if (recruiterEmail) {
+            const outboxId = randomUUID();
+            const idempotencyKey = createEmailIdempotencyKey(
+              'interview_notification',
+              recruiterEmail,
+              `${proposal.id}:REJECTED`,
+            );
+            const rendered = renderInterviewNotification({
+              recipientRole: 'RECRUITER',
+              candidateCode: submission.candidate.candidateCode,
+              requisitionTitle: submission.requisition.title,
+              format: proposal.format,
+              scheduledAt: proposal.startAt.toISOString(),
+              timezone: proposal.timezone,
+            });
+
+            const { encryptedPayload, keyId } = encryptEmailPayload(
+              {
+                recipientEmail: recruiterEmail.trim().toLowerCase(),
+                subject: rendered.subject,
+                html: rendered.html,
+                text: rendered.text,
+              },
+              { recordId: outboxId, idempotencyKey },
+            );
+
+            await tx.emailOutbox.create({
+              data: {
+                id: outboxId,
+                organizationId,
+                idempotencyKey,
+                messageType: 'interview_notification',
+                recipientEmail: null,
+                recipientRole: 'RECRUITER',
+                subject: null,
+                html: null,
+                text: null,
+                encryptedPayload,
+                keyId,
+                status: 'PENDING',
+                attempts: 0,
+                maxAttempts: 3,
+              },
+            });
+          }
 
           return {
             success: true,

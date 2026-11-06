@@ -150,6 +150,16 @@ export interface CandidateSubmissionDto {
   status: SubmissionStatus;
   submittedAt: string;
   updatedAt: string;
+  interviews?: Array<{
+    id: string;
+    startAt: string;
+    endAt: string;
+    timezone: string;
+    format: string;
+    status: string;
+    reason: string | null;
+    createdAt: string;
+  }>;
 }
 
 /**

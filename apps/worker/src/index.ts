@@ -1,10 +1,17 @@
 import 'dotenv/config';
 import { disconnectDatabase } from '@talentlens/database';
 import { WorkerJobProcessor } from './processor.js';
+import { WorkerEmailDispatcher } from './email-dispatcher.js';
+import { initializeIdempotencySecret, initializeKeyRing } from './email-crypto.js';
+
+// Verify fail-closed security configuration before worker loops
+initializeIdempotencySecret();
+initializeKeyRing();
 
 console.log('TalentLens document processing worker started.');
 
 const processor = new WorkerJobProcessor();
+const emailDispatcher = new WorkerEmailDispatcher();
 let running = true;
 let pollTimer: NodeJS.Timeout | null = null;
 
@@ -14,6 +21,11 @@ async function runLoop() {
       let processed = true;
       while (processed && running) {
         processed = await processor.processNextJob();
+      }
+
+      let emailProcessed = true;
+      while (emailProcessed && running) {
+        emailProcessed = await emailDispatcher.processNextEmail();
       }
     } catch (err) {
       console.error('Worker loop encountered an error:', (err as Error).message);

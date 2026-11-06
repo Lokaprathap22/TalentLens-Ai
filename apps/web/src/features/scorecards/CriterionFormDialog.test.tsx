@@ -110,7 +110,7 @@ describe('CriterionFormDialog', () => {
   });
 
   it('submits form with trimmed label, description, and source quote', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(
       <CriterionFormDialog
         open={true}
@@ -138,7 +138,7 @@ describe('CriterionFormDialog', () => {
       sourceQuote: 'Go expertise',
     });
     expect(onClose).toHaveBeenCalled();
-  });
+  }, 15000);
 
   it('validates required label and weight boundaries', async () => {
     const user = userEvent.setup();

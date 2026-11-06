@@ -7,7 +7,7 @@ import { parseApprovedPolicies } from '../modules/consent/consent.policy.js';
 
 const environmentSchema = z
   .object({
-    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    NODE_ENV: z.enum(['development', 'test', 'staging', 'production']).default('development'),
     API_PORT: z.preprocess(
       (value) => value ?? '4000',
       z
@@ -66,14 +66,92 @@ const environmentSchema = z
     RESUME_STORAGE_ROOT: z.string().min(1).default('./storage/resumes'),
     CONSENT_APPROVED_POLICIES: z.string().optional(),
     CONSENT_APPROVED_POLICY_VERSIONS: z.string().optional(),
+    SMTP_HOST: z.string().optional(),
+    SMTP_PORT: z.preprocess(
+      (value) => (value ? Number(value) : undefined),
+      z.number().int().min(1).max(65535).optional(),
+    ),
+    SMTP_USER: z.string().optional(),
+    SMTP_PASS: z.string().optional(),
+    EMAIL_FROM: z.string().email().optional(),
+    EMAIL_OUTBOX_ENCRYPTION_KEY: z.string().optional(),
+    EMAIL_OUTBOX_IDEMPOTENCY_SECRET: z.string().optional(),
+    STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
+    S3_BUCKET: z.string().optional(),
+    S3_REGION: z.string().default('us-east-1'),
+    S3_ENDPOINT: z.string().optional(),
+    S3_ACCESS_KEY_ID: z.string().optional(),
+    S3_SECRET_ACCESS_KEY: z.string().optional(),
+    ALLOW_LOCAL_STORAGE_IN_PRODUCTION: z.preprocess(
+      (v) => v === 'true' || v === true,
+      z.boolean().default(false),
+    ),
+    SCANNER_DRIVER: z.enum(['mock', 'clamav']).default('mock'),
+    CLAMAV_HOST: z.string().optional(),
+    CLAMAV_PORT: z.preprocess(
+      (v) => (v ? Number(v) : undefined),
+      z.number().int().min(1).max(65535).optional(),
+    ),
+    SCANNER_FAIL_CLOSED: z.preprocess((v) => {
+      if (v === undefined || v === null || v === '') return true;
+      if (typeof v === 'boolean') return v;
+      if (typeof v === 'string') return v.toLowerCase() !== 'false' && v !== '0';
+      return Boolean(v);
+    }, z.boolean().default(true)),
   })
   .superRefine((value, context) => {
-    if (value.NODE_ENV === 'production' && !value.APP_ORIGIN) {
-      context.addIssue({
-        code: 'custom',
-        path: ['APP_ORIGIN'],
-        message: 'APP_ORIGIN is required in production',
-      });
+    if (value.NODE_ENV === 'production' || value.NODE_ENV === 'staging') {
+      if (value.SCANNER_FAIL_CLOSED === false) {
+        context.addIssue({
+          code: 'custom',
+          path: ['SCANNER_FAIL_CLOSED'],
+          message: 'SCANNER_FAIL_CLOSED cannot be false in production and staging',
+        });
+      }
+      if (value.SCANNER_DRIVER === 'clamav' && !value.CLAMAV_HOST) {
+        context.addIssue({
+          code: 'custom',
+          path: ['CLAMAV_HOST'],
+          message: 'CLAMAV_HOST is required when SCANNER_DRIVER=clamav',
+        });
+      }
+      if (!value.APP_ORIGIN) {
+        context.addIssue({
+          code: 'custom',
+          path: ['APP_ORIGIN'],
+          message: 'APP_ORIGIN is required in production and staging',
+        });
+      }
+      if (value.STORAGE_DRIVER === 's3') {
+        if (!value.S3_BUCKET) {
+          context.addIssue({
+            code: 'custom',
+            path: ['S3_BUCKET'],
+            message: 'S3_BUCKET is required when STORAGE_DRIVER=s3',
+          });
+        }
+        if (!value.S3_ACCESS_KEY_ID) {
+          context.addIssue({
+            code: 'custom',
+            path: ['S3_ACCESS_KEY_ID'],
+            message: 'S3_ACCESS_KEY_ID is required when STORAGE_DRIVER=s3',
+          });
+        }
+        if (!value.S3_SECRET_ACCESS_KEY) {
+          context.addIssue({
+            code: 'custom',
+            path: ['S3_SECRET_ACCESS_KEY'],
+            message: 'S3_SECRET_ACCESS_KEY is required when STORAGE_DRIVER=s3',
+          });
+        }
+      } else if (!value.ALLOW_LOCAL_STORAGE_IN_PRODUCTION) {
+        context.addIssue({
+          code: 'custom',
+          path: ['STORAGE_DRIVER'],
+          message:
+            'STORAGE_DRIVER=s3 is required in production and staging unless ALLOW_LOCAL_STORAGE_IN_PRODUCTION=true',
+        });
+      }
     }
     if (value.ASSESSMENT_PROVIDER === 'fake' && value.NODE_ENV !== 'test') {
       context.addIssue({
@@ -101,6 +179,13 @@ const environmentSchema = z
       RESUME_STORAGE_ROOT,
       CONSENT_APPROVED_POLICIES,
       CONSENT_APPROVED_POLICY_VERSIONS,
+      SMTP_HOST,
+      SMTP_PORT,
+      SMTP_USER,
+      SMTP_PASS,
+      EMAIL_FROM,
+      EMAIL_OUTBOX_ENCRYPTION_KEY,
+      EMAIL_OUTBOX_IDEMPOTENCY_SECRET,
     }) => ({
       nodeEnv: NODE_ENV,
       apiPort: API_PORT,
@@ -118,6 +203,13 @@ const environmentSchema = z
       resumeStorageRoot: path.isAbsolute(RESUME_STORAGE_ROOT)
         ? path.normalize(RESUME_STORAGE_ROOT)
         : path.resolve(repositoryRoot(), RESUME_STORAGE_ROOT),
+      smtpHost: SMTP_HOST,
+      smtpPort: SMTP_PORT,
+      smtpUser: SMTP_USER,
+      smtpPass: SMTP_PASS,
+      emailFrom: EMAIL_FROM,
+      emailOutboxEncryptionKey: EMAIL_OUTBOX_ENCRYPTION_KEY,
+      emailOutboxIdempotencySecret: EMAIL_OUTBOX_IDEMPOTENCY_SECRET,
       approvedPolicies: parseApprovedPolicies(CONSENT_APPROVED_POLICIES),
       approvedPolicyVersions: CONSENT_APPROVED_POLICY_VERSIONS
         ? CONSENT_APPROVED_POLICY_VERSIONS.split(',')
@@ -138,7 +230,11 @@ export class EnvironmentValidationError extends Error {
 }
 
 export function parseEnvironment(input: EnvironmentInput): Environment {
-  const result = environmentSchema.safeParse(input);
+  const normalizedInput = {
+    ...input,
+    API_PORT: input.API_PORT ?? input.PORT,
+  };
+  const result = environmentSchema.safeParse(normalizedInput);
 
   if (!result.success) {
     const messages = result.error.issues.map((issue) => {

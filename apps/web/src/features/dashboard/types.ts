@@ -22,6 +22,8 @@ export interface RequisitionSummary {
 }
 
 export interface ReviewQueueItem {
+  candidateId?: string | undefined;
+  requisitionId?: string | undefined;
   /** Recruiters see the internal candidate code, never client-facing references. */
   candidateCode: string;
   requisitionTitle: string;

@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import type { EmailDeliveryService } from './consent.email.js';
+import { createEmailIdempotencyKey } from '../email/email.crypto.js';
+import { renderConsentInvitation, renderWithdrawalVerification } from '../email/email.templates.js';
 import { generateConsentNotice, isPolicyApproved, type ApprovedPolicy } from './consent.policy.js';
 import type { ConsentRepository } from './consent.repository.js';
 import type {
@@ -143,6 +145,24 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
 
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days expiration
 
+      // Browser URL fragment prevents token leakage in HTTP headers to server access logs
+      const invitationUrl = `${appOrigin}/consent#token=${rawToken}`;
+
+      const renderedEmail = renderConsentInvitation({
+        candidateName: context.candidate.candidateCode,
+        organizationName: context.requisition.organizationName,
+        requisitionTitle: context.requisition.title,
+        invitationUrl,
+        expiresAt,
+      });
+
+      const hashPart = createHash('sha256').update(invitationUrl).digest('hex').slice(0, 16);
+      const emailIdempotencyKey = createEmailIdempotencyKey(
+        'consent_invitation',
+        email,
+        `${candidateId}:${requisitionId}:${hashPart}`,
+      );
+
       const invitation = await repository.createInvitation({
         organizationId: principal.organizationId,
         candidateId,
@@ -153,10 +173,13 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         policyVersion: notice.policyVersion,
         noticeTextHash: notice.noticeTextHash,
         expiresAt,
+        emailPayload: {
+          subject: renderedEmail.subject,
+          html: renderedEmail.html,
+          text: renderedEmail.text,
+          idempotencyKey: emailIdempotencyKey,
+        },
       });
-
-      // Browser URL fragment prevents token leakage in HTTP headers to server access logs
-      const invitationUrl = `${appOrigin}/consent#token=${rawToken}`;
 
       const delivery = await emailDeliveryService.sendConsentInvitation({
         to: invitation.email,
@@ -179,6 +202,8 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         ...invitation,
         deliveryStatus,
         deliveryError: delivery.error ?? null,
+        invitationUrl,
+        rawToken,
       };
     },
 
@@ -273,6 +298,19 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         const rawToken = randomBytes(32).toString('hex');
         const tokenHash = hashToken(rawToken);
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24-hour expiration
+        const withdrawalUrl = `${appOrigin}/consent/withdraw#token=${rawToken}`;
+
+        const renderedWithdrawal = renderWithdrawalVerification({
+          organizationName: consentItem.organizationName,
+          withdrawalUrl,
+          expiresAt,
+        });
+
+        const emailIdempotencyKey = createEmailIdempotencyKey(
+          'withdrawal_verification',
+          normalizedEmail,
+          `${consentItem.consentId}:${tokenHash}`,
+        );
 
         await repository.createWithdrawalRequest({
           organizationId: consentItem.organizationId,
@@ -281,9 +319,14 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
           tokenHash,
           email: normalizedEmail,
           expiresAt,
+          emailPayload: {
+            subject: renderedWithdrawal.subject,
+            html: renderedWithdrawal.html,
+            text: renderedWithdrawal.text,
+            idempotencyKey: emailIdempotencyKey,
+          },
         });
 
-        const withdrawalUrl = `${appOrigin}/consent/withdraw#token=${rawToken}`;
         await emailDeliveryService.sendWithdrawalVerification({
           to: normalizedEmail,
           organizationName: consentItem.organizationName,

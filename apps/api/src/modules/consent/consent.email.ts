@@ -5,6 +5,9 @@ export interface ConsentInvitationEmailOptions {
   requisitionTitle: string;
   invitationUrl: string;
   expiresAt: Date;
+  tx?: unknown;
+  organizationId?: string;
+  skipImmediateDispatch?: boolean;
 }
 
 export interface WithdrawalVerificationEmailOptions {
@@ -12,6 +15,9 @@ export interface WithdrawalVerificationEmailOptions {
   organizationName: string;
   withdrawalUrl: string;
   expiresAt: Date;
+  tx?: unknown;
+  organizationId?: string;
+  skipImmediateDispatch?: boolean;
 }
 
 export interface DeliveryResult {

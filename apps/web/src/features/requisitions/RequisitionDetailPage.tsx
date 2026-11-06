@@ -7,6 +7,7 @@ import {
   Pencil,
   SlidersHorizontal,
   Sparkles,
+  Users,
 } from 'lucide-react';
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router';
@@ -198,6 +199,14 @@ export function RequisitionDetailPage(): React.JSX.Element {
             >
               <Icon icon={ClipboardCheck} size="sm" />
               Scorecards
+            </Button>
+
+            <Button
+              variant="secondary"
+              onClick={() => navigate(`/requisitions/${requisition.id}/candidates`)}
+            >
+              <Icon icon={Users} size="sm" />
+              Candidates
             </Button>
 
             {isEditable ? (

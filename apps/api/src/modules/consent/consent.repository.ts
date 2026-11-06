@@ -1,4 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { getDatabaseClient, Prisma, type PrismaClient } from '@talentlens/database';
+import { encryptEmailPayload } from '../email/email.crypto.js';
 import type {
   ConsentAcceptResult,
   ConsentDeclineResult,
@@ -40,6 +42,12 @@ export interface ConsentRepository {
     policyVersion: string;
     noticeTextHash: string;
     expiresAt: Date;
+    emailPayload?: {
+      subject: string;
+      html: string;
+      text: string;
+      idempotencyKey: string;
+    };
   }): Promise<ConsentInvitationDto>;
 
   updateInvitationDelivery(
@@ -77,6 +85,12 @@ export interface ConsentRepository {
     tokenHash: string;
     email: string;
     expiresAt: Date;
+    emailPayload?: {
+      subject: string;
+      html: string;
+      text: string;
+      idempotencyKey: string;
+    };
   }): Promise<{ id: string }>;
 
   confirmWithdrawal(tokenHash: string): Promise<ConsentWithdrawalConfirmResult | null>;
@@ -204,6 +218,38 @@ export function createConsentRepository(
             },
           },
         });
+
+        if (data.emailPayload) {
+          const outboxId = randomUUID();
+          const { encryptedPayload, keyId } = encryptEmailPayload(
+            {
+              recipientEmail: data.email.trim().toLowerCase(),
+              subject: data.emailPayload.subject,
+              html: data.emailPayload.html,
+              text: data.emailPayload.text,
+            },
+            { recordId: outboxId, idempotencyKey: data.emailPayload.idempotencyKey },
+          );
+
+          await tx.emailOutbox.create({
+            data: {
+              id: outboxId,
+              organizationId: data.organizationId,
+              idempotencyKey: data.emailPayload.idempotencyKey,
+              messageType: 'consent_invitation',
+              recipientEmail: null,
+              recipientRole: 'CANDIDATE',
+              subject: null,
+              html: null,
+              text: null,
+              encryptedPayload,
+              keyId,
+              status: 'PENDING',
+              attempts: 0,
+              maxAttempts: 3,
+            },
+          });
+        }
 
         return {
           id: created.id,
@@ -575,34 +621,68 @@ export function createConsentRepository(
     },
 
     async createWithdrawalRequest(data) {
-      const created = await database.consentWithdrawalRequest.create({
-        data: {
-          organizationId: data.organizationId,
-          candidateId: data.candidateId,
-          consentId: data.consentId,
-          tokenHash: data.tokenHash,
-          email: data.email,
-          status: 'PENDING',
-          expiresAt: data.expiresAt,
-        },
-      });
-
-      await database.auditLog.create({
-        data: {
-          organizationId: data.organizationId,
-          action: 'CONSENT_WITHDRAWAL_REQUESTED',
-          resourceType: 'ConsentWithdrawalRequest',
-          resourceId: created.id,
-          metadataJson: {
+      return database.$transaction(async (tx) => {
+        const created = await tx.consentWithdrawalRequest.create({
+          data: {
+            organizationId: data.organizationId,
             candidateId: data.candidateId,
             consentId: data.consentId,
+            tokenHash: data.tokenHash,
             email: data.email,
-            expiresAt: data.expiresAt.toISOString(),
+            status: 'PENDING',
+            expiresAt: data.expiresAt,
           },
-        },
-      });
+        });
 
-      return { id: created.id };
+        await tx.auditLog.create({
+          data: {
+            organizationId: data.organizationId,
+            action: 'CONSENT_WITHDRAWAL_REQUESTED',
+            resourceType: 'ConsentWithdrawalRequest',
+            resourceId: created.id,
+            metadataJson: {
+              candidateId: data.candidateId,
+              consentId: data.consentId,
+              email: data.email,
+              expiresAt: data.expiresAt.toISOString(),
+            },
+          },
+        });
+
+        if (data.emailPayload) {
+          const outboxId = randomUUID();
+          const { encryptedPayload, keyId } = encryptEmailPayload(
+            {
+              recipientEmail: data.email.trim().toLowerCase(),
+              subject: data.emailPayload.subject,
+              html: data.emailPayload.html,
+              text: data.emailPayload.text,
+            },
+            { recordId: outboxId, idempotencyKey: data.emailPayload.idempotencyKey },
+          );
+
+          await tx.emailOutbox.create({
+            data: {
+              id: outboxId,
+              organizationId: data.organizationId,
+              idempotencyKey: data.emailPayload.idempotencyKey,
+              messageType: 'withdrawal_verification',
+              recipientEmail: null,
+              recipientRole: 'CANDIDATE',
+              subject: null,
+              html: null,
+              text: null,
+              encryptedPayload,
+              keyId,
+              status: 'PENDING',
+              attempts: 0,
+              maxAttempts: 3,
+            },
+          });
+        }
+
+        return { id: created.id };
+      });
     },
 
     async confirmWithdrawal(tokenHash) {

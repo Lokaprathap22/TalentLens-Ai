@@ -29,6 +29,8 @@ export interface ConsentInvitationDto {
   deliveryError?: string | null;
   expiresAt: string;
   createdAt: string;
+  invitationUrl?: string;
+  rawToken?: string;
 }
 
 export interface ConsentNoticeData {

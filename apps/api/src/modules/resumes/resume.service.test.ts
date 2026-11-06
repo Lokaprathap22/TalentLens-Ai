@@ -12,6 +12,7 @@ import {
   ResumeNotFoundError,
   ResumeRoleError,
 } from './resume.service.js';
+import { MockResumeScanner, EICAR_SIGNATURE } from './resume.scanner.js';
 
 const recruiterPrincipal: AuthenticatedPrincipal = {
   userId: 'recruiter-uuid-1',
@@ -424,6 +425,125 @@ describe('Resume Ingestion Service — Security and Ingestion Controls', () => {
         recruiterPrincipal.userId,
         undefined,
       );
+    });
+  });
+
+  describe('Antivirus and Malware Scanning Boundary', () => {
+    it('rejects confirmed malicious resumes and never saves them to storage or database', async () => {
+      const mockScanner = new MockResumeScanner({
+        forceStatus: 'INFECTED',
+        simulatedThreatName: 'Trojan.Script.Resume-1',
+      });
+      const saveSpy = vi.fn();
+      const createBatchSpy = vi.fn();
+      const mockStorage: DocumentStorageService = {
+        save: saveSpy,
+        saveFromPath: saveSpy,
+        read: vi.fn(),
+        delete: vi.fn(),
+        exists: vi.fn(),
+      };
+      const mockRepo: Partial<ResumeRepository> = {
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'req-1',
+          title: 'Role',
+          organizationId: 'org-1',
+        })),
+        createResumeBatch: createBatchSpy,
+      };
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+        storageService: mockStorage,
+        scanner: mockScanner,
+      });
+
+      const req = createMockUploadStream([
+        { filename: 'malicious.pdf', content: Buffer.from('%PDF-1.4 malicious code') },
+      ]);
+
+      const result = await service.uploadResumes(recruiterPrincipal, 'req-1', req);
+
+      expect(result.totalFiles).toBe(1);
+      expect(result.acceptedCount).toBe(0);
+      expect(result.rejectedCount).toBe(1);
+      expect(result.rejected[0]?.status).toBe('REJECTED');
+      expect(result.rejected[0]?.reason).toContain('Trojan.Script.Resume-1');
+      expect(saveSpy).not.toHaveBeenCalled();
+      expect(createBatchSpy).not.toHaveBeenCalled();
+    });
+
+    it('quarantines upload when scanner fails in fail-closed mode', async () => {
+      const mockScanner = new MockResumeScanner({
+        forceStatus: 'ERROR',
+        errorMessage: 'ClamAV daemon unreachable',
+      });
+      const saveSpy = vi.fn();
+      const mockStorage: DocumentStorageService = {
+        save: saveSpy,
+        saveFromPath: saveSpy,
+        read: vi.fn(),
+        delete: vi.fn(),
+        exists: vi.fn(),
+      };
+      const mockRepo: Partial<ResumeRepository> = {
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'req-1',
+          title: 'Role',
+          organizationId: 'org-1',
+        })),
+      };
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+        storageService: mockStorage,
+        scanner: mockScanner,
+      });
+
+      const req = createMockUploadStream([
+        { filename: 'quarantine-doc.pdf', content: Buffer.from('%PDF-1.4 normal content') },
+      ]);
+
+      const result = await service.uploadResumes(recruiterPrincipal, 'req-1', req);
+
+      expect(result.acceptedCount).toBe(0);
+      expect(result.rejectedCount).toBe(1);
+      expect(result.rejected[0]?.reason).toContain('upload quarantined');
+      expect(saveSpy).not.toHaveBeenCalled();
+    });
+
+    it('automatically detects standard EICAR test signature with default mock scanner', async () => {
+      const saveSpy = vi.fn();
+      const mockStorage: DocumentStorageService = {
+        save: saveSpy,
+        saveFromPath: saveSpy,
+        read: vi.fn(),
+        delete: vi.fn(),
+        exists: vi.fn(),
+      };
+      const mockRepo: Partial<ResumeRepository> = {
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'req-1',
+          title: 'Role',
+          organizationId: 'org-1',
+        })),
+      };
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+        storageService: mockStorage,
+        scanner: new MockResumeScanner(),
+      });
+
+      const eicarPdf = Buffer.from(`%PDF-1.4\n${EICAR_SIGNATURE}\n%%EOF`);
+      const req = createMockUploadStream([{ filename: 'eicar-test.pdf', content: eicarPdf }]);
+
+      const result = await service.uploadResumes(recruiterPrincipal, 'req-1', req);
+
+      expect(result.acceptedCount).toBe(0);
+      expect(result.rejectedCount).toBe(1);
+      expect(result.rejected[0]?.reason).toContain('Win.Test.EICAR_HDB-1');
+      expect(saveSpy).not.toHaveBeenCalled();
     });
   });
 });

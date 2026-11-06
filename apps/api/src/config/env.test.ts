@@ -58,12 +58,58 @@ describe('parseEnvironment', () => {
         API_PORT: '443',
         APP_ORIGIN: 'https://app.example.com',
         DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
       }),
     ).toMatchObject({
       nodeEnv: 'production',
       apiPort: 443,
       appOrigin: 'https://app.example.com',
     });
+  });
+
+  it('parses valid staging configuration and requires APP_ORIGIN', () => {
+    expect(
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        APP_ORIGIN: 'https://staging.example.com',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-staging-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_STAGING_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_staging_test_key_123',
+      }),
+    ).toMatchObject({
+      nodeEnv: 'staging',
+      apiPort: 4000,
+      appOrigin: 'https://staging.example.com',
+    });
+
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-staging-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_STAGING_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_staging_test_key_123',
+      }),
+    ).toThrow('APP_ORIGIN');
+
+    // Fails closed if STORAGE_DRIVER=local in staging without explicit override
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        APP_ORIGIN: 'https://staging.example.com',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 'local',
+      }),
+    ).toThrow('STORAGE_DRIVER=s3 is required');
   });
 
   it('resolves relative RESUME_STORAGE_ROOT against the repository root', () => {
@@ -160,5 +206,69 @@ describe('parseEnvironment', () => {
     expect(openAiEnv.assessmentProvider).toBe('openai');
     expect(openAiEnv.assessmentOpenAiModel).toBe('gpt-4o-mini');
     expect(openAiEnv.assessmentTimeoutMs).toBe(45_000);
+  });
+
+  it('enforces SCANNER_FAIL_CLOSED and ClamAV configuration in production and staging', () => {
+    // Rejects fail-open in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        SCANNER_FAIL_CLOSED: 'false',
+      }),
+    ).toThrow('SCANNER_FAIL_CLOSED cannot be false in production and staging');
+
+    // Rejects fail-open in staging
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        APP_ORIGIN: 'https://staging.example.com',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-staging-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_STAGING_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_staging_test_key_123',
+        SCANNER_FAIL_CLOSED: 'false',
+      }),
+    ).toThrow('SCANNER_FAIL_CLOSED cannot be false in production and staging');
+
+    // Requires CLAMAV_HOST when SCANNER_DRIVER=clamav in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        SCANNER_DRIVER: 'clamav',
+      }),
+    ).toThrow('CLAMAV_HOST is required when SCANNER_DRIVER=clamav');
+
+    // Accepts valid ClamAV configuration in production
+    const validProd = parseEnvironment({
+      NODE_ENV: 'production',
+      API_PORT: '443',
+      APP_ORIGIN: 'https://app.example.com',
+      DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+      STORAGE_DRIVER: 's3',
+      S3_BUCKET: 'talentlens-prod-resumes',
+      S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+      S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+      SCANNER_DRIVER: 'clamav',
+      CLAMAV_HOST: 'clamav.internal',
+      CLAMAV_PORT: '3310',
+      SCANNER_FAIL_CLOSED: 'true',
+    });
+    expect(validProd.nodeEnv).toBe('production');
   });
 });
