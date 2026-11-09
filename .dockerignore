@@ -27,10 +27,28 @@ coverage
 storage/resumes/*
 !storage/resumes/.gitkeep
 
-# Database backups (never bundle into container images)
+# Database backups and temporary QA artifacts (never bundle into container images)
 backups/
 *.sql
 *.sql.gz
+*.sql.gz.sha256
+*.dump
+*.dump.sha256
+artifacts/
+**/artifacts/
+playwright-report/
+test-results/
+temp-*.pdf
+temp-*.docx
+
+# Non-runtime repository documentation and assistant metadata
+docs/
+audit-evidence/
+.github/
+README.md
+deployment.md
+AGENTS.md
+TALENTLENS_PROJECT_HANDOFF.md
 
 # IDE and agent scratch artifacts
 .vscode
@@ -41,6 +59,8 @@ backups/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 .DS_Store
 Thumbs.db
 

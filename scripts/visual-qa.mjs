@@ -1,10 +1,88 @@
+import fs from 'node:fs';
+import os from 'node:os';
 import { createServer } from 'vite';
 import { chromium } from '@playwright/test';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ARTIFACTS_DIR =
-  'C:/Users/revat/.gemini/antigravity/brain/3ce88443-30ab-4208-babc-0e04d670a067';
-const CHROME_PATH = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const rootDir = path.resolve(__dirname, '..');
+
+function resolveArtifactDir(baseDir) {
+  const override = process.env.TALENTLENS_ARTIFACT_DIR?.trim();
+  const targetDir = override
+    ? path.resolve(process.cwd(), override)
+    : path.join(baseDir, 'artifacts', 'visual-qa');
+  fs.mkdirSync(targetDir, { recursive: true });
+  return targetDir;
+}
+
+function resolveBrowserExecutablePath(chromiumLauncher) {
+  const override = process.env.CHROME_EXECUTABLE_PATH?.trim();
+  if (override) {
+    const resolvedOverride = path.resolve(process.cwd(), override);
+    if (!fs.existsSync(resolvedOverride)) {
+      throw new Error(
+        `Configured CHROME_EXECUTABLE_PATH does not exist: ${resolvedOverride}. Provide a valid Chrome/Chromium binary path or unset CHROME_EXECUTABLE_PATH.`,
+      );
+    }
+    return resolvedOverride;
+  }
+
+  const candidates = [];
+  if (process.platform === 'win32') {
+    const pf = process.env.PROGRAMFILES;
+    const pf86 = process.env['PROGRAMFILES(X86)'];
+    const localAppData = process.env.LOCALAPPDATA;
+    if (pf) {
+      candidates.push(path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(pf, 'Chromium', 'Application', 'chrome.exe'));
+      candidates.push(path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    }
+    if (pf86) {
+      candidates.push(path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    }
+    if (localAppData) {
+      candidates.push(path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(localAppData, 'Chromium', 'Application', 'chrome.exe'));
+    }
+  } else if (process.platform === 'darwin') {
+    candidates.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents/MacOS/Google Chrome'),
+    );
+  } else {
+    candidates.push(
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/snap/bin/chromium',
+    );
+  }
+
+  try {
+    const playwrightBinary = chromiumLauncher.executablePath?.();
+    if (playwrightBinary) {
+      candidates.push(playwrightBinary);
+    }
+  } catch {
+    // Playwright-managed browser may not be installed; continue probing OS paths.
+  }
+
+  const found = candidates.find((candidate) => candidate && fs.existsSync(candidate));
+  if (!found) {
+    throw new Error(
+      'No supported Chrome or Chromium executable was found for Playwright. Install Playwright Chromium (`npx playwright install chromium`) or set CHROME_EXECUTABLE_PATH to a valid browser binary.',
+    );
+  }
+  return found;
+}
+
+const ARTIFACTS_DIR = resolveArtifactDir(rootDir);
 
 // Realistic mock payloads
 const mockRecruiterUser = {
@@ -616,7 +694,7 @@ const mockInterviewsList = {
 async function main() {
   console.log('Starting Vite server for Visual QA...');
   const server = await createServer({
-    root: 'apps/web',
+    root: path.resolve(rootDir, 'apps', 'web'),
     server: { port: 5199, host: '127.0.0.1' },
     logLevel: 'error',
   });
@@ -624,224 +702,231 @@ async function main() {
   const origin = 'http://127.0.0.1:5199';
   console.log(`Vite server running at ${origin}`);
 
-  const browser = await chromium.launch({
-    executablePath: CHROME_PATH,
-    headless: true,
-  });
-
+  let browser = null;
   const screenshots = [];
 
-  async function capture(page, filename, width = 1440, height = 900) {
-    await page.setViewportSize({ width, height });
-    await page.waitForTimeout(600);
-    const filepath = path.join(ARTIFACTS_DIR, filename);
-    await page.screenshot({ path: filepath, fullPage: false });
-    console.log(`✓ Saved ${filename} (${width}x${height})`);
-    screenshots.push(filename);
+  try {
+    const executablePath = resolveBrowserExecutablePath(chromium);
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+    });
+
+    async function capture(page, filename, width = 1440, height = 900) {
+      await page.setViewportSize({ width, height });
+      await page.waitForTimeout(600);
+      const filepath = path.join(ARTIFACTS_DIR, filename);
+      await page.screenshot({ path: filepath, fullPage: false });
+      console.log(`✓ Saved ${filename} (${width}x${height})`);
+      screenshots.push(filename);
+    }
+
+    // 1. Recruiter Context
+    const recruiterContext = await browser.newContext();
+    const page = await recruiterContext.newPage();
+
+    // Route API requests for Recruiter
+    await page.route('**/api/v1/**', async (route) => {
+      const url = route.request().url();
+      if (url.includes('/auth/me')) {
+        return route.fulfill({ json: { user: mockRecruiterUser } });
+      }
+      if (url.includes('/auth/csrf')) {
+        return route.fulfill({ json: { csrfToken: 'mock-csrf-token' } });
+      }
+      if (url.includes('/dashboard/summary')) {
+        return route.fulfill({ json: mockRecruiterDashboard });
+      }
+      if (
+        url.includes('/requisitions') &&
+        !url.includes('/candidates') &&
+        !url.includes('/scorecards')
+      ) {
+        return route.fulfill({ json: { requisitions: mockRequisitionsList } });
+      }
+      if (url.includes('/candidates')) {
+        return route.fulfill({ json: mockGlobalCandidates });
+      }
+      if (url.includes('/clients/client-1/members')) {
+        return route.fulfill({ json: { members: mockClientMembers } });
+      }
+      if (url.includes('/clients/client-1')) {
+        return route.fulfill({ json: { client: mockClientsList[0] } });
+      }
+      if (url.includes('/clients')) {
+        return route.fulfill({ json: { clients: mockClientsList } });
+      }
+      if (url.includes('/interviews')) {
+        return route.fulfill({ json: mockInterviewsList });
+      }
+      return route.fulfill({ json: {} });
+    });
+
+    // SCREEN 1: Recruiter Dashboard
+    console.log('Capturing Recruiter Dashboard...');
+    await page.goto(`${origin}/dashboard`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-01-recruiter-dashboard-desktop.png', 1440, 900);
+    await capture(page, 'qa-batch6-01-recruiter-dashboard-mobile.png', 390, 844);
+
+    // SCREEN 2: Global Candidates Directory
+    console.log('Capturing Global Candidates...');
+    await page.goto(`${origin}/candidates`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-02-global-candidates-desktop.png', 1440, 900);
+    await capture(page, 'qa-batch6-02-global-candidates-mobile.png', 390, 844);
+
+    // SCREEN 3: Requisitions Directory
+    console.log('Capturing Requisitions...');
+    await page.goto(`${origin}/requisitions`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-03-requisitions-desktop.png', 1440, 900);
+
+    // SCREEN 4: Interviews Workspace (Recruiter)
+    console.log('Capturing Interviews Workspace...');
+    await page.goto(`${origin}/interviews`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-05-interviews-desktop.png', 1440, 900);
+    await capture(page, 'qa-batch6-05-interviews-mobile.png', 390, 844);
+
+    // SCREEN 5: Client Detail & Member Management
+    console.log('Capturing Client Detail...');
+    await page.goto(`${origin}/clients/client-1`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-06-client-detail-desktop.png', 1440, 900);
+
+    // SCREEN 6: Settings Page
+    console.log('Capturing Settings...');
+    await page.goto(`${origin}/settings`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-10-settings-desktop.png', 1440, 900);
+
+    // SCREEN 7: Login Page
+    console.log('Capturing Login Page...');
+    const anonContext = await browser.newContext();
+    const anonPage = await anonContext.newPage();
+    await anonPage.route('**/api/v1/**', async (route) => {
+      const url = route.request().url();
+      if (url.includes('/auth/me')) {
+        return route.fulfill({ status: 401, json: { error: 'unauthenticated' } });
+      }
+      if (url.includes('/auth/csrf')) {
+        return route.fulfill({ json: { csrfToken: 'mock-csrf-token' } });
+      }
+      return route.fulfill({ json: {} });
+    });
+    await anonPage.goto(`${origin}/login`, { waitUntil: 'networkidle' });
+    await capture(anonPage, 'qa-batch6-09-login-desktop.png', 1440, 900);
+    await capture(anonPage, 'qa-batch6-09-login-mobile.png', 390, 844);
+
+    // SCREEN 8: Client Hiring Manager Portal & Dashboard
+    console.log('Capturing Client Hiring Manager Experience...');
+    const clientContext = await browser.newContext();
+    const clientPage = await clientContext.newPage();
+    await clientPage.route('**/api/v1/**', async (route) => {
+      const url = route.request().url();
+      if (url.includes('/auth/me')) {
+        return route.fulfill({ json: { user: mockClientUser } });
+      }
+      if (url.includes('/auth/csrf')) {
+        return route.fulfill({ json: { csrfToken: 'mock-csrf-token' } });
+      }
+      if (url.includes('/dashboard/summary')) {
+        return route.fulfill({ json: mockClientDashboard });
+      }
+      if (url.includes('/submissions') || url.includes('/client-portal')) {
+        return route.fulfill({
+          json: {
+            submissions: [
+              {
+                submissionId: 'sub-1',
+                candidateRef: 'CAN-8F2A1C',
+                requisitionId: 'req-1',
+                requisitionTitle: 'Staff Distributed Systems Engineer',
+                status: 'SUBMITTED',
+                submittedAt: new Date(Date.now() - 7200000).toISOString(),
+                assessmentSummary: {
+                  score: 94,
+                  coverage: 91,
+                  status: 'COMPLETED',
+                  criteriaCount: 12,
+                },
+                latestDecision: null,
+              },
+              {
+                submissionId: 'sub-2',
+                candidateRef: 'CAN-4E9B3D',
+                requisitionId: 'req-2',
+                requisitionTitle: 'Principal Cloud Security Architect',
+                status: 'CLIENT_SHORTLISTED',
+                submittedAt: new Date(Date.now() - 28800000).toISOString(),
+                assessmentSummary: {
+                  score: 87,
+                  coverage: 83,
+                  status: 'COMPLETED',
+                  criteriaCount: 10,
+                },
+                latestDecision: {
+                  decision: 'SHORTLIST',
+                  createdAt: new Date(Date.now() - 86400000).toISOString(),
+                },
+              },
+              {
+                submissionId: 'sub-3',
+                candidateRef: 'CAN-1A8D4E',
+                requisitionId: 'req-1',
+                requisitionTitle: 'Staff Distributed Systems Engineer',
+                status: 'INTERVIEW_PROPOSED',
+                submittedAt: new Date(Date.now() - 86400000).toISOString(),
+                assessmentSummary: {
+                  score: 91,
+                  coverage: 88,
+                  status: 'COMPLETED',
+                  criteriaCount: 12,
+                },
+                latestDecision: null,
+              },
+            ],
+          },
+        });
+      }
+      if (url.includes('/clients')) {
+        return route.fulfill({ json: { clients: [mockClientsList[0]] } });
+      }
+      if (url.includes('/interviews')) {
+        return route.fulfill({ json: mockInterviewsList });
+      }
+      return route.fulfill({ json: {} });
+    });
+
+    await clientPage.goto(`${origin}/dashboard`, { waitUntil: 'networkidle' });
+    await capture(clientPage, 'qa-batch6-07-client-dashboard-desktop.png', 1440, 900);
+    await capture(clientPage, 'qa-batch6-07-client-dashboard-mobile.png', 390, 844);
+
+    await clientPage.goto(`${origin}/client-portal`, { waitUntil: 'networkidle' });
+    await capture(clientPage, 'qa-batch6-08-client-portal-desktop.png', 1440, 900);
+    await capture(clientPage, 'qa-batch6-08-client-portal-mobile.png', 390, 844);
+
+    // SCREEN 9: Candidate Deletion & Consent Experience
+    console.log('Capturing Candidate Deletion Journey...');
+    const consentContext = await browser.newContext();
+    const consentPage = await consentContext.newPage();
+    await consentPage.route('**/api/v1/**', async (route) => {
+      return route.fulfill({ json: {} });
+    });
+    await consentPage.goto(`${origin}/consent/deletion`, { waitUntil: 'networkidle' });
+    await capture(consentPage, 'qa-batch7-01-consent-deletion-desktop.png', 1440, 900);
+    await capture(consentPage, 'qa-batch7-01-consent-deletion-mobile.png', 390, 844);
+
+    // SCREEN 10: Design System Showcase
+    console.log('Capturing Design System Showcase...');
+    await page.goto(`${origin}/design-system`, { waitUntil: 'networkidle' });
+    await capture(page, 'qa-batch6-12-design-system-desktop.png', 1440, 900);
+
+    console.log(
+      `Visual QA completed! Generated ${screenshots.length} screenshots in ${ARTIFACTS_DIR}`,
+    );
+  } finally {
+    console.log('Closing browser and server...');
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    await server.close().catch(() => {});
   }
-
-  // 1. Recruiter Context
-  const recruiterContext = await browser.newContext();
-  const page = await recruiterContext.newPage();
-
-  // Route API requests for Recruiter
-  await page.route('**/api/v1/**', async (route) => {
-    const url = route.request().url();
-    if (url.includes('/auth/me')) {
-      return route.fulfill({ json: { user: mockRecruiterUser } });
-    }
-    if (url.includes('/auth/csrf')) {
-      return route.fulfill({ json: { csrfToken: 'mock-csrf-token' } });
-    }
-    if (url.includes('/dashboard/summary')) {
-      return route.fulfill({ json: mockRecruiterDashboard });
-    }
-    if (
-      url.includes('/requisitions') &&
-      !url.includes('/candidates') &&
-      !url.includes('/scorecards')
-    ) {
-      return route.fulfill({ json: { requisitions: mockRequisitionsList } });
-    }
-    if (url.includes('/candidates')) {
-      return route.fulfill({ json: mockGlobalCandidates });
-    }
-    if (url.includes('/clients/client-1/members')) {
-      return route.fulfill({ json: { members: mockClientMembers } });
-    }
-    if (url.includes('/clients/client-1')) {
-      return route.fulfill({ json: { client: mockClientsList[0] } });
-    }
-    if (url.includes('/clients')) {
-      return route.fulfill({ json: { clients: mockClientsList } });
-    }
-    if (url.includes('/interviews')) {
-      return route.fulfill({ json: mockInterviewsList });
-    }
-    return route.fulfill({ json: {} });
-  });
-
-  // SCREEN 1: Recruiter Dashboard
-  console.log('Capturing Recruiter Dashboard...');
-  await page.goto(`${origin}/dashboard`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-01-recruiter-dashboard-desktop.png', 1440, 900);
-  await capture(page, 'qa-batch6-01-recruiter-dashboard-mobile.png', 390, 844);
-
-  // SCREEN 2: Global Candidates Directory
-  console.log('Capturing Global Candidates...');
-  await page.goto(`${origin}/candidates`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-02-global-candidates-desktop.png', 1440, 900);
-  await capture(page, 'qa-batch6-02-global-candidates-mobile.png', 390, 844);
-
-  // SCREEN 3: Requisitions Directory
-  console.log('Capturing Requisitions...');
-  await page.goto(`${origin}/requisitions`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-03-requisitions-desktop.png', 1440, 900);
-
-  // SCREEN 4: Interviews Workspace (Recruiter)
-  console.log('Capturing Interviews Workspace...');
-  await page.goto(`${origin}/interviews`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-05-interviews-desktop.png', 1440, 900);
-  await capture(page, 'qa-batch6-05-interviews-mobile.png', 390, 844);
-
-  // SCREEN 5: Client Detail & Member Management
-  console.log('Capturing Client Detail...');
-  await page.goto(`${origin}/clients/client-1`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-06-client-detail-desktop.png', 1440, 900);
-
-  // SCREEN 6: Settings Page
-  console.log('Capturing Settings...');
-  await page.goto(`${origin}/settings`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-10-settings-desktop.png', 1440, 900);
-
-  // SCREEN 7: Login Page
-  console.log('Capturing Login Page...');
-  const anonContext = await browser.newContext();
-  const anonPage = await anonContext.newPage();
-  await anonPage.route('**/api/v1/**', async (route) => {
-    const url = route.request().url();
-    if (url.includes('/auth/me')) {
-      return route.fulfill({ status: 401, json: { error: 'unauthenticated' } });
-    }
-    if (url.includes('/auth/csrf')) {
-      return route.fulfill({ json: { csrfToken: 'mock-csrf-token' } });
-    }
-    return route.fulfill({ json: {} });
-  });
-  await anonPage.goto(`${origin}/login`, { waitUntil: 'networkidle' });
-  await capture(anonPage, 'qa-batch6-09-login-desktop.png', 1440, 900);
-  await capture(anonPage, 'qa-batch6-09-login-mobile.png', 390, 844);
-
-  // SCREEN 8: Client Hiring Manager Portal & Dashboard
-  console.log('Capturing Client Hiring Manager Experience...');
-  const clientContext = await browser.newContext();
-  const clientPage = await clientContext.newPage();
-  await clientPage.route('**/api/v1/**', async (route) => {
-    const url = route.request().url();
-    if (url.includes('/auth/me')) {
-      return route.fulfill({ json: { user: mockClientUser } });
-    }
-    if (url.includes('/auth/csrf')) {
-      return route.fulfill({ json: { csrfToken: 'mock-csrf-token' } });
-    }
-    if (url.includes('/dashboard/summary')) {
-      return route.fulfill({ json: mockClientDashboard });
-    }
-    if (url.includes('/submissions') || url.includes('/client-portal')) {
-      return route.fulfill({
-        json: {
-          submissions: [
-            {
-              submissionId: 'sub-1',
-              candidateRef: 'CAN-8F2A1C',
-              requisitionId: 'req-1',
-              requisitionTitle: 'Staff Distributed Systems Engineer',
-              status: 'SUBMITTED',
-              submittedAt: new Date(Date.now() - 7200000).toISOString(),
-              assessmentSummary: {
-                score: 94,
-                coverage: 91,
-                status: 'COMPLETED',
-                criteriaCount: 12,
-              },
-              latestDecision: null,
-            },
-            {
-              submissionId: 'sub-2',
-              candidateRef: 'CAN-4E9B3D',
-              requisitionId: 'req-2',
-              requisitionTitle: 'Principal Cloud Security Architect',
-              status: 'CLIENT_SHORTLISTED',
-              submittedAt: new Date(Date.now() - 28800000).toISOString(),
-              assessmentSummary: {
-                score: 87,
-                coverage: 83,
-                status: 'COMPLETED',
-                criteriaCount: 10,
-              },
-              latestDecision: {
-                decision: 'SHORTLIST',
-                createdAt: new Date(Date.now() - 86400000).toISOString(),
-              },
-            },
-            {
-              submissionId: 'sub-3',
-              candidateRef: 'CAN-1A8D4E',
-              requisitionId: 'req-1',
-              requisitionTitle: 'Staff Distributed Systems Engineer',
-              status: 'INTERVIEW_PROPOSED',
-              submittedAt: new Date(Date.now() - 86400000).toISOString(),
-              assessmentSummary: {
-                score: 91,
-                coverage: 88,
-                status: 'COMPLETED',
-                criteriaCount: 12,
-              },
-              latestDecision: null,
-            },
-          ],
-        },
-      });
-    }
-    if (url.includes('/clients')) {
-      return route.fulfill({ json: { clients: [mockClientsList[0]] } });
-    }
-    if (url.includes('/interviews')) {
-      return route.fulfill({ json: mockInterviewsList });
-    }
-    return route.fulfill({ json: {} });
-  });
-
-  await clientPage.goto(`${origin}/dashboard`, { waitUntil: 'networkidle' });
-  await capture(clientPage, 'qa-batch6-07-client-dashboard-desktop.png', 1440, 900);
-  await capture(clientPage, 'qa-batch6-07-client-dashboard-mobile.png', 390, 844);
-
-  await clientPage.goto(`${origin}/client-portal`, { waitUntil: 'networkidle' });
-  await capture(clientPage, 'qa-batch6-08-client-portal-desktop.png', 1440, 900);
-  await capture(clientPage, 'qa-batch6-08-client-portal-mobile.png', 390, 844);
-
-  // SCREEN 9: Candidate Deletion & Consent Experience
-  console.log('Capturing Candidate Deletion Journey...');
-  const consentContext = await browser.newContext();
-  const consentPage = await consentContext.newPage();
-  await consentPage.route('**/api/v1/**', async (route) => {
-    return route.fulfill({ json: {} });
-  });
-  await consentPage.goto(`${origin}/consent/deletion`, { waitUntil: 'networkidle' });
-  await capture(consentPage, 'qa-batch7-01-consent-deletion-desktop.png', 1440, 900);
-  await capture(consentPage, 'qa-batch7-01-consent-deletion-mobile.png', 390, 844);
-
-  // SCREEN 10: Design System Showcase
-  console.log('Capturing Design System Showcase...');
-  await page.goto(`${origin}/design-system`, { waitUntil: 'networkidle' });
-  await capture(page, 'qa-batch6-12-design-system-desktop.png', 1440, 900);
-
-  console.log('Closing browser and server...');
-  await browser.close();
-  await server.close();
-  console.log(
-    `Visual QA completed! Generated ${screenshots.length} screenshots in ${ARTIFACTS_DIR}`,
-  );
 }
 
 main().catch((err) => {

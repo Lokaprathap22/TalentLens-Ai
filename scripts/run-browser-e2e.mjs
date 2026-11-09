@@ -1,6 +1,7 @@
 /* global document, getComputedStyle, window */
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
@@ -50,8 +51,81 @@ const { hashPassword } = await import('../apps/api/dist/modules/auth/password.se
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
-const artifactsDir =
-  'C:\\Users\\revat\\.gemini\\antigravity\\brain\\3ce88443-30ab-4208-babc-0e04d670a067';
+
+function resolveArtifactDir(baseDir) {
+  const override = process.env.TALENTLENS_ARTIFACT_DIR?.trim();
+  const targetDir = override
+    ? path.resolve(process.cwd(), override)
+    : path.join(baseDir, 'artifacts', 'e2e');
+  fs.mkdirSync(targetDir, { recursive: true });
+  return targetDir;
+}
+
+function resolveBrowserExecutablePath(chromiumLauncher) {
+  const override = process.env.CHROME_EXECUTABLE_PATH?.trim();
+  if (override) {
+    const resolvedOverride = path.resolve(process.cwd(), override);
+    if (!fs.existsSync(resolvedOverride)) {
+      throw new Error(
+        `Configured CHROME_EXECUTABLE_PATH does not exist: ${resolvedOverride}. Provide a valid Chrome/Chromium binary path or unset CHROME_EXECUTABLE_PATH.`,
+      );
+    }
+    return resolvedOverride;
+  }
+
+  const candidates = [];
+  if (process.platform === 'win32') {
+    const pf = process.env.PROGRAMFILES;
+    const pf86 = process.env['PROGRAMFILES(X86)'];
+    const localAppData = process.env.LOCALAPPDATA;
+    if (pf) {
+      candidates.push(path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(pf, 'Chromium', 'Application', 'chrome.exe'));
+      candidates.push(path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    }
+    if (pf86) {
+      candidates.push(path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    }
+    if (localAppData) {
+      candidates.push(path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(localAppData, 'Chromium', 'Application', 'chrome.exe'));
+    }
+  } else if (process.platform === 'darwin') {
+    candidates.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents/MacOS/Google Chrome'),
+    );
+  } else {
+    candidates.push(
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/snap/bin/chromium',
+    );
+  }
+
+  try {
+    const playwrightBinary = chromiumLauncher.executablePath?.();
+    if (playwrightBinary) {
+      candidates.push(playwrightBinary);
+    }
+  } catch {
+    // Playwright-managed browser may not be installed; continue probing OS paths.
+  }
+
+  const found = candidates.find((candidate) => candidate && fs.existsSync(candidate));
+  if (!found) {
+    throw new Error(
+      'No supported Chrome or Chromium executable was found for Playwright. Install Playwright Chromium (`npx playwright install chromium`) or set CHROME_EXECUTABLE_PATH to a valid browser binary.',
+    );
+  }
+  return found;
+}
+
+const artifactsDir = resolveArtifactDir(rootDir);
 
 function log(step, msg) {
   const ts = new Date().toISOString().substring(11, 19);
@@ -542,10 +616,11 @@ async function run() {
 
   log(2, 'Database tenant seeds completed.');
 
-  // 3. Launch Playwright Chrome
-  log(3, 'Launching Playwright with Google Chrome (Headless)...');
+  // 3. Launch Playwright Chrome/Chromium
+  const executablePath = resolveBrowserExecutablePath(chromium);
+  log(3, `Launching Playwright browser (${executablePath})...`);
   const browser = await chromium.launch({
-    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    executablePath,
     headless: true,
   });
 
