@@ -64,14 +64,14 @@ export function DataTable<Row>({
       <table className="w-full border-collapse text-sm">
         <caption className="sr-only">{caption}</caption>
         <thead>
-          <tr className="border-y border-border bg-surface-muted/70">
+          <tr className="border-y border-border bg-surface-muted/60">
             {columns.map((column) => (
               <th
                 key={column.id}
                 scope="col"
                 className={cn(
                   cellBase(column),
-                  'h-9 text-xs font-medium tracking-wide whitespace-nowrap text-fg-subtle',
+                  'h-9 text-xs font-medium tracking-wide whitespace-nowrap text-fg-muted',
                 )}
               >
                 <span className={column.hideHeader ? 'sr-only' : undefined}>{column.header}</span>
@@ -84,16 +84,19 @@ export function DataTable<Row>({
             ? Array.from({ length: skeletonRows }, (_, index) => (
                 <tr key={index} aria-hidden="true">
                   {columns.map((column) => (
-                    <td key={column.id} className={cn(cellBase(column), 'h-14')}>
+                    <td key={column.id} className={cn(cellBase(column), 'h-13')}>
                       <Skeleton className="h-4 w-3/4 max-w-40" />
                     </td>
                   ))}
                 </tr>
               ))
             : rows.map((row) => (
-                <tr key={getRowKey(row)} className="transition-colors hover:bg-surface-muted/50">
+                <tr
+                  key={getRowKey(row)}
+                  className="transition-colors duration-100 hover:bg-surface-muted/60 focus-within:bg-accent-soft/20"
+                >
                   {columns.map((column) => (
-                    <td key={column.id} className={cn(cellBase(column), 'h-14 py-2')}>
+                    <td key={column.id} className={cn(cellBase(column), 'h-13 py-2')}>
                       {column.cell(row)}
                     </td>
                   ))}

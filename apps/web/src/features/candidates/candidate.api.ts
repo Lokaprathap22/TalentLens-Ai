@@ -27,8 +27,11 @@ import type {
   DocumentExtraction,
   GetDocumentExtractionResponse,
   GetResumeDetailsResponse,
+  GlobalCandidateSummary,
   ListCandidatesQuery,
   ListCandidatesResponse,
+  ListGlobalCandidatesQuery,
+  ListGlobalCandidatesResponse,
   ResumeBatchUploadResult,
   ResumeDocumentDto,
   ReviewDecision,
@@ -38,10 +41,14 @@ import type {
 // ---------------------------------------------------------------------------
 // Upload configuration constants (verified against resume.multipart.ts)
 // ---------------------------------------------------------------------------
-/** Maximum number of files per batch upload request. */
-export const UPLOAD_MAX_FILES = 10;
-/** Maximum size in bytes per individual file (10 MB). */
-export const UPLOAD_MAX_FILE_BYTES = 10 * 1024 * 1024;
+/** Maximum number of files per bulk batch upload (up to 500 CVs). */
+export const UPLOAD_MAX_FILES = 500;
+/** Chunk size for bounded multipart uploads to stay strictly under Nginx 50M limit (3 files x 15MB max = 45MB max). */
+export const UPLOAD_CHUNK_SIZE = 3;
+/** Maximum size in bytes per individual file (15 MB). */
+export const UPLOAD_MAX_FILE_BYTES = 15 * 1024 * 1024;
+/** Maximum size in bytes for total bulk batch (1 GB). */
+export const UPLOAD_MAX_BATCH_BYTES = 1024 * 1024 * 1024;
 /** Accepted MIME types for client-side extension pre-filtering. */
 export const UPLOAD_ACCEPTED_TYPES = ['.pdf', '.docx'] as const;
 /** Human-readable accepted type description. */
@@ -85,13 +92,94 @@ function isValidListCandidatesResponse(value: unknown): value is ListCandidatesR
   );
 }
 
-function isValidResumeBatchUploadResult(value: unknown): value is ResumeBatchUploadResult {
+function isValidGlobalCandidateSummary(value: unknown): value is GlobalCandidateSummary {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
   const r = value as Record<string, unknown>;
   return (
-    (r['batchId'] === null || typeof r['batchId'] === 'string') &&
+    typeof r['candidateId'] === 'string' &&
+    r['candidateId'].trim().length > 0 &&
+    typeof r['candidateCode'] === 'string' &&
+    r['candidateCode'].trim().length > 0 &&
+    typeof r['createdAt'] === 'string' &&
+    typeof r['lastActivityAt'] === 'string' &&
+    (r['requisitionId'] === null || typeof r['requisitionId'] === 'string') &&
+    (r['requisitionTitle'] === null || typeof r['requisitionTitle'] === 'string') &&
+    (r['clientName'] === null || typeof r['clientName'] === 'string') &&
+    (r['resumeDocumentId'] === null || typeof r['resumeDocumentId'] === 'string') &&
+    (r['resumeFileName'] === null || typeof r['resumeFileName'] === 'string') &&
+    (r['parseStatus'] === null || typeof r['parseStatus'] === 'string') &&
+    (r['currentRole'] === null || typeof r['currentRole'] === 'string') &&
+    (r['experienceYears'] === null || typeof r['experienceYears'] === 'number') &&
+    (r['location'] === null || typeof r['location'] === 'string') &&
+    Array.isArray(r['skills']) &&
+    (r['assessmentId'] === null || typeof r['assessmentId'] === 'string') &&
+    (r['assessmentStatus'] === null || typeof r['assessmentStatus'] === 'string') &&
+    (r['overallScore'] === null || typeof r['overallScore'] === 'number') &&
+    (r['coverage'] === null || typeof r['coverage'] === 'number') &&
+    typeof r['isComplete'] === 'boolean' &&
+    typeof r['criteriaCount'] === 'number' &&
+    typeof r['criteriaMetCount'] === 'number' &&
+    typeof r['reviewStatus'] === 'string' &&
+    (r['reviewedAt'] === null || typeof r['reviewedAt'] === 'string') &&
+    typeof r['isShortlisted'] === 'boolean' &&
+    (r['shortlistedAt'] === null || typeof r['shortlistedAt'] === 'string') &&
+    (r['submissionStatus'] === null || typeof r['submissionStatus'] === 'string') &&
+    (r['submittedAt'] === null || typeof r['submittedAt'] === 'string') &&
+    typeof r['statusCategory'] === 'string'
+  );
+}
+
+function isValidGlobalCandidatesResponse(value: unknown): value is ListGlobalCandidatesResponse {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const r = value as Record<string, unknown>;
+  return (
+    Array.isArray(r['items']) &&
+    r['items'].every(isValidGlobalCandidateSummary) &&
+    typeof r['total'] === 'number' &&
+    typeof r['page'] === 'number' &&
+    typeof r['pageSize'] === 'number' &&
+    typeof r['totalPages'] === 'number'
+  );
+}
+
+function isValidIdString(value: unknown): value is string {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  if (/[\s/?#\\]/.test(trimmed)) {
+    return false;
+  }
+  if (trimmed === 'null' || trimmed === 'undefined') {
+    return false;
+  }
+  return true;
+}
+
+function isValidResumeBatchUploadResult(value: unknown): value is ResumeBatchUploadResult {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const r = value as Record<string, unknown>;
+  const hasValidBatchId = r['batchId'] === null || isValidIdString(r['batchId']);
+  if (!hasValidBatchId) {
+    return false;
+  }
+  if (
+    typeof r['acceptedCount'] === 'number' &&
+    r['acceptedCount'] > 0 &&
+    !isValidIdString(r['batchId'])
+  ) {
+    return false;
+  }
+  return (
     typeof r['totalFiles'] === 'number' &&
     typeof r['acceptedCount'] === 'number' &&
     typeof r['duplicateCount'] === 'number' &&
@@ -99,6 +187,25 @@ function isValidResumeBatchUploadResult(value: unknown): value is ResumeBatchUpl
     Array.isArray(r['accepted']) &&
     Array.isArray(r['duplicates']) &&
     Array.isArray(r['rejected'])
+  );
+}
+
+export interface ResumeBatchStatusDto {
+  id: string;
+  status: string;
+  isOpen: boolean;
+}
+
+function isValidResumeBatchStatus(value: unknown): value is ResumeBatchStatusDto {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const r = value as Record<string, unknown>;
+  return (
+    isValidIdString(r['id']) &&
+    typeof r['status'] === 'string' &&
+    r['status'].trim().length > 0 &&
+    typeof r['isOpen'] === 'boolean'
   );
 }
 
@@ -241,8 +348,18 @@ export function resolveUploadErrorMessage(error: unknown): string {
   if (error.status === 404 || error.code === 'not_found') {
     return 'The requisition could not be found. It may have been removed.';
   }
+  if (error.status === 409 || error.code === 'batch_not_finalized') {
+    return error.message.trim().length > 0
+      ? error.message
+      : 'The batch could not be finalized due to a server state conflict. Please check status and try again.';
+  }
   if (error.status === 413 || error.code === 'file_too_large') {
     return `One or more files exceed the maximum size of ${UPLOAD_MAX_FILE_BYTES / (1024 * 1024)} MB.`;
+  }
+  if (error.status === 502 && error.code === 'invalid_response_format') {
+    return error.message.trim().length > 0
+      ? error.message
+      : 'Received an unexpected response from the server while finalizing the batch. Please try again.';
   }
   if (error.status === 0 || error.code === 'network_error') {
     return 'Unable to reach TalentLens AI. Check your connection and try again.';
@@ -324,6 +441,15 @@ export async function listCandidates(
   if (query.submissionStatus !== undefined) {
     params.set('submissionStatus', query.submissionStatus);
   }
+  if (query.search !== undefined && query.search.trim().length > 0) {
+    params.set('search', query.search.trim());
+  }
+  if (query.sortBy !== undefined) {
+    params.set('sortBy', query.sortBy);
+  }
+  if (query.sortOrder !== undefined) {
+    params.set('sortOrder', query.sortOrder);
+  }
 
   const queryString = params.toString();
   const path = queryString
@@ -333,6 +459,62 @@ export async function listCandidates(
   const response = await apiClient.get<unknown>(path, signal !== undefined ? { signal } : {});
 
   if (!isValidListCandidatesResponse(response)) {
+    throw new ApiError({
+      status: 502,
+      code: 'invalid_response_format',
+      message: 'Received an unexpected candidate directory response from the server.',
+    });
+  }
+
+  return response;
+}
+
+/**
+ * Lists candidates across all requisitions within the recruiter's organization.
+ *
+ * Route: GET /api/v1/candidates
+ * Auth: Recruiter session required (enforced by backend middleware).
+ * Server-side support: search, requisition filter, statusCategory, sorting, and pagination.
+ */
+export async function listGlobalCandidates(
+  query: ListGlobalCandidatesQuery = {},
+  signal?: AbortSignal,
+): Promise<ListGlobalCandidatesResponse> {
+  const params = new URLSearchParams();
+  if (query.page !== undefined) {
+    params.set('page', String(query.page));
+  }
+  if (query.pageSize !== undefined) {
+    params.set('pageSize', String(query.pageSize));
+  }
+  if (query.search !== undefined && query.search.trim().length > 0) {
+    params.set('search', query.search.trim());
+  }
+  if (query.requisitionId !== undefined && query.requisitionId.trim().length > 0) {
+    params.set('requisitionId', query.requisitionId.trim());
+  }
+  if (query.statusCategory !== undefined && query.statusCategory !== 'ALL') {
+    params.set('statusCategory', query.statusCategory);
+  }
+  if (query.assessmentStatus !== undefined && query.assessmentStatus !== 'ALL') {
+    params.set('assessmentStatus', query.assessmentStatus);
+  }
+  if (query.reviewStatus !== undefined && query.reviewStatus !== 'ALL') {
+    params.set('reviewStatus', query.reviewStatus);
+  }
+  if (query.sortBy !== undefined) {
+    params.set('sortBy', query.sortBy);
+  }
+  if (query.sortOrder !== undefined) {
+    params.set('sortOrder', query.sortOrder);
+  }
+
+  const queryString = params.toString();
+  const path = queryString ? `/candidates?${queryString}` : '/candidates';
+
+  const response = await apiClient.get<unknown>(path, signal !== undefined ? { signal } : {});
+
+  if (!isValidGlobalCandidatesResponse(response)) {
     throw new ApiError({
       status: 502,
       code: 'invalid_response_format',
@@ -360,19 +542,141 @@ export async function listCandidates(
  *
  * IMPORTANT: Never log file contents, candidate codes, or extracted text.
  */
+export interface UploadProgressInfo {
+  uploadedCount: number;
+  totalCount: number;
+  percent: number;
+}
+
+export type UploadProgressCallback = (progress: UploadProgressInfo) => void;
+
+export type UploadFileInput = File | { file: File; clientFileId: string };
+
+export interface UploadResumesOptions {
+  signal?: AbortSignal;
+  onProgress?: UploadProgressCallback;
+  batchId?: string;
+  isFinal?: boolean;
+}
+
+export class UploadChunkError extends ApiError {
+  public readonly batchId: string | null;
+  public readonly aggregateAccepted: ResumeBatchUploadResult['accepted'];
+  public readonly aggregateDuplicates: ResumeBatchUploadResult['duplicates'];
+  public readonly aggregateRejected: ResumeBatchUploadResult['rejected'];
+  public readonly failedChunkIndex: number;
+
+  constructor(params: {
+    message: string;
+    status?: number | undefined;
+    code?: string | undefined;
+    batchId: string | null;
+    aggregateAccepted: ResumeBatchUploadResult['accepted'];
+    aggregateDuplicates: ResumeBatchUploadResult['duplicates'];
+    aggregateRejected: ResumeBatchUploadResult['rejected'];
+    failedChunkIndex: number;
+  }) {
+    super({
+      status: params.status ?? 500,
+      code: params.code ?? 'upload_chunk_error',
+      message: params.message,
+    });
+    this.name = 'UploadChunkError';
+    this.batchId = params.batchId;
+    this.aggregateAccepted = params.aggregateAccepted;
+    this.aggregateDuplicates = params.aggregateDuplicates;
+    this.aggregateRejected = params.aggregateRejected;
+    this.failedChunkIndex = params.failedChunkIndex;
+  }
+}
+
+type FileWithClientId = File & { clientFileId?: string | undefined };
+
+function getFileInfo(item: UploadFileInput): {
+  file: File;
+  clientFileId?: string | undefined;
+} {
+  if (
+    'file' in item &&
+    typeof (item as { file?: unknown }).file === 'object' &&
+    (item as { file?: unknown }).file instanceof File
+  ) {
+    const wrapped = item as { file: File; clientFileId?: string | undefined };
+    return {
+      file: wrapped.file,
+      ...(wrapped.clientFileId !== undefined ? { clientFileId: wrapped.clientFileId } : {}),
+    };
+  }
+  const file = item as FileWithClientId;
+  return {
+    file,
+    ...(file.clientFileId !== undefined ? { clientFileId: file.clientFileId } : {}),
+  };
+}
+
 export async function uploadResumes(
   requisitionId: string,
-  files: File[],
-  signal?: AbortSignal,
+  files: UploadFileInput[],
+  signalOrOptions?: AbortSignal | UploadResumesOptions,
+  legacyOnProgress?: UploadProgressCallback,
+  legacyBatchId?: string,
 ): Promise<ResumeBatchUploadResult> {
-  const trimmedId = requisitionId.trim();
-  if (!trimmedId) {
+  let signal: AbortSignal | undefined;
+  let onProgress: UploadProgressCallback | undefined;
+  let overallBatchId: string | null = null;
+  let isFinalExplicit: boolean | undefined = undefined;
+
+  if (signalOrOptions instanceof AbortSignal) {
+    signal = signalOrOptions;
+    onProgress = legacyOnProgress;
+    if (legacyBatchId !== undefined) {
+      if (!isValidIdString(legacyBatchId)) {
+        throw new ApiError({
+          status: 400,
+          code: 'invalid_request',
+          message: 'A valid batch identifier is required.',
+        });
+      }
+      overallBatchId = legacyBatchId.trim();
+    }
+  } else if (signalOrOptions && typeof signalOrOptions === 'object') {
+    signal = signalOrOptions.signal;
+    onProgress = signalOrOptions.onProgress;
+    if (signalOrOptions.batchId !== undefined) {
+      if (!isValidIdString(signalOrOptions.batchId)) {
+        throw new ApiError({
+          status: 400,
+          code: 'invalid_request',
+          message: 'A valid batch identifier is required.',
+        });
+      }
+      overallBatchId = signalOrOptions.batchId.trim();
+    }
+    if (signalOrOptions.isFinal !== undefined) {
+      isFinalExplicit = signalOrOptions.isFinal;
+    }
+  } else {
+    onProgress = legacyOnProgress;
+    if (legacyBatchId !== undefined) {
+      if (!isValidIdString(legacyBatchId)) {
+        throw new ApiError({
+          status: 400,
+          code: 'invalid_request',
+          message: 'A valid batch identifier is required.',
+        });
+      }
+      overallBatchId = legacyBatchId.trim();
+    }
+  }
+
+  if (!isValidIdString(requisitionId)) {
     throw new ApiError({
       status: 400,
       code: 'invalid_request',
       message: 'A valid requisition identifier is required.',
     });
   }
+  const trimmedId = requisitionId.trim();
 
   if (files.length === 0) {
     throw new ApiError({
@@ -390,31 +694,290 @@ export async function uploadResumes(
     });
   }
 
-  const formData = new FormData();
-  for (const file of files) {
-    // Field name must match what the backend expects from multipart parsing.
-    // The backend parser extracts any part that has a filename= attribute in
-    // Content-Disposition, so the field name is not constrained — we use 'files'.
-    formData.append('files', file);
+  const totalBatchBytes = files.reduce((acc, f) => acc + getFileInfo(f).file.size, 0);
+  if (totalBatchBytes > UPLOAD_MAX_BATCH_BYTES) {
+    throw new ApiError({
+      status: 400,
+      code: 'invalid_request',
+      message:
+        'Batch exceeds maximum allowed size of 1 GB. Please split your upload into smaller batches.',
+    });
   }
 
-  // apiClient.post detects FormData and removes Content-Type so the browser
-  // generates the correct multipart/form-data; boundary= header automatically.
-  const response = await apiClient.post<unknown>(
-    `/requisitions/${encodeURIComponent(trimmedId)}/resumes`,
-    formData,
+  // If file count is within single chunk limit and no batchId specified, execute direct request
+  if (files.length <= UPLOAD_CHUNK_SIZE && !overallBatchId) {
+    const formData = new FormData();
+    for (const item of files) {
+      const { file, clientFileId } = getFileInfo(item);
+      if (clientFileId) {
+        formData.append(`file:${clientFileId}`, file, file.name);
+      } else {
+        formData.append('files', file, file.name);
+      }
+    }
+
+    const directUrl =
+      isFinalExplicit === true
+        ? `/requisitions/${encodeURIComponent(trimmedId)}/resumes?isFinal=true`
+        : `/requisitions/${encodeURIComponent(trimmedId)}/resumes`;
+
+    const response = await apiClient.post<unknown>(
+      directUrl,
+      formData,
+      signal !== undefined ? { signal } : {},
+    );
+
+    if (!isValidResumeBatchUploadResult(response)) {
+      throw new ApiError({
+        status: 502,
+        code: 'invalid_response_format',
+        message: 'Received an unexpected upload response from the server.',
+      });
+    }
+
+    onProgress?.({
+      uploadedCount: files.length,
+      totalCount: files.length,
+      percent: 100,
+    });
+
+    return response;
+  }
+
+  // Bounded chunked upload for bulk batches up to 500 files
+  const chunks: UploadFileInput[][] = [];
+  for (let i = 0; i < files.length; i += UPLOAD_CHUNK_SIZE) {
+    chunks.push(files.slice(i, i + UPLOAD_CHUNK_SIZE));
+  }
+
+  const aggregateAccepted: ResumeBatchUploadResult['accepted'] = [];
+  const aggregateDuplicates: ResumeBatchUploadResult['duplicates'] = [];
+  const aggregateRejected: ResumeBatchUploadResult['rejected'] = [];
+  let processedFileCount = 0;
+
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+    const chunk = chunks[chunkIndex]!;
+    const formData = new FormData();
+    for (const item of chunk) {
+      const { file, clientFileId } = getFileInfo(item);
+      if (clientFileId) {
+        formData.append(`file:${clientFileId}`, file, file.name);
+      } else {
+        formData.append('files', file, file.name);
+      }
+    }
+
+    const isLastChunk = chunkIndex === chunks.length - 1;
+    const params = new URLSearchParams();
+    if (overallBatchId) {
+      params.set('batchId', overallBatchId);
+    }
+    if (isLastChunk && isFinalExplicit === true) {
+      params.set('isFinal', 'true');
+    }
+    const queryString = params.toString();
+    const uploadPath: string = queryString
+      ? `/requisitions/${encodeURIComponent(trimmedId)}/resumes?${queryString}`
+      : `/requisitions/${encodeURIComponent(trimmedId)}/resumes`;
+
+    let uploadResponse: unknown;
+    try {
+      uploadResponse = await apiClient.post<unknown>(
+        uploadPath,
+        formData,
+        signal !== undefined ? { signal } : {},
+      );
+    } catch (chunkErr: unknown) {
+      const message = resolveUploadErrorMessage(chunkErr);
+      const apiErr = isApiError(chunkErr) ? chunkErr : null;
+      throw new UploadChunkError({
+        message,
+        status: apiErr?.status,
+        code: apiErr?.code,
+        batchId: overallBatchId,
+        aggregateAccepted,
+        aggregateDuplicates,
+        aggregateRejected,
+        failedChunkIndex: chunkIndex,
+      });
+    }
+
+    if (!isValidResumeBatchUploadResult(uploadResponse)) {
+      throw new ApiError({
+        status: 502,
+        code: 'invalid_response_format',
+        message: 'Received an unexpected upload response from the server.',
+      });
+    }
+
+    if (!overallBatchId && uploadResponse.batchId) {
+      overallBatchId = uploadResponse.batchId;
+    }
+
+    aggregateAccepted.push(...uploadResponse.accepted);
+    aggregateDuplicates.push(...uploadResponse.duplicates);
+    aggregateRejected.push(...uploadResponse.rejected);
+    processedFileCount += chunk.length;
+
+    onProgress?.({
+      uploadedCount: processedFileCount,
+      totalCount: files.length,
+      percent: Math.min(100, Math.round((processedFileCount / files.length) * 100)),
+    });
+  }
+
+  return {
+    batchId: overallBatchId,
+    totalFiles: files.length,
+    acceptedCount: aggregateAccepted.length,
+    duplicateCount: aggregateDuplicates.length,
+    rejectedCount: aggregateRejected.length,
+    accepted: aggregateAccepted,
+    duplicates: aggregateDuplicates,
+    rejected: aggregateRejected,
+  };
+}
+
+function isAmbiguousFinalizationFailure(error: unknown): boolean {
+  if (!isApiError(error) || error.code === 'invalid_response_format') {
+    return false;
+  }
+  return (
+    error.status === 0 ||
+    error.code === 'network_error' ||
+    error.status === 502 ||
+    error.status === 503 ||
+    error.status === 504
+  );
+}
+
+/**
+ * Retrieves the current server state of a resume processing batch.
+ *
+ * Route: GET /api/v1/requisitions/:requisitionId/resumes/batches/:batchId
+ * Auth: Recruiter session required.
+ */
+export async function getResumeBatchStatus(
+  requisitionId: string,
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<ResumeBatchStatusDto> {
+  if (!isValidIdString(requisitionId) || !isValidIdString(batchId)) {
+    throw new ApiError({
+      status: 400,
+      code: 'invalid_request',
+      message: 'Valid requisition and batch identifiers are required.',
+    });
+  }
+  const trimmedRequisitionId = requisitionId.trim();
+  const trimmedBatchId = batchId.trim();
+
+  const response = await apiClient.get<unknown>(
+    `/requisitions/${encodeURIComponent(trimmedRequisitionId)}/resumes/batches/${encodeURIComponent(trimmedBatchId)}`,
     signal !== undefined ? { signal } : {},
   );
 
-  if (!isValidResumeBatchUploadResult(response)) {
+  if (!isValidResumeBatchStatus(response) || response.id !== trimmedBatchId) {
     throw new ApiError({
       status: 502,
       code: 'invalid_response_format',
-      message: 'Received an unexpected upload response from the server.',
+      message: 'Received an unexpected batch status response from the server.',
     });
   }
 
   return response;
+}
+
+/**
+ * Finalizes an open resume batch for background processing.
+ * Validates request identifiers and server confirmation before succeeding.
+ * When a response may have been lost in transit (network error or gateway timeout),
+ * reconciles read-only batch status with the server before failing.
+ */
+export async function finalizeResumeBatch(
+  requisitionId: string,
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<ResumeBatchStatusDto> {
+  if (!isValidIdString(requisitionId) || !isValidIdString(batchId)) {
+    throw new ApiError({
+      status: 400,
+      code: 'invalid_request',
+      message: 'Valid requisition and batch identifiers are required.',
+    });
+  }
+  const trimmedRequisitionId = requisitionId.trim();
+  const trimmedBatchId = batchId.trim();
+
+  try {
+    const response = await apiClient.post<unknown>(
+      `/requisitions/${encodeURIComponent(trimmedRequisitionId)}/resumes/batches/${encodeURIComponent(trimmedBatchId)}/finalize`,
+      {},
+      signal !== undefined ? { signal } : {},
+    );
+
+    if (!isValidResumeBatchStatus(response) || response.id !== trimmedBatchId) {
+      throw new ApiError({
+        status: 502,
+        code: 'invalid_response_format',
+        message: 'Received an unexpected batch finalization response from the server.',
+      });
+    }
+
+    if (response.isOpen) {
+      throw new ApiError({
+        status: 409,
+        code: 'batch_not_finalized',
+        message: 'The server reported that the batch is still open. Please retry finalization.',
+      });
+    }
+
+    return response;
+  } catch (error: unknown) {
+    if (isAmbiguousFinalizationFailure(error) && !signal?.aborted) {
+      try {
+        const reconciled = await apiClient.get<unknown>(
+          `/requisitions/${encodeURIComponent(trimmedRequisitionId)}/resumes/batches/${encodeURIComponent(trimmedBatchId)}`,
+          signal !== undefined ? { signal } : {},
+        );
+        if (
+          isValidResumeBatchStatus(reconciled) &&
+          reconciled.id === trimmedBatchId &&
+          reconciled.isOpen === false
+        ) {
+          return reconciled;
+        }
+      } catch {
+        // Reconciliation failed or batch remains open — surface the original finalization error.
+      }
+    }
+    throw error;
+  }
+}
+
+/**
+ * Checks server state before retrying batch finalization so a duplicate POST is not
+ * issued if the server already completed the prior request.
+ */
+export async function reconcileAndFinalizeResumeBatch(
+  requisitionId: string,
+  batchId: string,
+  signal?: AbortSignal,
+): Promise<ResumeBatchStatusDto> {
+  if (!isValidIdString(requisitionId) || !isValidIdString(batchId)) {
+    throw new ApiError({
+      status: 400,
+      code: 'invalid_request',
+      message: 'Valid requisition and batch identifiers are required.',
+    });
+  }
+
+  const currentStatus = await getResumeBatchStatus(requisitionId, batchId, signal);
+  if (currentStatus.isOpen === false) {
+    return currentStatus;
+  }
+
+  return finalizeResumeBatch(requisitionId, batchId, signal);
 }
 
 // ---------------------------------------------------------------------------

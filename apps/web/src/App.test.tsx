@@ -139,14 +139,14 @@ describe('TalentLens AI Authentication, ProtectedRoute & Recruiter AppShell (M9.
     fetchMock.mockResolvedValueOnce(jsonResponse({ clients: [] }));
     const user = userEvent.setup({ delay: null });
 
-    renderAt('/dashboard');
+    renderAt('/requisitions');
 
     expect(
       await screen.findByRole('heading', {
         name: /Candidate Evaluation Workspace/i,
       }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Dashboard' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Requisitions' })).not.toBeInTheDocument();
     expect(screen.getAllByText('hiring.manager@client.example').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Client Portal/i).length).toBeGreaterThan(0);
 

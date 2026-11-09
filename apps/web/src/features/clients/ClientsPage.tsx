@@ -6,9 +6,11 @@ import {
   Plus,
   Power,
   PowerOff,
+  Users,
   X,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
+import { Link } from 'react-router';
 
 import {
   Button,
@@ -26,6 +28,7 @@ import {
   Tab,
   TabList,
   Tabs,
+  buttonStyles,
 } from '../../components/ui/index.js';
 import type { Column } from '../../components/ui/index.js';
 import { PageHeader } from '../../layouts/PageHeader.js';
@@ -192,7 +195,12 @@ export function ClientsPage({
             <Icon icon={Building2} size="sm" />
           </span>
           <div className="min-w-0">
-            <p className="truncate font-semibold text-fg">{row.name}</p>
+            <Link
+              to={`/clients/${row.id}`}
+              className="truncate font-semibold text-fg hover:text-accent focus:outline-none focus:underline"
+            >
+              {row.name}
+            </Link>
             <p className="mt-0.5 tabular text-2xs text-fg-subtle sm:hidden">
               Updated {formatShortDate(row.updatedAt)}
             </p>
@@ -233,6 +241,14 @@ export function ClientsPage({
         const isActive = row.status === 'ACTIVE';
         return (
           <div className="inline-flex items-center justify-end gap-1.5">
+            <Link
+              to={`/clients/${row.id}`}
+              className={buttonStyles('secondary', 'sm')}
+              aria-label={`View ${row.name} members`}
+            >
+              <Icon icon={Users} size="sm" className="mr-1" />
+              <span className="hidden sm:inline">Members</span>
+            </Link>
             <Button
               variant="secondary"
               size="sm"

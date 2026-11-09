@@ -308,9 +308,9 @@ describe('LoginPage (M9.2A Step 3)', () => {
     expect(isSafeInternalPath('//evil.example/phish')).toBe(false);
     expect(isSafeInternalPath('/\\evil.example')).toBe(false);
     expect(isSafeInternalPath('/dashboard/../admin')).toBe(false);
-    expect(isPathAllowedForRole('/dashboard', 'CLIENT_HIRING_MANAGER')).toBe(false);
+    expect(isPathAllowedForRole('/requisitions', 'CLIENT_HIRING_MANAGER')).toBe(false);
     expect(resolveSafePostLoginRedirect('https://evil.example', 'RECRUITER')).toBe('/dashboard');
-    expect(resolveSafePostLoginRedirect('/dashboard', 'CLIENT_HIRING_MANAGER')).toBe(
+    expect(resolveSafePostLoginRedirect('/requisitions', 'CLIENT_HIRING_MANAGER')).toBe(
       '/client-portal',
     );
 

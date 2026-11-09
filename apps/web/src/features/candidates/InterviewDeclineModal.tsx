@@ -75,7 +75,7 @@ export function InterviewDeclineModal({
             maxLength={1000}
             required
             placeholder="e.g., Conflict with candidate work schedule, requesting next week instead..."
-            className="w-full rounded-md border border-border bg-bg-surface p-2.5 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+            className="w-full rounded-md border border-border bg-surface p-2.5 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </div>
 

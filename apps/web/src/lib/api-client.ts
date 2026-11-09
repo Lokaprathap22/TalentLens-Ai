@@ -9,6 +9,7 @@ export interface AuthenticatedUserDto {
   userId: string;
   organizationId: string;
   organizationName: string;
+  name?: string | null;
   email: string;
   role: UserRole;
 }
@@ -199,11 +200,16 @@ export function resolveApiUrl(path: string): string {
 
 const PUBLIC_UNAUTHENTICATED_POST_ROUTES: ReadonlySet<string> = new Set([
   '/auth/login',
+  '/auth/activate',
+  '/auth/password/reset/request',
+  '/auth/password/reset/confirm',
   '/consent/inspect',
   '/consent/accept',
   '/consent/decline',
   '/consent/withdraw/request',
   '/consent/withdraw/confirm',
+  '/consent/deletion/request',
+  '/consent/deletion/confirm',
 ]);
 
 function isCsrfExemptRequest(method: HttpMethod, path: string): boolean {

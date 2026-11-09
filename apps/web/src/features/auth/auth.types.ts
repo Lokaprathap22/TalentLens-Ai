@@ -105,7 +105,14 @@ export function isPathAllowedForRole(path: string, role: UserRole): boolean {
         (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
       );
     case 'CLIENT_HIRING_MANAGER':
-      return pathname === '/client-portal' || pathname.startsWith('/client-portal/');
+      return (
+        pathname === '/dashboard' ||
+        pathname.startsWith('/dashboard/') ||
+        pathname === '/client-portal' ||
+        pathname.startsWith('/client-portal/') ||
+        pathname === '/interviews' ||
+        pathname.startsWith('/interviews/')
+      );
     case 'DELIVERY_HEAD':
       return pathname === '/delivery-overview' || pathname.startsWith('/delivery-overview/');
   }

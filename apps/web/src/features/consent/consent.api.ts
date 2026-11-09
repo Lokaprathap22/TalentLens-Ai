@@ -1,5 +1,7 @@
 import { apiClient } from '../../lib/api-client.js';
 import type {
+  CandidateDeletionConfirmResult,
+  CandidateDeletionRequestResult,
   ConsentAcceptResult,
   ConsentDeclineResult,
   ConsentInvitationDto,
@@ -57,6 +59,24 @@ export async function confirmConsentWithdrawal(
   token: string,
 ): Promise<ConsentWithdrawalConfirmResult> {
   return apiClient.post<ConsentWithdrawalConfirmResult>('/consent/withdraw/confirm', {
+    token,
+  });
+}
+
+export async function requestCandidateDeletion(
+  email: string,
+  candidateCode?: string,
+): Promise<CandidateDeletionRequestResult> {
+  return apiClient.post<CandidateDeletionRequestResult>('/consent/deletion/request', {
+    email,
+    ...(candidateCode ? { candidateCode } : {}),
+  });
+}
+
+export async function confirmCandidateDeletion(
+  token: string,
+): Promise<CandidateDeletionConfirmResult> {
+  return apiClient.post<CandidateDeletionConfirmResult>('/consent/deletion/confirm', {
     token,
   });
 }

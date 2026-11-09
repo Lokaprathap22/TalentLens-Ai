@@ -9,13 +9,13 @@ export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const base =
-  'inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md font-medium transition-colors duration-100 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
+  'inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md font-medium transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
 
 const variants: Record<ButtonVariant, string> = {
   primary:
     'bg-accent text-on-accent shadow-xs hover:bg-accent-hover active:bg-accent-active disabled:hover:bg-accent',
   secondary:
-    'border border-border-strong bg-surface text-fg shadow-xs hover:bg-surface-muted active:bg-surface-sunken disabled:hover:bg-surface',
+    'border border-border-strong bg-surface text-fg shadow-xs hover:bg-surface-muted hover:border-fg-disabled active:bg-surface-sunken disabled:hover:bg-surface disabled:hover:border-border-strong',
   ghost: 'text-fg-muted hover:bg-surface-muted hover:text-fg active:bg-surface-sunken',
   danger: 'bg-danger text-on-accent shadow-xs hover:brightness-95 active:brightness-90',
 };

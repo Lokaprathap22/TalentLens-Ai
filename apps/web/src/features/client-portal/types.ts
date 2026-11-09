@@ -13,6 +13,8 @@
 
 export type ClientDecisionType = 'SHORTLIST' | 'REJECT';
 
+export type ClientFeedbackHistoryDecision = ClientDecisionType | 'PROPOSE_INTERVIEW';
+
 export type ClientSubmissionStatus =
   'SUBMITTED' | 'CLIENT_SHORTLISTED' | 'CLIENT_REJECTED' | 'INTERVIEW_PROPOSED' | 'WITHDRAWN';
 
@@ -69,7 +71,7 @@ export interface ClientSubmissionDetail {
   } | null;
   feedbackHistory: Array<{
     id: string;
-    decision: ClientDecisionType;
+    decision: ClientFeedbackHistoryDecision;
     reason: string | null;
     proposedAt: string | null;
     timezone: string | null;
@@ -107,4 +109,4 @@ export interface ClientFeedbackResponse {
 }
 
 export type ClientPortalStatusFilter =
-  'ALL' | 'SUBMITTED' | 'CLIENT_SHORTLISTED' | 'CLIENT_REJECTED';
+  'ALL' | 'SUBMITTED' | 'INTERVIEW_PROPOSED' | 'CLIENT_SHORTLISTED' | 'CLIENT_REJECTED';

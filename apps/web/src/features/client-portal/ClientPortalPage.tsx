@@ -186,18 +186,25 @@ export function ClientPortalPage(): React.JSX.Element {
       id: 'actions',
       header: '',
       align: 'right',
-      cell: (row) => (
-        <Button
-          type="button"
-          size="sm"
-          variant={row.status === 'SUBMITTED' ? 'primary' : 'secondary'}
-          onClick={() => handleOpenReview(row.submissionId)}
-          className="text-xs"
-        >
-          <Eye className="h-3.5 w-3.5 mr-1" />
-          {row.status === 'SUBMITTED' ? 'Review Candidate' : 'View Decision'}
-        </Button>
-      ),
+      cell: (row) => {
+        const isPendingDecision = row.status === 'SUBMITTED' || row.status === 'INTERVIEW_PROPOSED';
+        return (
+          <Button
+            type="button"
+            size="sm"
+            variant={isPendingDecision ? 'primary' : 'secondary'}
+            onClick={() => handleOpenReview(row.submissionId)}
+            className="text-xs"
+          >
+            <Eye className="h-3.5 w-3.5 mr-1" />
+            {row.status === 'SUBMITTED'
+              ? 'Review Candidate'
+              : row.status === 'INTERVIEW_PROPOSED'
+                ? 'Review & Decide'
+                : 'View Decision'}
+          </Button>
+        );
+      },
     },
   ];
 
@@ -206,14 +213,38 @@ export function ClientPortalPage(): React.JSX.Element {
       {/* Top Navigation Bar */}
       <header className="border-b border-border bg-surface px-4 sm:px-6 lg:px-8">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <LogoMark className="size-8" />
-            <div className="flex items-baseline gap-2">
-              <Wordmark className="text-base text-fg" />
-              <span className="rounded bg-accent-soft px-1.5 py-0.5 text-2xs font-semibold text-accent-fg uppercase tracking-wider">
-                Client Portal
-              </span>
+          <div className="flex items-center gap-6">
+            <div className="flex items-center gap-3">
+              <LogoMark className="size-8" />
+              <div className="flex items-baseline gap-2">
+                <Wordmark className="text-base text-fg" />
+                <span className="rounded bg-accent-soft px-1.5 py-0.5 text-2xs font-semibold text-accent-fg uppercase tracking-wider">
+                  Client Portal
+                </span>
+              </div>
             </div>
+
+            <nav className="flex items-center gap-2" aria-label="Client Portal Sections">
+              <a
+                href="/dashboard"
+                className="rounded-md px-3 py-1.5 text-xs font-medium text-fg-muted hover:bg-surface-muted hover:text-fg"
+              >
+                Dashboard
+              </a>
+              <a
+                href="/client-portal"
+                aria-current="page"
+                className="rounded-md bg-accent-soft px-3 py-1.5 text-xs font-semibold text-accent-fg"
+              >
+                Submissions
+              </a>
+              <a
+                href="/interviews"
+                className="rounded-md px-3 py-1.5 text-xs font-medium text-fg-muted hover:bg-surface-muted hover:text-fg"
+              >
+                Interviews
+              </a>
+            </nav>
           </div>
 
           <div className="flex items-center gap-4">
@@ -224,7 +255,7 @@ export function ClientPortalPage(): React.JSX.Element {
                 <select
                   value={selectedClientId ?? ''}
                   onChange={(e) => setSelectedClientId(e.target.value)}
-                  className="rounded-md border border-border bg-bg-surface px-2.5 py-1 text-xs text-fg focus:border-accent focus:outline-none"
+                  className="rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-fg focus:border-accent focus:outline-none"
                   aria-label="Select client organization"
                 >
                   {clients.map((c) => (
@@ -342,6 +373,7 @@ export function ClientPortalPage(): React.JSX.Element {
                 {[
                   { value: 'ALL', label: 'All Submissions' },
                   { value: 'SUBMITTED', label: 'Pending Review' },
+                  { value: 'INTERVIEW_PROPOSED', label: 'Interview Stage' },
                   { value: 'CLIENT_SHORTLISTED', label: 'Shortlisted' },
                   { value: 'CLIENT_REJECTED', label: 'Declined' },
                 ].map((tab) => (

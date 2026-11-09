@@ -3,7 +3,6 @@ import {
   Building2,
   CalendarClock,
   ClipboardCheck,
-  History,
   LayoutDashboard,
   Settings,
   Users,
@@ -63,7 +62,7 @@ export const recruiterNavigation: NavSection[] = [
     id: 'talent',
     label: 'Talent',
     items: [
-      { id: 'candidates', label: 'Candidates', icon: Users, to: '/candidates', available: false },
+      { id: 'candidates', label: 'Candidates', icon: Users, to: '/candidates', available: true },
     ],
   },
   {
@@ -80,7 +79,7 @@ export const recruiterNavigation: NavSection[] = [
         label: 'Interviews',
         icon: CalendarClock,
         to: '/interviews',
-        available: false,
+        available: true,
       },
     ],
   },
@@ -88,8 +87,7 @@ export const recruiterNavigation: NavSection[] = [
     id: 'administration',
     label: 'Administration',
     items: [
-      { id: 'audit', label: 'Audit history', icon: History, to: '/audit', available: false },
-      { id: 'settings', label: 'Settings', icon: Settings, to: '/settings', available: false },
+      { id: 'settings', label: 'Settings', icon: Settings, to: '/settings', available: true },
     ],
   },
 ];

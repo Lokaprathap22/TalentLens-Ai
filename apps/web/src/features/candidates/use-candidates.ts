@@ -64,11 +64,46 @@ export function filterCandidates(
   });
 }
 
-/** Sorts candidates by lastActivityAt descending, then by candidateId for stability. */
+/**
+ * Sorts candidates by lastActivityAt descending, then by candidateId for stability.
+ * NOTE: This is chronological activity sorting, NOT assessment ranking.
+ * For assessment score ranking, use sortCandidatesByScore.
+ */
 export function sortCandidatesByActivity(
   candidates: readonly CandidateSummary[],
 ): CandidateSummary[] {
   return [...candidates].sort((a, b) => {
+    const byDate = b.lastActivityAt.localeCompare(a.lastActivityAt);
+    if (byDate !== 0) return byDate;
+    return a.candidateId.localeCompare(b.candidateId);
+  });
+}
+
+/**
+ * Sorts candidates by verified assessment score descending (verified scores first),
+ * tie-breaker 1: lastActivityAt descending, tie-breaker 2: candidateId ascending.
+ * Does not invent scores or rank unassessed candidates as scored.
+ */
+export function sortCandidatesByScore(
+  candidates: readonly CandidateSummary[],
+  ascending = false,
+): CandidateSummary[] {
+  return [...candidates].sort((a, b) => {
+    const scoreA =
+      a.assessmentStatus === 'COMPLETE' && a.overallScore !== null ? a.overallScore : null;
+    const scoreB =
+      b.assessmentStatus === 'COMPLETE' && b.overallScore !== null ? b.overallScore : null;
+
+    if (scoreA !== null && scoreB !== null) {
+      if (scoreA !== scoreB) {
+        return ascending ? scoreA - scoreB : scoreB - scoreA;
+      }
+    } else if (scoreA !== null) {
+      return -1;
+    } else if (scoreB !== null) {
+      return 1;
+    }
+
     const byDate = b.lastActivityAt.localeCompare(a.lastActivityAt);
     if (byDate !== 0) return byDate;
     return a.candidateId.localeCompare(b.candidateId);
@@ -117,10 +152,7 @@ export function useCandidates(
   const mountedRef = useRef(true);
   const fetchVersionRef = useRef(0);
   const serverQueryRef = useRef(serverQuery);
-
-  useEffect(() => {
-    serverQueryRef.current = serverQuery;
-  }, [serverQuery]);
+  const serverQueryKey = JSON.stringify(serverQuery);
 
   const executeFetch = useCallback(
     async (version: number): Promise<void> => {
@@ -151,6 +183,10 @@ export function useCandidates(
   );
 
   useEffect(() => {
+    serverQueryRef.current = serverQuery;
+  }, [serverQuery]);
+
+  useEffect(() => {
     mountedRef.current = true;
     const version = ++fetchVersionRef.current;
     void executeFetch(version);
@@ -159,7 +195,7 @@ export function useCandidates(
       mountedRef.current = false;
       fetchVersionRef.current += 1;
     };
-  }, [executeFetch]);
+  }, [executeFetch, serverQueryKey]);
 
   const reload = useCallback(async (): Promise<void> => {
     const version = ++fetchVersionRef.current;

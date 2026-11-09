@@ -22,7 +22,7 @@ import {
   Upload,
   Users,
 } from 'lucide-react';
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
 
 import { Badge } from '../../components/ui/badge.js';
@@ -44,7 +44,12 @@ import { PageHeader } from '../../layouts/PageHeader.js';
 import { formatShortDate } from '../../lib/format.js';
 import { useRequisitionDetail } from '../requisitions/use-requisition-detail.js';
 import { CandidateDetailDrawer } from './CandidateDetailDrawer.js';
-import type { AcceptedUploadItem, CandidateSummary, ResumeBatchUploadResult } from './types.js';
+import type {
+  AcceptedUploadItem,
+  CandidateSummary,
+  ListCandidatesQuery,
+  ResumeBatchUploadResult,
+} from './types.js';
 import {
   getParseStatusLabel,
   getParseStatusTone,
@@ -52,7 +57,7 @@ import {
   getReviewStatusTone,
 } from './types.js';
 import { useCandidates } from './use-candidates.js';
-import type { ProcessingFilter, SubmissionFilter } from './use-candidates.js';
+import type { ProcessingFilter, SubmissionFilter, UseCandidatesFilter } from './use-candidates.js';
 import { ResumeUploadDialog } from './ResumeUploadDialog.js';
 
 // ---------------------------------------------------------------------------
@@ -282,12 +287,35 @@ export function CandidatesPage(): React.JSX.Element {
   // Load requisition metadata for breadcrumbs and header
   const { state: reqState, requisition } = useRequisitionDetail(safeRequisitionId);
 
-  // Candidate directory state
-  const { state, filteredCandidates, total, reload, prependCandidates, filter, setFilter } =
-    useCandidates(safeRequisitionId);
-
-  const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
+  const [isUploadOpen, setIsUploadOpen] = useState(false);
+
+  const serverQuery = useMemo<ListCandidatesQuery>(
+    () => ({
+      limit: PAGE_SIZE,
+      offset: (currentPage - 1) * PAGE_SIZE,
+    }),
+    [currentPage],
+  );
+
+  // Candidate directory state
+  const {
+    state,
+    filteredCandidates,
+    total,
+    reload,
+    prependCandidates,
+    filter,
+    setFilter: rawSetFilter,
+  } = useCandidates(safeRequisitionId, serverQuery);
+
+  const setFilter = useCallback(
+    (patch: Partial<UseCandidatesFilter>) => {
+      setCurrentPage(1);
+      rawSetFilter(patch);
+    },
+    [rawSetFilter],
+  );
 
   // Deep-linkable inspection drawer driven by URL search params
   const [searchParams, setSearchParams] = useSearchParams();
@@ -350,11 +378,14 @@ export function CandidatesPage(): React.JSX.Element {
     [prependCandidates, reload],
   );
 
-  // Client-side pagination over filtered candidates
-  const totalFiltered = filteredCandidates.length;
+  // Support both server-paginated mode and client-sliced mode
+  const isServerPaginated = total > filteredCandidates.length || serverQuery.offset !== undefined;
   const pageStart = (currentPage - 1) * PAGE_SIZE;
   const pageEnd = pageStart + PAGE_SIZE;
-  const pageCandidates = filteredCandidates.slice(pageStart, pageEnd);
+  const pageCandidates = isServerPaginated
+    ? filteredCandidates
+    : filteredCandidates.slice(pageStart, pageEnd);
+  const paginationTotal = isServerPaginated ? total : filteredCandidates.length;
 
   const columns = candidateColumns(handleInspectCandidate);
 
@@ -488,7 +519,7 @@ export function CandidatesPage(): React.JSX.Element {
         <Pagination
           page={currentPage}
           pageSize={PAGE_SIZE}
-          total={totalFiltered}
+          total={paginationTotal}
           onPageChange={(page) => {
             setCurrentPage(page);
           }}

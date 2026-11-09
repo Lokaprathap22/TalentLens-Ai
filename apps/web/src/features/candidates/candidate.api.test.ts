@@ -4,13 +4,17 @@ import { ApiError, apiClient } from '../../lib/api-client.js';
 import {
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_MAX_FILES,
+  finalizeResumeBatch,
   getCandidateDetail,
   getCandidateTimeline,
+  getResumeBatchStatus,
   getResumeDetails,
   getResumeExtraction,
   getResumeFileBlob,
   listCandidates,
+  listGlobalCandidates,
   listSubmissionsForRequisition,
+  reconcileAndFinalizeResumeBatch,
   recordCandidateReview,
   resolveCandidateErrorMessage,
   resolveUploadErrorMessage,
@@ -24,6 +28,7 @@ import type {
   CandidateDetail,
   CandidateSummary,
   DocumentExtraction,
+  GlobalCandidateSummary,
   ResumeBatchUploadResult,
 } from './types.js';
 
@@ -337,9 +342,192 @@ describe('candidate.api — uploadResumes', () => {
     await expect(uploadResumes(REQUISITION_ID, tooMany)).rejects.toMatchObject({
       status: 400,
       code: 'invalid_request',
-      message: expect.stringContaining('10 files'),
+      message: expect.stringContaining(`${UPLOAD_MAX_FILES} files`),
     });
 
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  it('19b. chunks bulk uploads exceeding UPLOAD_CHUNK_SIZE into bounded requests with batchId continuity', async () => {
+    const postSpy = vi.spyOn(apiClient, 'post').mockImplementation(async (_path) => {
+      return {
+        batchId: 'batch-shared-500',
+        totalFiles: 3,
+        acceptedCount: 3,
+        duplicateCount: 0,
+        rejectedCount: 0,
+        accepted: [
+          {
+            resumeDocumentId: 'doc-1',
+            candidateId: 'cand-1',
+            candidateCode: 'CAN-1',
+            fileName: 'chunk.pdf',
+            fileType: 'PDF',
+            sizeBytes: 100,
+            sha256: 'sha1',
+            status: 'ACCEPTED',
+          },
+        ],
+        duplicates: [],
+        rejected: [],
+      };
+    });
+
+    const progressReports: number[] = [];
+    // 6 files with UPLOAD_CHUNK_SIZE = 3 -> 2 chunks (3 + 3)
+    const sixFiles = Array.from({ length: 6 }, (_, i) => makePdfFile(`res-${i}.pdf`));
+    const result = await uploadResumes(REQUISITION_ID, sixFiles, undefined, (p) => {
+      progressReports.push(p.percent);
+    });
+
+    expect(postSpy).toHaveBeenCalledTimes(2);
+    // First chunk creates batch
+    expect(postSpy.mock.calls[0]?.[0]).toBe(`/requisitions/${REQUISITION_ID}/resumes`);
+    // Second chunk passes batchId continuity
+    expect(postSpy.mock.calls[1]?.[0]).toContain('batchId=batch-shared-500');
+    expect(result.totalFiles).toBe(6);
+    expect(progressReports.length).toBe(2);
+    expect(progressReports[1]).toBe(100);
+  });
+
+  it('19b2. appends ?isFinal=true on single direct upload when options.isFinal is true', async () => {
+    const postSpy = vi.spyOn(apiClient, 'post').mockResolvedValueOnce(SAMPLE_UPLOAD_RESULT);
+
+    await uploadResumes(REQUISITION_ID, [makePdfFile()], { isFinal: true });
+
+    expect(postSpy).toHaveBeenCalledTimes(1);
+    expect(postSpy.mock.calls[0]?.[0]).toBe(`/requisitions/${REQUISITION_ID}/resumes?isFinal=true`);
+  });
+
+  it('19b3. finalizeResumeBatch validates IDs and calls batch finalize endpoint', async () => {
+    await expect(finalizeResumeBatch('  ', 'batch-1')).rejects.toMatchObject({
+      status: 400,
+      code: 'invalid_request',
+    });
+
+    const postSpy = vi
+      .spyOn(apiClient, 'post')
+      .mockResolvedValueOnce({ id: 'batch-1', status: 'COMPLETED', isOpen: false });
+
+    const res = await finalizeResumeBatch(REQUISITION_ID, 'batch-1');
+    expect(postSpy).toHaveBeenCalledWith(
+      `/requisitions/${REQUISITION_ID}/resumes/batches/batch-1/finalize`,
+      {},
+      {},
+    );
+    expect(res).toEqual({ id: 'batch-1', status: 'COMPLETED', isOpen: false });
+  });
+
+  it('19b4. finalizeResumeBatch rejects malformed batch IDs and invalid server responses', async () => {
+    const postSpy = vi.spyOn(apiClient, 'post');
+    await expect(finalizeResumeBatch(REQUISITION_ID, '   ')).rejects.toMatchObject({
+      status: 400,
+      code: 'invalid_request',
+    });
+    await expect(finalizeResumeBatch(REQUISITION_ID, 'batch/invalid')).rejects.toMatchObject({
+      status: 400,
+      code: 'invalid_request',
+    });
+    expect(postSpy).not.toHaveBeenCalled();
+
+    postSpy.mockResolvedValueOnce({ id: 'batch-1', status: 'PROCESSING', isOpen: true });
+    await expect(finalizeResumeBatch(REQUISITION_ID, 'batch-1')).rejects.toMatchObject({
+      status: 409,
+      code: 'batch_not_finalized',
+    });
+
+    postSpy.mockResolvedValueOnce({ status: 'COMPLETED' });
+    await expect(finalizeResumeBatch(REQUISITION_ID, 'batch-1')).rejects.toMatchObject({
+      status: 502,
+      code: 'invalid_response_format',
+    });
+  });
+
+  it('19b5. finalizeResumeBatch reconciles lost network response via GET /batches/:batchId when server already finalized', async () => {
+    const postSpy = vi.spyOn(apiClient, 'post').mockRejectedValueOnce(
+      new ApiError({
+        status: 0,
+        code: 'network_error',
+        message: 'Connection reset before response received',
+      }),
+    );
+    const getSpy = vi
+      .spyOn(apiClient, 'get')
+      .mockResolvedValueOnce({ id: 'batch-1', status: 'PROCESSING', isOpen: false });
+
+    const res = await finalizeResumeBatch(REQUISITION_ID, 'batch-1');
+    expect(postSpy).toHaveBeenCalledTimes(1);
+    expect(getSpy).toHaveBeenCalledWith(
+      `/requisitions/${REQUISITION_ID}/resumes/batches/batch-1`,
+      {},
+    );
+    expect(res).toEqual({ id: 'batch-1', status: 'PROCESSING', isOpen: false });
+  });
+
+  it('19b6. finalizeResumeBatch propagates network failure when server batch remains open or unreachable', async () => {
+    vi.spyOn(apiClient, 'post').mockRejectedValueOnce(
+      new ApiError({
+        status: 0,
+        code: 'network_error',
+        message: 'Network down',
+      }),
+    );
+    vi.spyOn(apiClient, 'get').mockResolvedValueOnce({
+      id: 'batch-1',
+      status: 'PROCESSING',
+      isOpen: true,
+    });
+
+    await expect(finalizeResumeBatch(REQUISITION_ID, 'batch-1')).rejects.toMatchObject({
+      status: 0,
+      code: 'network_error',
+    });
+  });
+
+  it('19b7. reconcileAndFinalizeResumeBatch checks server state first and skips duplicate finalize POST when already closed', async () => {
+    const getSpy = vi
+      .spyOn(apiClient, 'get')
+      .mockResolvedValueOnce({ id: 'batch-1', status: 'COMPLETED', isOpen: false });
+    const postSpy = vi.spyOn(apiClient, 'post');
+
+    const alreadyClosed = await reconcileAndFinalizeResumeBatch(REQUISITION_ID, 'batch-1');
+    expect(alreadyClosed).toEqual({ id: 'batch-1', status: 'COMPLETED', isOpen: false });
+    expect(postSpy).not.toHaveBeenCalled();
+
+    getSpy.mockResolvedValueOnce({ id: 'batch-1', status: 'QUEUED', isOpen: true });
+    postSpy.mockResolvedValueOnce({ id: 'batch-1', status: 'PROCESSING', isOpen: false });
+    const closedNow = await reconcileAndFinalizeResumeBatch(REQUISITION_ID, 'batch-1');
+    expect(closedNow).toEqual({ id: 'batch-1', status: 'PROCESSING', isOpen: false });
+    expect(postSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('19b8. getResumeBatchStatus rejects malformed batch IDs and mismatched server payloads', async () => {
+    await expect(getResumeBatchStatus(REQUISITION_ID, '')).rejects.toMatchObject({
+      status: 400,
+      code: 'invalid_request',
+    });
+
+    vi.spyOn(apiClient, 'get').mockResolvedValueOnce({
+      id: 'different-batch',
+      status: 'COMPLETED',
+      isOpen: false,
+    });
+    await expect(getResumeBatchStatus(REQUISITION_ID, 'batch-1')).rejects.toMatchObject({
+      status: 502,
+      code: 'invalid_response_format',
+    });
+  });
+
+  it('19c. rejects bulk uploads exceeding 1 GB cumulative batch limit', async () => {
+    const postSpy = vi.spyOn(apiClient, 'post');
+    // Create 2 files whose total size exceeds 1 GB
+    const hugeFile1 = { name: 'huge1.pdf', size: 600 * 1024 * 1024 } as File;
+    const hugeFile2 = { name: 'huge2.pdf', size: 600 * 1024 * 1024 } as File;
+
+    await expect(uploadResumes(REQUISITION_ID, [hugeFile1, hugeFile2])).rejects.toMatchObject({
+      status: 400,
+      code: 'invalid_request',
+    });
     expect(postSpy).not.toHaveBeenCalled();
   });
 
@@ -901,6 +1089,84 @@ describe('Candidate detail & Resume inspection API', () => {
       await expect(listSubmissionsForRequisition('')).rejects.toMatchObject({
         status: 400,
         code: 'invalid_request',
+      });
+    });
+  });
+
+  describe('candidate.api — listGlobalCandidates', () => {
+    const SAMPLE_GLOBAL_CANDIDATE: GlobalCandidateSummary = {
+      candidateId: 'cand-global-1',
+      candidateCode: 'CAN-GLOBAL-1',
+      createdAt: '2026-11-05T09:00:00.000Z',
+      lastActivityAt: '2026-11-05T12:00:00.000Z',
+      requisitionId: REQUISITION_ID,
+      requisitionTitle: 'Staff Engineer',
+      clientName: 'Acme Corp',
+      resumeDocumentId: 'doc-1',
+      resumeFileName: 'resume.pdf',
+      parseStatus: 'PARSED',
+      currentRole: 'Backend Lead',
+      experienceYears: 8,
+      location: 'Bangalore',
+      skills: ['TypeScript', 'Node.js'],
+      assessmentId: 'ass-1',
+      assessmentStatus: 'COMPLETE',
+      overallScore: 89,
+      coverage: 0.95,
+      isComplete: true,
+      criteriaCount: 4,
+      criteriaMetCount: 4,
+      reviewStatus: 'REVIEWED',
+      reviewedAt: '2026-11-05T11:00:00.000Z',
+      isShortlisted: true,
+      shortlistedAt: '2026-11-05T11:30:00.000Z',
+      submissionStatus: 'SUBMITTED',
+      submittedAt: '2026-11-05T12:00:00.000Z',
+      statusCategory: 'ASSESSED',
+    };
+
+    it('successfully queries global candidates with query params', async () => {
+      const mockResponse = {
+        items: [SAMPLE_GLOBAL_CANDIDATE],
+        total: 1,
+        page: 2,
+        pageSize: 10,
+        totalPages: 1,
+      };
+
+      const getSpy = vi.spyOn(apiClient, 'get').mockResolvedValueOnce(mockResponse);
+
+      const res = await listGlobalCandidates({
+        page: 2,
+        pageSize: 10,
+        search: 'Backend',
+        requisitionId: REQUISITION_ID,
+        statusCategory: 'ASSESSED',
+        sortBy: 'score',
+        sortOrder: 'desc',
+      });
+
+      expect(getSpy).toHaveBeenCalledWith(expect.stringContaining('/candidates?'), {});
+      const url = getSpy.mock.calls[0]![0] as string;
+      expect(url).toContain('page=2');
+      expect(url).toContain('pageSize=10');
+      expect(url).toContain('search=Backend');
+      expect(url).toContain(`requisitionId=${REQUISITION_ID}`);
+      expect(url).toContain('statusCategory=ASSESSED');
+      expect(url).toContain('sortBy=score');
+      expect(url).toContain('sortOrder=desc');
+      expect(res).toEqual(mockResponse);
+    });
+
+    it('rejects invalid response shape with 502 ApiError', async () => {
+      vi.spyOn(apiClient, 'get').mockResolvedValueOnce({
+        items: [{ invalid: true }],
+        total: 'not-a-number',
+      });
+
+      await expect(listGlobalCandidates()).rejects.toMatchObject({
+        status: 502,
+        code: 'invalid_response_format',
       });
     });
   });

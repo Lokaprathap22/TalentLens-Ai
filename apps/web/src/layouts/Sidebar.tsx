@@ -17,7 +17,7 @@ interface SidebarProps {
 }
 
 const itemBase =
-  'group relative flex h-9 w-full items-center gap-3 rounded-md px-2.5 text-sm font-medium outline-offset-0 focus-visible:outline-sidebar-indicator';
+  'group relative flex h-9 w-full items-center gap-3 rounded-md px-2.5 text-sm font-medium transition-colors duration-150 outline-offset-0 focus-visible:outline-sidebar-indicator';
 
 function NavEntry({
   item,

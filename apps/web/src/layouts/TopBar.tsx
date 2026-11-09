@@ -38,7 +38,7 @@ export function TopBar({
         type="button"
         onClick={onOpenSearch}
         aria-keyshortcuts="Control+K Meta+K"
-        className="ml-1 flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-border-strong bg-surface-muted/60 px-2.5 text-left text-base text-fg-subtle hover:border-fg-disabled hover:bg-surface sm:max-w-md sm:flex-none sm:basis-96"
+        className="ml-1 flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-border-strong bg-surface-muted/60 px-2.5 text-left text-sm text-fg-subtle transition-colors duration-150 hover:border-fg-disabled hover:bg-surface sm:max-w-md sm:flex-none sm:basis-96"
       >
         <Icon icon={Search} size="md" />
         <span className="flex-1 truncate">Search…</span>

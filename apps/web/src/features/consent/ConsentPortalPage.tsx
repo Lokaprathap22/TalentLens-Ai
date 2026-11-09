@@ -189,12 +189,12 @@ export function ConsentPortalPage(): React.JSX.Element {
   }, [token, declineReason]);
 
   return (
-    <div className="min-h-screen bg-bg p-4 sm:p-6 lg:p-8 flex flex-col items-center justify-center">
+    <div className="min-h-screen bg-canvas p-4 sm:p-6 lg:p-8 flex flex-col items-center justify-center">
       <div className="w-full max-w-2xl space-y-6">
         {/* TalentLens AI Branding */}
         <div className="flex items-center justify-between pb-2 border-b border-border">
           <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-accent-fg font-bold text-sm">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-on-accent font-bold text-sm">
               TL
             </div>
             <div>

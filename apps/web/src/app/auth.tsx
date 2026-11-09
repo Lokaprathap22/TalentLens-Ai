@@ -116,6 +116,7 @@ export interface AuthContextValue {
   login: (input: LoginInput) => Promise<AuthenticatedUser>;
   logout: () => Promise<void>;
   retryInitialization: () => Promise<void>;
+  updateUser: (user: AuthenticatedUser) => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -132,6 +133,18 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
 
   const clearLogoutError = useCallback(() => {
     setLogoutError(null);
+  }, []);
+
+  const updateUser = useCallback((updatedUser: AuthenticatedUser) => {
+    setState((current) => {
+      if (current.status === 'authenticated') {
+        return {
+          ...current,
+          user: updatedUser,
+        };
+      }
+      return current;
+    });
   }, []);
 
   const initializeCsrfForUser = useCallback(
@@ -375,6 +388,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
       login,
       logout,
       retryInitialization,
+      updateUser,
     }),
     [
       state,
@@ -385,6 +399,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
       login,
       logout,
       retryInitialization,
+      updateUser,
     ],
   );
 

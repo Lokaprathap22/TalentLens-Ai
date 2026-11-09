@@ -333,7 +333,7 @@ export function ScorecardEditorPage(): React.JSX.Element {
                         onClick={() => setFilter(key)}
                         className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
                           filter === key
-                            ? 'bg-accent text-accent-fg'
+                            ? 'bg-accent text-on-accent'
                             : 'bg-surface-muted text-fg-muted hover:bg-surface-muted/80 hover:text-fg'
                         }`}
                       >

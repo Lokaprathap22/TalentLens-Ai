@@ -635,6 +635,8 @@ describe('api-client foundation (M9.2A Step 2)', () => {
       '/consent/decline',
       '/consent/withdraw/request',
       '/consent/withdraw/confirm',
+      '/consent/deletion/request',
+      '/consent/deletion/confirm',
       '/auth/login',
     ];
 

@@ -5,12 +5,18 @@ import {
   CLIENT_NAME_MAX_LENGTH,
   DUPLICATE_CLIENT_NAME_MESSAGE,
   createClient,
+  getClient,
+  inviteClientMember,
+  listClientMembers,
   listClients,
   resolveClientErrorMessage,
+  resolveMemberErrorMessage,
   updateClient,
   validateClientName,
+  validateMemberEmail,
+  validateMemberName,
 } from './client.api.js';
-import type { ClientRecord } from './types.js';
+import type { ClientMemberRecord, ClientRecord } from './types.js';
 import { computeClientSummaryCounts, filterClients, sortClientsByName } from './use-clients.js';
 
 const SAMPLE_CLIENT_ACTIVE: ClientRecord = {
@@ -200,5 +206,109 @@ describe('client.api & client domain helpers (M9.3 Step 2)', () => {
     expect(filterClients(list, 'ACTIVE', '').map((c) => c.name)).toEqual(['Apex Fintech']);
     expect(filterClients(list, 'INACTIVE', '').map((c) => c.name)).toEqual(['Beacon Health']);
     expect(filterClients(list, 'ALL', '  beacon ')).toEqual([SAMPLE_CLIENT_INACTIVE]);
+  });
+
+  it('9. getClient fetches single client by ID', async () => {
+    const getSpy = vi
+      .spyOn(apiClient, 'get')
+      .mockResolvedValueOnce({ client: SAMPLE_CLIENT_ACTIVE });
+
+    const result = await getClient(SAMPLE_CLIENT_ACTIVE.id);
+    expect(getSpy).toHaveBeenCalledWith(`/clients/${SAMPLE_CLIENT_ACTIVE.id}`, {});
+    expect(result).toEqual(SAMPLE_CLIENT_ACTIVE);
+  });
+
+  it('10. listClientMembers requests GET /clients/:clientId/members and parses member DTOs', async () => {
+    const sampleMember: ClientMemberRecord = {
+      id: 'mem-1',
+      membershipId: 'mem-1',
+      userId: 'usr-1',
+      clientId: SAMPLE_CLIENT_ACTIVE.id,
+      organizationId: 'org-1',
+      name: 'Jane Doe',
+      email: 'jane@acme.com',
+      role: 'CLIENT_HIRING_MANAGER',
+      membershipStatus: 'ACTIVE',
+      userStatus: 'INVITED',
+      createdAt: '2026-11-05T00:00:00.000Z',
+      updatedAt: '2026-11-05T00:00:00.000Z',
+    };
+
+    const getSpy = vi.spyOn(apiClient, 'get').mockResolvedValueOnce({ members: [sampleMember] });
+
+    const result = await listClientMembers(SAMPLE_CLIENT_ACTIVE.id);
+    expect(getSpy).toHaveBeenCalledWith(`/clients/${SAMPLE_CLIENT_ACTIVE.id}/members`, {});
+    expect(result).toEqual([sampleMember]);
+  });
+
+  it('11. inviteClientMember validates email before calling POST /clients/:clientId/members', async () => {
+    const sampleMember: ClientMemberRecord = {
+      id: 'mem-2',
+      membershipId: 'mem-2',
+      userId: 'usr-2',
+      clientId: SAMPLE_CLIENT_ACTIVE.id,
+      organizationId: 'org-1',
+      name: 'Alex Chen',
+      email: 'alex@acme.com',
+      role: 'CLIENT_HIRING_MANAGER',
+      membershipStatus: 'ACTIVE',
+      userStatus: 'INVITED',
+      createdAt: '2026-11-05T00:00:00.000Z',
+      updatedAt: '2026-11-05T00:00:00.000Z',
+    };
+
+    const postSpy = vi.spyOn(apiClient, 'post').mockResolvedValueOnce({ member: sampleMember });
+
+    const result = await inviteClientMember(SAMPLE_CLIENT_ACTIVE.id, {
+      email: '   ALEX@acme.com   ',
+      name: '  Alex Chen  ',
+    });
+
+    expect(postSpy).toHaveBeenCalledWith(`/clients/${SAMPLE_CLIENT_ACTIVE.id}/members`, {
+      email: 'alex@acme.com',
+      name: 'Alex Chen',
+    });
+    expect(result).toEqual(sampleMember);
+  });
+
+  it('12. validateMemberEmail and validateMemberName enforce boundaries', () => {
+    expect(validateMemberEmail('   ')).toEqual({
+      valid: false,
+      error: 'Enter a work email address.',
+    });
+    expect(validateMemberEmail('notanemail')).toEqual({
+      valid: false,
+      error: 'Enter a valid work email address.',
+    });
+    expect(validateMemberEmail('  user@acme.com  ')).toEqual({
+      valid: true,
+      email: 'user@acme.com',
+    });
+
+    expect(validateMemberName('  Jane Doe  ')).toEqual({ valid: true, name: 'Jane Doe' });
+    expect(validateMemberName(undefined)).toEqual({ valid: true, name: undefined });
+  });
+
+  it('13. resolveMemberErrorMessage correctly categorizes specific error codes', () => {
+    expect(
+      resolveMemberErrorMessage(
+        new ApiError({ status: 409, code: 'role_conflict', message: 'Role conflict' }),
+        'Fallback',
+      ),
+    ).toMatch(/recruiter or delivery head/i);
+
+    expect(
+      resolveMemberErrorMessage(
+        new ApiError({ status: 409, code: 'duplicate_membership', message: 'Duplicate' }),
+        'Fallback',
+      ),
+    ).toMatch(/already exists for this client/i);
+
+    expect(
+      resolveMemberErrorMessage(
+        new ApiError({ status: 409, code: 'duplicate_invitation', message: 'Invited' }),
+        'Fallback',
+      ),
+    ).toMatch(/already pending/i);
   });
 });

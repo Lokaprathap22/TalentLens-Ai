@@ -143,7 +143,7 @@ export function InterviewProposalModal({
               if (validationError) setValidationError(null);
             }}
             required
-            className="w-full rounded-md border border-border bg-bg-surface px-3 py-2 text-xs text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+            className="w-full rounded-md border border-border bg-surface px-3 py-2 text-xs text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </div>
 
@@ -161,7 +161,7 @@ export function InterviewProposalModal({
               id="interview-duration"
               value={durationMinutes}
               onChange={(e) => setDurationMinutes(Number(e.target.value))}
-              className="w-full rounded-md border border-border bg-bg-surface px-3 py-2 text-xs text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+              className="w-full rounded-md border border-border bg-surface px-3 py-2 text-xs text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
             >
               <option value={30}>30 minutes</option>
               <option value={45}>45 minutes</option>
@@ -182,7 +182,7 @@ export function InterviewProposalModal({
               id="interview-tz"
               value={timezone}
               onChange={(e) => setTimezone(e.target.value)}
-              className="w-full rounded-md border border-border bg-bg-surface px-3 py-2 text-xs text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+              className="w-full rounded-md border border-border bg-surface px-3 py-2 text-xs text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
             >
               {timezonesList.map((tz) => (
                 <option key={tz} value={tz}>
@@ -203,7 +203,7 @@ export function InterviewProposalModal({
               className={`flex items-center justify-center gap-1.5 rounded-md border p-2 text-xs font-medium transition-all ${
                 format === 'VIDEO'
                   ? 'border-accent bg-accent/15 text-accent font-semibold ring-1 ring-accent'
-                  : 'border-border bg-bg-surface text-fg-subtle hover:text-fg hover:bg-surface-muted'
+                  : 'border-border bg-surface text-fg-subtle hover:text-fg hover:bg-surface-muted'
               }`}
             >
               <Video className="h-3.5 w-3.5" />
@@ -215,7 +215,7 @@ export function InterviewProposalModal({
               className={`flex items-center justify-center gap-1.5 rounded-md border p-2 text-xs font-medium transition-all ${
                 format === 'PHONE'
                   ? 'border-accent bg-accent/15 text-accent font-semibold ring-1 ring-accent'
-                  : 'border-border bg-bg-surface text-fg-subtle hover:text-fg hover:bg-surface-muted'
+                  : 'border-border bg-surface text-fg-subtle hover:text-fg hover:bg-surface-muted'
               }`}
             >
               <Phone className="h-3.5 w-3.5" />
@@ -227,7 +227,7 @@ export function InterviewProposalModal({
               className={`flex items-center justify-center gap-1.5 rounded-md border p-2 text-xs font-medium transition-all ${
                 format === 'IN_PERSON'
                   ? 'border-accent bg-accent/15 text-accent font-semibold ring-1 ring-accent'
-                  : 'border-border bg-bg-surface text-fg-subtle hover:text-fg hover:bg-surface-muted'
+                  : 'border-border bg-surface text-fg-subtle hover:text-fg hover:bg-surface-muted'
               }`}
             >
               <MapPin className="h-3.5 w-3.5" />
@@ -252,7 +252,7 @@ export function InterviewProposalModal({
                 ? 'Explain why an alternative window is proposed...'
                 : 'Add agenda, meeting link placeholders, or notes for the client...'
             }
-            className="w-full rounded-md border border-border bg-bg-surface p-2.5 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+            className="w-full rounded-md border border-border bg-surface p-2.5 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </div>
 

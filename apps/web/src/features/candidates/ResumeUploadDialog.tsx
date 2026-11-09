@@ -18,10 +18,15 @@ import { Button } from '../../components/ui/button.js';
 import { Dialog } from '../../components/ui/dialog.js';
 import { Icon } from '../../components/ui/icon.js';
 import { cn } from '../../lib/cn.js';
+import { ApiError, isApiError } from '../../lib/api-client.js';
 import {
   UPLOAD_ACCEPTED_TYPES_LABEL,
+  UPLOAD_MAX_BATCH_BYTES,
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_MAX_FILES,
+  UploadChunkError,
+  finalizeResumeBatch,
+  getResumeBatchStatus,
   resolveUploadErrorMessage,
   uploadResumes,
   validateUploadFile,
@@ -32,15 +37,19 @@ import type { AcceptedUploadItem, ResumeBatchUploadResult, UploadSlot } from './
 // Helpers
 // ---------------------------------------------------------------------------
 
-let slotIdCounter = 0;
-function nextSlotId(): string {
-  return `slot-${++slotIdCounter}`;
-}
-
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isValidBatchIdentifier(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return false;
+  if (/[\s/?#\\]/.test(trimmed)) return false;
+  if (trimmed === 'null' || trimmed === 'undefined') return false;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,14 +192,28 @@ export function ResumeUploadDialog({
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const uploadingRef = useRef(false);
   const dropActiveRef = useRef(false);
+  const needsFinalizationReconcileRef = useRef(false);
+  const slotIdCounterRef = useRef(0);
+  const nextSlotId = useCallback((): string => {
+    return `slot-${++slotIdCounterRef.current}`;
+  }, []);
   const dropZoneId = useId();
   const fileListId = useId();
 
   const [slots, setSlots] = useState<UploadSlot[]>([]);
+  const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
+  const [batchFinalized, setBatchFinalized] = useState(false);
+  const [finalizingBatch, setFinalizingBatch] = useState(false);
+  const [closeFinalizeFailed, setCloseFinalizeFailed] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
   const [uploadPhase, setUploadPhase] = useState<'idle' | 'uploading' | 'done'>('idle');
   const [uploadResult, setUploadResult] = useState<ResumeBatchUploadResult | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{
+    uploadedCount: number;
+    totalCount: number;
+    percent: number;
+  } | null>(null);
 
   // Reset state when dialog opens/closes
   useEffect(() => {
@@ -198,53 +221,148 @@ export function ResumeUploadDialog({
       // Only reset if not mid-upload
       if (!uploadingRef.current) {
         setSlots([]);
+        setActiveBatchId(null);
+        setBatchFinalized(false);
+        setFinalizingBatch(false);
+        setCloseFinalizeFailed(false);
         setBatchError(null);
         setUploadPhase('idle');
         setUploadResult(null);
+        setUploadProgress(null);
         setIsDragOver(false);
-        slotIdCounter = 0;
+        needsFinalizationReconcileRef.current = false;
+        slotIdCounterRef.current = 0;
       }
     }
   }, [open]);
 
-  const addFiles = useCallback((incomingFiles: FileList | File[]): void => {
-    setBatchError(null);
-    const incoming = Array.from(incomingFiles);
-
-    setSlots((prev) => {
-      // De-duplicate by name+size fingerprint to prevent duplicate selections
-      const existingFingerprints = new Set(prev.map((s) => `${s.file.name}:${s.file.size}`));
-
-      const toAdd: UploadSlot[] = [];
-      for (const file of incoming) {
-        const fp = `${file.name}:${file.size}`;
-        if (existingFingerprints.has(fp)) {
-          continue; // Skip already-selected file
-        }
-        existingFingerprints.add(fp);
-
-        const validationError = validateUploadFile(file) ?? undefined;
-        toAdd.push({
-          slotId: nextSlotId(),
-          file,
-          status: validationError ? 'invalid' : 'pending',
-          validationError,
+  const tryFinalizeBatch = useCallback(
+    async (targetBatchId: string, checkServerFirst = false): Promise<boolean> => {
+      if (!isValidBatchIdentifier(targetBatchId)) {
+        needsFinalizationReconcileRef.current = false;
+        setBatchFinalized(false);
+        throw new ApiError({
+          status: 400,
+          code: 'invalid_request',
+          message: 'A valid batch identifier is required to finalize the upload batch.',
         });
       }
 
-      const next = [...prev, ...toAdd];
-
-      // Check total batch size after adding
-      const validCount = next.filter((s) => s.status !== 'invalid').length;
-      if (validCount > UPLOAD_MAX_FILES) {
-        setBatchError(
-          `You can upload at most ${UPLOAD_MAX_FILES} files per batch. Remove some files before uploading.`,
-        );
+      if (checkServerFirst) {
+        try {
+          const status = await getResumeBatchStatus(requisitionId, targetBatchId);
+          if (status.id === targetBatchId && status.isOpen === false) {
+            needsFinalizationReconcileRef.current = false;
+            setBatchFinalized(true);
+            setBatchError(null);
+            setCloseFinalizeFailed(false);
+            return true;
+          }
+        } catch (statusErr) {
+          if (
+            isApiError(statusErr) &&
+            (statusErr.status === 400 ||
+              statusErr.status === 401 ||
+              statusErr.status === 403 ||
+              statusErr.status === 404)
+          ) {
+            throw statusErr;
+          }
+        }
       }
 
-      return next;
-    });
-  }, []);
+      try {
+        const finalized = await finalizeResumeBatch(requisitionId, targetBatchId);
+        if (!finalized || finalized.id !== targetBatchId || finalized.isOpen !== false) {
+          throw new ApiError({
+            status: 409,
+            code: 'batch_not_finalized',
+            message: 'The server did not confirm that the batch was finalized. Please retry.',
+          });
+        }
+        needsFinalizationReconcileRef.current = false;
+        setBatchFinalized(true);
+        setBatchError(null);
+        setCloseFinalizeFailed(false);
+        return true;
+      } catch (finalizeErr) {
+        const mayHaveCompleted =
+          !isApiError(finalizeErr) ||
+          (finalizeErr.code !== 'invalid_response_format' &&
+            (finalizeErr.status === 0 ||
+              finalizeErr.code === 'network_error' ||
+              finalizeErr.status >= 500));
+
+        if (mayHaveCompleted) {
+          try {
+            const status = await getResumeBatchStatus(requisitionId, targetBatchId);
+            if (status.id === targetBatchId && status.isOpen === false) {
+              needsFinalizationReconcileRef.current = false;
+              setBatchFinalized(true);
+              setBatchError(null);
+              setCloseFinalizeFailed(false);
+              return true;
+            }
+          } catch {
+            // Reconciliation failed or batch remains open — surface the original finalization error.
+          }
+        }
+
+        needsFinalizationReconcileRef.current = true;
+        setBatchFinalized(false);
+        throw finalizeErr;
+      }
+    },
+    [requisitionId],
+  );
+
+  const addFiles = useCallback(
+    (incomingFiles: FileList | File[]): void => {
+      setBatchError(null);
+      const incoming = Array.from(incomingFiles);
+
+      setSlots((prev) => {
+        // Track existing File references to prevent adding the exact same file instance twice
+        const existingFileSet = new Set(prev.map((s) => s.file));
+
+        const toAdd: UploadSlot[] = [];
+        for (const file of incoming) {
+          if (existingFileSet.has(file)) {
+            continue;
+          }
+          existingFileSet.add(file);
+
+          const validationError = validateUploadFile(file) ?? undefined;
+          toAdd.push({
+            slotId: nextSlotId(),
+            file,
+            status: validationError ? 'invalid' : 'pending',
+            validationError,
+          });
+        }
+
+        const next = [...prev, ...toAdd];
+
+        // Check total batch size after adding
+        const validCount = next.filter((s) => s.status !== 'invalid').length;
+        if (validCount > UPLOAD_MAX_FILES) {
+          setBatchError(
+            `You can upload at most ${UPLOAD_MAX_FILES} files per batch. Remove some files before uploading.`,
+          );
+        } else {
+          const totalBytes = next.reduce((acc, s) => acc + s.file.size, 0);
+          if (totalBytes > UPLOAD_MAX_BATCH_BYTES) {
+            setBatchError(
+              'Total batch size exceeds 1 GB limit. Remove some files before uploading.',
+            );
+          }
+        }
+
+        return next;
+      });
+    },
+    [nextSlotId],
+  );
 
   const handleFileInputChange = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>): void => {
@@ -326,28 +444,52 @@ export function ResumeUploadDialog({
     );
 
     try {
-      const filesToUpload = pendingSlots.map((s) => s.file);
-      const result = await uploadResumes(requisitionId, filesToUpload);
+      const filesToUpload = pendingSlots.map((s) => {
+        (s.file as File & { clientFileId?: string }).clientFileId = s.slotId;
+        return s.file;
+      });
+      const pendingSlotIds = new Set(pendingSlots.map((s) => s.slotId));
+      const hasUnresolvedOtherSlots = slots.some(
+        (s) =>
+          !pendingSlotIds.has(s.slotId) &&
+          (s.status === 'invalid' || s.status === 'error' || s.status === 'rejected'),
+      );
+      const shouldFinalize = !hasUnresolvedOtherSlots;
 
+      const result = await uploadResumes(requisitionId, filesToUpload, {
+        onProgress: (progress) => {
+          setUploadProgress(progress);
+        },
+        isFinal: shouldFinalize,
+        ...(activeBatchId ? { batchId: activeBatchId } : {}),
+      });
+
+      // Commit upload results & slot statuses immediately so a follow-up finalization
+      // failure never resets accepted slots to pending or triggers duplicate uploads.
       setUploadResult(result);
       setUploadPhase('done');
 
-      // Map server results back to slots by filename
+      // Map server results back to slots by clientFileId first, fallback to filename
       setSlots((prev) =>
         prev.map((slot) => {
           if (slot.status !== 'uploading') {
             return slot;
           }
-          const name = slot.file.name;
-          const accepted = result.accepted.find((a) => a.fileName === name);
+          const accepted = result.accepted.find((a) =>
+            a.clientFileId ? a.clientFileId === slot.slotId : a.fileName === slot.file.name,
+          );
           if (accepted) {
             return { ...slot, status: 'accepted' as const, serverResult: accepted };
           }
-          const duplicate = result.duplicates.find((d) => d.fileName === name);
+          const duplicate = result.duplicates.find((d) =>
+            d.clientFileId ? d.clientFileId === slot.slotId : d.fileName === slot.file.name,
+          );
           if (duplicate) {
             return { ...slot, status: 'duplicate' as const, serverResult: duplicate };
           }
-          const rejected = result.rejected.find((r) => r.fileName === name);
+          const rejected = result.rejected.find((r) =>
+            r.clientFileId ? r.clientFileId === slot.slotId : r.fileName === slot.file.name,
+          );
           if (rejected) {
             return { ...slot, status: 'rejected' as const, serverResult: rejected };
           }
@@ -363,55 +505,248 @@ export function ResumeUploadDialog({
       if (result.acceptedCount > 0) {
         onUploadSuccess(result.accepted, result);
       }
-    } catch (error) {
-      setUploadPhase('idle');
-      setBatchError(resolveUploadErrorMessage(error));
 
-      // Revert uploading slots to pending so they can be retried
-      setSlots((prev) =>
-        prev.map((s) => (s.status === 'uploading' ? { ...s, status: 'pending' as const } : s)),
-      );
+      const returnedInvalidBatchId =
+        result.batchId !== null && !isValidBatchIdentifier(result.batchId);
+      const missingBatchIdForAccepted =
+        result.acceptedCount > 0 && !isValidBatchIdentifier(result.batchId) && !activeBatchId;
+
+      if (returnedInvalidBatchId || missingBatchIdForAccepted) {
+        setBatchFinalized(false);
+        setBatchError(
+          'The server returned a missing or malformed batch identifier. Batch finalization could not be verified.',
+        );
+        return;
+      }
+
+      const resolvedBatchId =
+        (isValidBatchIdentifier(result.batchId) ? result.batchId.trim() : null) ?? activeBatchId;
+
+      if (resolvedBatchId) {
+        setActiveBatchId(resolvedBatchId);
+        if (shouldFinalize) {
+          if (result.batchId === null && activeBatchId) {
+            setFinalizingBatch(true);
+            try {
+              await tryFinalizeBatch(activeBatchId, needsFinalizationReconcileRef.current);
+            } catch (finalizeError) {
+              setBatchFinalized(false);
+              setBatchError(resolveUploadErrorMessage(finalizeError));
+            } finally {
+              setFinalizingBatch(false);
+            }
+          } else {
+            needsFinalizationReconcileRef.current = false;
+            setBatchFinalized(true);
+            setCloseFinalizeFailed(false);
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof UploadChunkError) {
+        if (isValidBatchIdentifier(error.batchId)) {
+          setActiveBatchId(error.batchId.trim());
+        }
+        setBatchFinalized(false);
+        setUploadPhase('done');
+        setBatchError(error.message);
+
+        // Update slots: preserve accepted/duplicates/rejected from previous chunks
+        setSlots((prev) =>
+          prev.map((slot) => {
+            if (slot.status !== 'uploading') {
+              return slot;
+            }
+            const accepted = error.aggregateAccepted.find((a) =>
+              a.clientFileId ? a.clientFileId === slot.slotId : a.fileName === slot.file.name,
+            );
+            if (accepted) {
+              return { ...slot, status: 'accepted' as const, serverResult: accepted };
+            }
+            const duplicate = error.aggregateDuplicates.find((d) =>
+              d.clientFileId ? d.clientFileId === slot.slotId : d.fileName === slot.file.name,
+            );
+            if (duplicate) {
+              return { ...slot, status: 'duplicate' as const, serverResult: duplicate };
+            }
+            const rejected = error.aggregateRejected.find((r) =>
+              r.clientFileId ? r.clientFileId === slot.slotId : r.fileName === slot.file.name,
+            );
+            if (rejected) {
+              return { ...slot, status: 'rejected' as const, serverResult: rejected };
+            }
+            return {
+              ...slot,
+              status: 'error' as const,
+              errorMessage: error.message || 'Chunk upload failed',
+            };
+          }),
+        );
+
+        if (error.aggregateAccepted.length > 0) {
+          onUploadSuccess(error.aggregateAccepted, {
+            batchId: error.batchId,
+            totalFiles: slots.length,
+            acceptedCount: error.aggregateAccepted.length,
+            duplicateCount: error.aggregateDuplicates.length,
+            rejectedCount: error.aggregateRejected.length,
+            accepted: error.aggregateAccepted,
+            duplicates: error.aggregateDuplicates,
+            rejected: error.aggregateRejected,
+          });
+        }
+      } else {
+        setUploadPhase('idle');
+        setBatchError(resolveUploadErrorMessage(error));
+
+        // Revert uploading slots to pending so they can be retried
+        setSlots((prev) =>
+          prev.map((s) => (s.status === 'uploading' ? { ...s, status: 'pending' as const } : s)),
+        );
+      }
     } finally {
       uploadingRef.current = false;
+      setUploadProgress(null);
     }
-  }, [slots, requisitionId, onUploadSuccess]);
+  }, [slots, requisitionId, onUploadSuccess, activeBatchId, tryFinalizeBatch]);
 
-  const handleClose = useCallback((): void => {
-    if (uploadingRef.current) {
-      // Do not close while upload is in-flight
+  const handleRetryFailed = useCallback((): void => {
+    if (batchFinalized) {
+      // Previous batch was already closed on the server (e.g. rejected files); start a fresh batch on retry
+      setActiveBatchId(null);
+      setBatchFinalized(false);
+    }
+    setCloseFinalizeFailed(false);
+    setSlots((prev) =>
+      prev.map((s) => {
+        if (s.status === 'rejected' || s.status === 'error') {
+          return {
+            ...s,
+            status: 'pending' as const,
+            errorMessage: undefined,
+            serverResult: undefined,
+          };
+        }
+        return s;
+      }),
+    );
+    setUploadPhase('idle');
+    setBatchError(null);
+  }, [batchFinalized]);
+
+  const handleFinalizeOpenBatch = useCallback(async (): Promise<void> => {
+    if (!activeBatchId || batchFinalized || uploadingRef.current || finalizingBatch) {
       return;
     }
+    setFinalizingBatch(true);
+    setBatchError(null);
+    try {
+      await tryFinalizeBatch(activeBatchId, needsFinalizationReconcileRef.current);
+    } catch (error) {
+      setBatchFinalized(false);
+      setBatchError(resolveUploadErrorMessage(error));
+    } finally {
+      setFinalizingBatch(false);
+    }
+  }, [activeBatchId, batchFinalized, finalizingBatch, tryFinalizeBatch]);
+
+  const handleClose = useCallback(async (): Promise<void> => {
+    if (uploadingRef.current || finalizingBatch) {
+      // Do not close while upload or finalization is in-flight
+      return;
+    }
+    if (activeBatchId && !batchFinalized) {
+      setFinalizingBatch(true);
+      setBatchError(null);
+      try {
+        await tryFinalizeBatch(activeBatchId, needsFinalizationReconcileRef.current);
+      } catch (error) {
+        setBatchFinalized(false);
+        setCloseFinalizeFailed(true);
+        setBatchError(
+          `${resolveUploadErrorMessage(error)} You can retry "Finalize batch" or click "Close without finalizing".`,
+        );
+        return;
+      } finally {
+        setFinalizingBatch(false);
+      }
+    }
     onClose();
-  }, [onClose]);
+  }, [activeBatchId, batchFinalized, finalizingBatch, onClose, tryFinalizeBatch]);
 
   // Derived state
   const pendingSlots = slots.filter((s) => s.status === 'pending');
   const invalidSlots = slots.filter((s) => s.status === 'invalid');
+  const failedSlots = slots.filter((s) => s.status === 'rejected' || s.status === 'error');
   const hasValidPending = pendingSlots.length > 0;
+  const hasFailedSlots = failedSlots.length > 0;
   const isUploading = uploadPhase === 'uploading';
   const isDone = uploadPhase === 'done';
+
+  const totalBatchBytes = slots.reduce((acc, s) => acc + s.file.size, 0);
 
   const canUpload =
     hasValidPending &&
     !isUploading &&
     !isDone &&
     invalidSlots.length === 0 &&
-    pendingSlots.length <= UPLOAD_MAX_FILES;
+    pendingSlots.length <= UPLOAD_MAX_FILES &&
+    totalBatchBytes <= UPLOAD_MAX_BATCH_BYTES;
 
   const maxMbLabel = `${UPLOAD_MAX_FILE_BYTES / (1024 * 1024)} MB`;
 
   return (
     <Dialog
       open={open}
-      onClose={handleClose}
+      onClose={() => {
+        void handleClose();
+      }}
       title="Upload resumes"
       description={`Add up to ${UPLOAD_MAX_FILES} ${UPLOAD_ACCEPTED_TYPES_LABEL} files (max ${maxMbLabel} each) for processing.`}
       size="lg"
       footer={
         <>
-          <Button variant="secondary" onClick={handleClose} disabled={isUploading}>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              void handleClose();
+            }}
+            disabled={isUploading || finalizingBatch}
+          >
             {isDone ? 'Close' : 'Cancel'}
           </Button>
+          {isDone && hasFailedSlots ? (
+            <Button variant="secondary" onClick={handleRetryFailed} disabled={finalizingBatch}>
+              Retry failed ({failedSlots.length})
+            </Button>
+          ) : null}
+          {isDone && closeFinalizeFailed && activeBatchId && !batchFinalized ? (
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setCloseFinalizeFailed(false);
+                onClose();
+              }}
+              disabled={finalizingBatch}
+            >
+              Close without finalizing
+            </Button>
+          ) : null}
+          {isDone &&
+          activeBatchId &&
+          !batchFinalized &&
+          (!hasFailedSlots || closeFinalizeFailed) ? (
+            <Button
+              variant="primary"
+              onClick={() => {
+                void handleFinalizeOpenBatch();
+              }}
+              loading={finalizingBatch}
+              disabled={finalizingBatch}
+            >
+              Finalize batch
+            </Button>
+          ) : null}
           {!isDone ? (
             <Button
               variant="primary"
@@ -441,6 +776,29 @@ export function ResumeUploadDialog({
       }
     >
       <div className="space-y-4">
+        {/* Progress Bar during in-flight upload */}
+        {isUploading && uploadProgress ? (
+          <div
+            className="space-y-1.5 rounded-lg border border-border bg-surface-muted/40 p-3"
+            role="progressbar"
+            aria-valuenow={uploadProgress.percent}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div className="flex justify-between text-xs font-medium text-fg">
+              <span>
+                Uploading {uploadProgress.uploadedCount} of {uploadProgress.totalCount} files…
+              </span>
+              <span>{uploadProgress.percent}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-surface-raised">
+              <div
+                className="h-full bg-accent transition-all duration-300"
+                style={{ width: `${uploadProgress.percent}%` }}
+              />
+            </div>
+          </div>
+        ) : null}
         {/* Drop zone */}
         {!isDone ? (
           <div
@@ -557,7 +915,24 @@ export function ResumeUploadDialog({
                   consent before text extraction begins.
                 </li>
               )}
+              {batchFinalized && activeBatchId ? (
+                <li className="font-medium text-success">Batch finalized for processing.</li>
+              ) : activeBatchId && !batchFinalized ? (
+                <li className="font-medium text-warning">
+                  {hasFailedSlots
+                    ? 'Partial batch open — retry remaining failed files or finalize to close the batch.'
+                    : 'Batch open and pending finalization — retry "Finalize batch" to queue processing.'}
+                </li>
+              ) : null}
             </ul>
+          </div>
+        ) : isDone && batchFinalized && activeBatchId ? (
+          <div
+            role="status"
+            className="flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-4 py-3 text-xs font-medium text-success"
+          >
+            <Icon icon={CheckCircle2} size="sm" className="shrink-0" />
+            <span>Batch finalized for processing.</span>
           </div>
         ) : null}
 

@@ -53,7 +53,8 @@ export type ActivityKind =
   | 'interview_proposed'
   | 'review_recorded'
   | 'assessment_complete'
-  | 'submitted';
+  | 'submitted'
+  | 'general';
 
 export interface ActivityItem {
   id: string;
@@ -63,12 +64,76 @@ export interface ActivityItem {
   createdAt: string;
 }
 
-export interface DashboardData {
-  /** Reference instant used for relative times. */
+export interface RecruiterDashboardMetrics {
+  totalActiveRequisitions: number;
+  requisitionsRequiringAttention: number;
+  candidatesInPipeline: number;
+  candidatesAwaitingAssessment: number;
+  candidatesAwaitingReview: number;
+  pendingClientDecisions: number;
+  upcomingConfirmedInterviews: number;
+}
+
+export interface ClientHiringManagerMetrics {
+  pendingCandidateReviews: number;
+  submittedAwaitingDecisions: number;
+  upcomingConfirmedInterviews: number;
+  recentDecisionsCount: number;
+  activeRequisitionsCount: number;
+}
+
+export interface ClientCandidateReviewItem {
+  submissionId: string;
+  candidateCode: string;
+  requisitionId: string;
+  requisitionTitle: string;
+  clientId: string;
+  clientName: string;
+  submittedAt: string;
+  advisoryScore: number | null;
+  criteriaCount: number | null;
+  status: 'SUBMITTED' | 'INTERVIEW_PROPOSED' | 'CLIENT_SHORTLISTED' | 'CLIENT_REJECTED';
+}
+
+export interface ClientRecentDecisionItem {
+  id: string;
+  decision: 'SHORTLIST' | 'REJECT' | 'PROPOSE_INTERVIEW';
+  reason: string | null;
+  candidateCode: string;
+  requisitionTitle: string;
+  createdAt: string;
+}
+
+export interface ClientRequisitionSummary {
+  id: string;
+  title: string;
+  clientId: string;
+  clientName: string;
+  status: 'OPEN' | 'PAUSED';
+  activeSubmissionsCount: number;
+  interviewsCount: number;
+}
+
+export interface RecruiterDashboardData {
+  role: 'RECRUITER';
   generatedAt: string;
+  metrics: RecruiterDashboardMetrics;
   pipeline: PipelineStage[];
   requisitions: RequisitionSummary[];
   reviewQueue: ReviewQueueItem[];
   interviews: UpcomingInterview[];
   activity: ActivityItem[];
 }
+
+export interface ClientDashboardData {
+  role: 'CLIENT_HIRING_MANAGER';
+  generatedAt: string;
+  metrics: ClientHiringManagerMetrics;
+  pendingReviews: ClientCandidateReviewItem[];
+  upcomingInterviews: UpcomingInterview[];
+  recentDecisions: ClientRecentDecisionItem[];
+  activeRequisitions: ClientRequisitionSummary[];
+  activity: ActivityItem[];
+}
+
+export type DashboardData = RecruiterDashboardData | ClientDashboardData;

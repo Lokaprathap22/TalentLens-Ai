@@ -1,4 +1,4 @@
-import { Check, Copy, Link as LinkIcon, ShieldCheck } from 'lucide-react';
+import { Mail, ShieldCheck } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import type { FormEvent } from 'react';
 
@@ -46,14 +46,12 @@ export function ConsentInvitationModal({
   const [status, setStatus] = useState<'idle' | 'submitting' | 'success' | 'error'>('idle');
   const [invitation, setInvitation] = useState<ConsentInvitationDto | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
 
   const handleReset = useCallback(() => {
     setEmail('');
     setStatus('idle');
     setInvitation(null);
     setError(null);
-    setCopied(false);
   }, []);
 
   const handleClose = useCallback(() => {
@@ -86,25 +84,14 @@ export function ConsentInvitationModal({
     [requisitionId, candidateId, email, onSuccess],
   );
 
-  const handleCopy = useCallback(async () => {
-    if (!invitation?.invitationUrl) return;
-    try {
-      await navigator.clipboard.writeText(invitation.invitationUrl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Fallback
-    }
-  }, [invitation]);
-
   return (
     <Dialog
       open={open}
       onClose={handleClose}
-      title={status === 'success' ? 'Consent Invitation Link' : 'Issue Consent Invitation'}
+      title={status === 'success' ? 'Consent Invitation Dispatched' : 'Issue Consent Invitation'}
       description={
         status === 'success'
-          ? `Consent invitation ready for candidate ${candidateCode}.`
+          ? `Consent invitation dispatched for candidate ${candidateCode}.`
           : `Create a single-use consent invitation for candidate ${candidateCode}.`
       }
       size="md"
@@ -156,48 +143,32 @@ export function ConsentInvitationModal({
               </div>
             </div>
 
-            <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-fg flex items-center gap-1.5">
-                <LinkIcon className="h-3.5 w-3.5 text-accent" />
-                Secure Candidate Invitation Link
-              </label>
-              <div className="flex items-center gap-2">
-                <Input
-                  readOnly
-                  value={invitation.invitationUrl ?? ''}
-                  className="font-mono text-xs bg-surface-muted select-all"
-                  aria-label="Invitation URL"
-                />
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={handleCopy}
-                  className="shrink-0 flex items-center gap-1 text-xs"
-                >
-                  {copied ? (
-                    <>
-                      <Check className="h-3.5 w-3.5 text-success" />
-                      <span className="text-success font-medium">Copied!</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-3.5 w-3.5" />
-                      <span>Copy Link</span>
-                    </>
-                  )}
-                </Button>
+            <div className="rounded-md border border-border bg-bg-subtle p-3.5 space-y-2 text-xs">
+              <div className="flex items-center gap-1.5 font-semibold text-fg">
+                <Mail className="h-4 w-4 text-accent" />
+                <span>Email Invitation Dispatched</span>
+              </div>
+              <p className="text-fg-subtle">
+                A secure, single-use authorization link has been sent directly to{' '}
+                <span className="font-semibold text-fg">{invitation.email}</span>.
+              </p>
+              <div className="flex items-center justify-between pt-1 border-t border-border/50 text-[11px] text-fg-muted">
+                <span>Delivery Status:</span>
+                <span className="font-medium text-fg capitalize">
+                  {invitation.deliveryStatus.toLowerCase()}
+                </span>
               </div>
             </div>
 
-            <div className="rounded border border-border p-3 text-xs text-fg-subtle space-y-1">
+            <div className="rounded border border-border p-3 text-xs text-fg-subtle space-y-1 bg-surface-muted/50">
               <div className="flex items-center gap-1 font-semibold text-fg">
                 <ShieldCheck className="h-4 w-4 text-accent" />
-                Manual Link Sharing
+                Privacy &amp; Security Policy
               </div>
               <p>
-                Email delivery is disabled in this environment. Copy the secure link above and share
-                it directly with the candidate. Opening the link allows them to review the screening
-                disclosure and grant authorization.
+                To protect candidate privacy and prevent unauthorized token delegation,
+                authorization links are delivered solely to the candidate's verified email outbox
+                and cannot be copied or viewed by recruiters.
               </p>
             </div>
           </div>

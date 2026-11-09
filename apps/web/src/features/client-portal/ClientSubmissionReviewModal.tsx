@@ -22,6 +22,7 @@ import { Card } from '../../components/ui/card.js';
 import { Skeleton } from '../../components/ui/states.js';
 import type {
   ClientDecisionType,
+  ClientFeedbackHistoryDecision,
   ClientFeedbackInput,
   ClientInterviewProposalInput,
   ClientSubmissionDetail,
@@ -94,6 +95,29 @@ function getStatusBadge(status: ClientSubmissionStatus): React.JSX.Element {
   }
 }
 
+function getFeedbackDecisionBadge(decision: ClientFeedbackHistoryDecision): React.JSX.Element {
+  switch (decision) {
+    case 'SHORTLIST':
+      return (
+        <Badge tone="success" dot>
+          Shortlisted
+        </Badge>
+      );
+    case 'PROPOSE_INTERVIEW':
+      return (
+        <Badge tone="accent" dot>
+          Interview Proposed
+        </Badge>
+      );
+    case 'REJECT':
+      return (
+        <Badge tone="neutral" dot>
+          Declined
+        </Badge>
+      );
+  }
+}
+
 function getInterviewStatusTone(
   status: string,
 ): 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'accent' {
@@ -132,8 +156,19 @@ function formatInterviewWindow(startIso: string, endIso: string, timezone: strin
   }
 }
 
-export function ClientSubmissionReviewModal({
-  isOpen,
+export function ClientSubmissionReviewModal(
+  props: ClientSubmissionReviewModalProps,
+): React.JSX.Element | null {
+  if (!props.isOpen) return null;
+  return (
+    <ClientSubmissionReviewModalContent
+      key={props.detail?.submissionId ?? '__loading__'}
+      {...props}
+    />
+  );
+}
+
+function ClientSubmissionReviewModalContent({
   onClose,
   detail,
   isLoading,
@@ -146,7 +181,7 @@ export function ClientSubmissionReviewModal({
   onRejectInterview,
   isInterviewLoading = false,
   interviewError = null,
-}: ClientSubmissionReviewModalProps): React.JSX.Element | null {
+}: ClientSubmissionReviewModalProps): React.JSX.Element {
   const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
   const getDefaultDateTime = (): string => {
@@ -181,10 +216,19 @@ export function ClientSubmissionReviewModal({
   const [rejectionReason, setRejectionReason] = useState<string>('');
   const [rejectionValidationError, setRejectionValidationError] = useState<string | null>(null);
 
-  if (!isOpen) return null;
+  const canRecordHiringDecision =
+    detail?.status === 'SUBMITTED' || detail?.status === 'INTERVIEW_PROPOSED';
+  const hasCompletedInterview = Boolean(
+    detail?.interviews?.some((iv) => iv.status === 'COMPLETED'),
+  );
+  const canModifyInterviews =
+    detail !== null && detail.status !== 'WITHDRAWN' && detail.status !== 'CLIENT_REJECTED';
 
   const handleSubmit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
+    if (isSubmittingFeedback || !canRecordHiringDecision) {
+      return;
+    }
     setValidationError(null);
 
     if (!decision) {
@@ -207,6 +251,8 @@ export function ClientSubmissionReviewModal({
         decision,
         ...(reason.trim() ? { reason: reason.trim() } : {}),
       });
+      setDecision(null);
+      setReason('');
       setSuccessMessage(
         'Your feedback has been successfully recorded and shared with the recruiter.',
       );
@@ -225,9 +271,9 @@ export function ClientSubmissionReviewModal({
       aria-labelledby="client-review-title"
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs overflow-y-auto"
     >
-      <div className="relative w-full max-w-3xl rounded-xl border border-border bg-bg-surface shadow-2xl my-8 overflow-hidden flex flex-col max-h-[90vh]">
+      <div className="relative w-full max-w-3xl rounded-xl border border-border bg-surface shadow-2xl my-8 overflow-hidden flex flex-col max-h-[90vh]">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-surface-raised">
+        <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-surface">
           <div>
             <div className="flex items-center gap-2">
               <h2 id="client-review-title" className="text-base font-semibold text-fg">
@@ -285,7 +331,7 @@ export function ClientSubmissionReviewModal({
               </div>
 
               {/* Advisory Scorecard Assessment Card */}
-              <Card className="p-5 border-border bg-surface-raised space-y-4">
+              <Card className="p-5 border-border bg-surface space-y-4">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border-b border-border/60 pb-3">
                   <div className="flex items-center gap-2">
                     <Award className="h-4 w-4 text-accent" />
@@ -316,7 +362,7 @@ export function ClientSubmissionReviewModal({
                     {detail.assessment.criteria.map((criterion, idx) => (
                       <div
                         key={idx}
-                        className="rounded-lg border border-border bg-bg-surface p-3.5 space-y-2 text-xs"
+                        className="rounded-lg border border-border bg-surface p-3.5 space-y-2 text-xs"
                       >
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-2">
@@ -361,7 +407,7 @@ export function ClientSubmissionReviewModal({
 
               {/* Feedback History (if previously recorded) */}
               {detail.feedbackHistory && detail.feedbackHistory.length > 0 ? (
-                <Card className="p-5 border-border bg-surface-raised space-y-3">
+                <Card className="p-5 border-border bg-surface space-y-3">
                   <div className="flex items-center gap-2">
                     <Clock className="h-4 w-4 text-fg-subtle" />
                     <h3 className="text-sm font-semibold text-fg">Recorded Feedback History</h3>
@@ -371,12 +417,10 @@ export function ClientSubmissionReviewModal({
                     {detail.feedbackHistory.map((fb) => (
                       <div
                         key={fb.id}
-                        className="rounded-lg border border-border bg-bg-surface p-3 text-xs space-y-1.5"
+                        className="rounded-lg border border-border bg-surface p-3 text-xs space-y-1.5"
                       >
                         <div className="flex items-center justify-between">
-                          <Badge tone={fb.decision === 'SHORTLIST' ? 'success' : 'neutral'} dot>
-                            {fb.decision === 'SHORTLIST' ? 'Shortlisted' : 'Declined'}
-                          </Badge>
+                          {getFeedbackDecisionBadge(fb.decision)}
                           <span className="text-fg-subtle">{formatDate(fb.createdAt)}</span>
                         </div>
                         {fb.reason ? (
@@ -406,15 +450,27 @@ export function ClientSubmissionReviewModal({
                 </div>
               ) : null}
 
-              {/* Feedback Form (active only when SUBMITTED) */}
-              {detail.status === 'SUBMITTED' ? (
-                <Card className="p-5 border-border bg-surface-raised space-y-4">
+              {/* Persistent feedback success confirmation banner (kept visible after transition to terminal status) */}
+              {successMessage ? (
+                <div
+                  role="status"
+                  className="rounded-lg border border-success/30 bg-success/5 p-3 text-xs text-success flex items-center gap-2"
+                >
+                  <CheckCircle2 className="h-4 w-4 shrink-0" />
+                  <span>{successMessage}</span>
+                </div>
+              ) : null}
+
+              {/* Feedback Form (enabled for active pending review and post-interview states) */}
+              {canRecordHiringDecision ? (
+                <Card className="p-5 border-border bg-surface space-y-4">
                   <div className="flex items-center justify-between border-b border-border/60 pb-3">
                     <div>
                       <h3 className="text-sm font-semibold text-fg">Record Hiring Decision</h3>
                       <p className="text-xs text-fg-subtle mt-0.5">
-                        Indicate whether you wish to advance this candidate to interview or decline
-                        the submission.
+                        {detail.status === 'INTERVIEW_PROPOSED' && hasCompletedInterview
+                          ? 'Interview has completed. Record your final decision to shortlist or decline this candidate.'
+                          : 'Indicate whether you wish to shortlist this candidate or decline the submission.'}
                       </p>
                     </div>
                   </div>
@@ -424,14 +480,15 @@ export function ClientSubmissionReviewModal({
                     <div className="grid grid-cols-2 gap-3">
                       <button
                         type="button"
+                        disabled={isSubmittingFeedback}
                         onClick={() => {
                           setDecision('SHORTLIST');
                           setValidationError(null);
                         }}
-                        className={`flex items-center justify-center gap-2 rounded-lg border p-3 text-xs font-semibold transition-all ${
+                        className={`flex items-center justify-center gap-2 rounded-lg border p-3 text-xs font-semibold transition-all disabled:opacity-50 ${
                           decision === 'SHORTLIST'
                             ? 'border-success bg-success/15 text-success ring-1 ring-success'
-                            : 'border-border bg-bg-surface text-fg hover:border-success/50 hover:bg-surface-muted'
+                            : 'border-border bg-surface text-fg hover:border-success/50 hover:bg-surface-muted'
                         }`}
                       >
                         <ThumbsUp className="h-4 w-4" />
@@ -440,14 +497,15 @@ export function ClientSubmissionReviewModal({
 
                       <button
                         type="button"
+                        disabled={isSubmittingFeedback}
                         onClick={() => {
                           setDecision('REJECT');
                           setValidationError(null);
                         }}
-                        className={`flex items-center justify-center gap-2 rounded-lg border p-3 text-xs font-semibold transition-all ${
+                        className={`flex items-center justify-center gap-2 rounded-lg border p-3 text-xs font-semibold transition-all disabled:opacity-50 ${
                           decision === 'REJECT'
                             ? 'border-danger bg-danger/15 text-danger ring-1 ring-danger'
-                            : 'border-border bg-bg-surface text-fg hover:border-danger/50 hover:bg-surface-muted'
+                            : 'border-border bg-surface text-fg hover:border-danger/50 hover:bg-surface-muted'
                         }`}
                       >
                         <ThumbsDown className="h-4 w-4" />
@@ -469,6 +527,7 @@ export function ClientSubmissionReviewModal({
                       </label>
                       <textarea
                         id="client-reason"
+                        disabled={isSubmittingFeedback}
                         value={reason}
                         onChange={(e) => {
                           setReason(e.target.value);
@@ -481,7 +540,7 @@ export function ClientSubmissionReviewModal({
                             ? 'Please provide specific job-related reasons for declining (e.g., requires more hands-on experience with Kubernetes)...'
                             : 'Add any specific feedback or notes for the recruiter...'
                         }
-                        className="w-full rounded-md border border-border bg-bg-surface p-2.5 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                        className="w-full rounded-md border border-border bg-surface p-2.5 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
                       />
                     </div>
 
@@ -521,17 +580,6 @@ export function ClientSubmissionReviewModal({
                       </div>
                     ) : null}
 
-                    {/* Success message */}
-                    {successMessage ? (
-                      <div
-                        role="status"
-                        className="rounded-lg border border-success/30 bg-success/5 p-3 text-xs text-success flex items-center gap-2"
-                      >
-                        <CheckCircle2 className="h-4 w-4 shrink-0" />
-                        <span>{successMessage}</span>
-                      </div>
-                    ) : null}
-
                     {/* Submit button */}
                     <div className="flex items-center justify-end gap-3 pt-2">
                       <Button
@@ -562,11 +610,21 @@ export function ClientSubmissionReviewModal({
                     </div>
                   </form>
                 </Card>
+              ) : detail.status === 'CLIENT_SHORTLISTED' || detail.status === 'CLIENT_REJECTED' ? (
+                <div className="rounded-lg border border-border bg-surface-muted px-4 py-3 text-xs text-fg-subtle flex items-center justify-between gap-2">
+                  <div>
+                    <strong className="text-fg">Final Hiring Decision Recorded:</strong>{' '}
+                    {detail.status === 'CLIENT_SHORTLISTED'
+                      ? 'This candidate has been shortlisted.'
+                      : 'This candidate submission has been declined.'}
+                  </div>
+                  {getStatusBadge(detail.status)}
+                </div>
               ) : null}
 
               {/* Interview Coordination & Proposals */}
               {detail.status !== 'WITHDRAWN' ? (
-                <Card className="p-5 border-border bg-surface-raised space-y-4">
+                <Card className="p-5 border-border bg-surface space-y-4">
                   <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-border/60 pb-3">
                     <div>
                       <h3 className="text-sm font-semibold text-fg flex items-center gap-2">
@@ -577,7 +635,7 @@ export function ClientSubmissionReviewModal({
                         Review recruiter proposals or suggest interview time windows directly.
                       </p>
                     </div>
-                    {onProposeInterview && !showProposalForm ? (
+                    {canModifyInterviews && onProposeInterview && !showProposalForm ? (
                       <Button
                         type="button"
                         size="sm"
@@ -638,7 +696,7 @@ export function ClientSubmissionReviewModal({
                             value={interviewDatetime}
                             onChange={(e) => setInterviewDatetime(e.target.value)}
                             required
-                            className="w-full rounded-md border border-border bg-bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
+                            className="w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
                           />
                         </div>
 
@@ -648,7 +706,7 @@ export function ClientSubmissionReviewModal({
                             <select
                               value={interviewDuration}
                               onChange={(e) => setInterviewDuration(Number(e.target.value))}
-                              className="w-full rounded-md border border-border bg-bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
+                              className="w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
                             >
                               <option value={30}>30 mins</option>
                               <option value={45}>45 mins</option>
@@ -661,7 +719,7 @@ export function ClientSubmissionReviewModal({
                             <select
                               value={interviewTimezone}
                               onChange={(e) => setInterviewTimezone(e.target.value)}
-                              className="w-full rounded-md border border-border bg-bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
+                              className="w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
                             >
                               <option value={localTz}>{localTz}</option>
                               <option value="UTC">UTC</option>
@@ -690,7 +748,7 @@ export function ClientSubmissionReviewModal({
                               className={`px-3 py-1 rounded text-xs font-medium border transition-colors ${
                                 interviewFormat === fmt
                                   ? 'border-accent bg-accent/20 text-accent font-semibold'
-                                  : 'border-border bg-bg-surface text-fg-subtle hover:text-fg'
+                                  : 'border-border bg-surface text-fg-subtle hover:text-fg'
                               }`}
                             >
                               {fmt === 'VIDEO' ? 'Video' : fmt === 'PHONE' ? 'Phone' : 'In-person'}
@@ -709,7 +767,7 @@ export function ClientSubmissionReviewModal({
                           onChange={(e) => setInterviewNotes(e.target.value)}
                           maxLength={500}
                           placeholder="e.g. Hiring manager and tech lead will attend..."
-                          className="w-full rounded-md border border-border bg-bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
+                          className="w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg focus:border-accent focus:outline-none"
                         />
                       </div>
 
@@ -790,7 +848,7 @@ export function ClientSubmissionReviewModal({
                         rows={2}
                         maxLength={500}
                         placeholder="e.g. Schedule conflict with client team, requesting an afternoon slot instead..."
-                        className="w-full rounded-md border border-border bg-bg-surface p-2 text-xs text-fg focus:border-danger focus:outline-none"
+                        className="w-full rounded-md border border-border bg-surface p-2 text-xs text-fg focus:border-danger focus:outline-none"
                       />
                       {rejectionValidationError ? (
                         <p className="text-xs text-danger">{rejectionValidationError}</p>
@@ -858,12 +916,12 @@ export function ClientSubmissionReviewModal({
                           </div>
 
                           {iv.reason ? (
-                            <div className="text-[11px] text-fg-subtle italic bg-bg-surface/50 p-2 rounded">
+                            <div className="text-[11px] text-fg-subtle italic bg-surface/50 p-2 rounded">
                               &ldquo;{iv.reason}&rdquo;
                             </div>
                           ) : null}
 
-                          {iv.status === 'PROPOSED' ? (
+                          {canModifyInterviews && iv.status === 'PROPOSED' ? (
                             <div className="flex items-center gap-2 pt-1 border-t border-border/40">
                               {onAcceptInterview ? (
                                 <Button
@@ -905,7 +963,7 @@ export function ClientSubmissionReviewModal({
                       ))}
                     </div>
                   ) : (
-                    <div className="rounded-lg border border-dashed border-border/80 bg-bg-surface/30 p-4 text-center text-xs text-fg-subtle">
+                    <div className="rounded-lg border border-dashed border-border/80 bg-surface/30 p-4 text-center text-xs text-fg-subtle">
                       No interviews scheduled or proposed yet.
                     </div>
                   )}

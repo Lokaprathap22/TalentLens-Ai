@@ -51,6 +51,56 @@ describe('M9.10 Full Core Recruitment Workflow Integration', () => {
       if (url.endsWith('/api/v1/auth/csrf')) {
         return jsonResponse({ csrfToken: 'mock-csrf' });
       }
+      if (url.includes('/api/v1/dashboard/summary')) {
+        return jsonResponse({
+          role: 'RECRUITER',
+          generatedAt: '2026-11-06T10:00:00.000Z',
+          metrics: {
+            totalActiveRequisitions: 1,
+            requisitionsRequiringAttention: 0,
+            candidatesInPipeline: 1,
+            candidatesAwaitingAssessment: 0,
+            candidatesAwaitingReview: 1,
+            pendingClientDecisions: 0,
+            upcomingConfirmedInterviews: 0,
+          },
+          pipelineStages: [
+            { key: 'intake', label: 'Intake', count: 0, hint: 'Awaiting assessment' },
+            { key: 'assessed', label: 'Assessed', count: 0, hint: 'Criteria evaluated' },
+            { key: 'review', label: 'Review', count: 1, hint: 'Recruiter verification' },
+            { key: 'shortlisted', label: 'Shortlisted', count: 0, hint: 'Approved for client' },
+            { key: 'client', label: 'Client', count: 0, hint: 'With hiring manager' },
+            { key: 'interview', label: 'Interview', count: 0, hint: 'Confirmed schedule' },
+          ],
+          recentRequisitions: [
+            {
+              id: reqId,
+              title: 'Principal Distributed Systems Engineer',
+              clientName: 'Apex Fintech Solutions',
+              status: 'OPEN',
+              candidatesCount: 1,
+              awaitingReviewCount: 1,
+              withClientCount: 0,
+              updatedAt: '2026-10-05T00:00:00.000Z',
+            },
+          ],
+          reviewQueue: [
+            {
+              candidateId: candId,
+              requisitionId: reqId,
+              candidateCode: 'CAN-8A4F1D92',
+              requisitionTitle: 'Principal Distributed Systems Engineer',
+              assessmentStatus: 'COMPLETE',
+              score: 92,
+              coverage: 95,
+              consent: 'ACTIVE',
+              lastActivityAt: '2026-11-06T09:00:00.000Z',
+            },
+          ],
+          upcomingInterviews: [],
+          recentActivity: [],
+        });
+      }
       if (url.includes('/api/v1/clients')) {
         return jsonResponse({
           clients: [

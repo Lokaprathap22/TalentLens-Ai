@@ -15,11 +15,10 @@ const MOCK_INVITATION: ConsentInvitationDto = {
   status: 'PENDING',
   policyVersion: '1.0.0',
   noticeTextHash: 'hash-abc',
-  deliveryStatus: 'NOT_CONFIGURED',
+  deliveryStatus: 'SENT',
   deliveryError: null,
   expiresAt: '2026-11-13T00:00:00Z',
   createdAt: '2026-11-06T00:00:00Z',
-  invitationUrl: 'https://app.talentlens.ai/consent#token=mock-token-xyz',
 };
 
 describe('ConsentInvitationModal', () => {
@@ -43,7 +42,7 @@ describe('ConsentInvitationModal', () => {
     expect(screen.getByRole('button', { name: /generate invitation/i })).toBeInTheDocument();
   });
 
-  it('submits email and displays invitation link on success', async () => {
+  it('submits email and displays email confirmation notice without leaking bearer link', async () => {
     const createSpy = vi
       .spyOn(consentApi, 'createConsentInvitation')
       .mockResolvedValueOnce(MOCK_INVITATION);
@@ -68,15 +67,20 @@ describe('ConsentInvitationModal', () => {
     fireEvent.click(screen.getByRole('button', { name: /generate invitation/i }));
 
     await waitFor(() => {
-      expect(screen.getByRole('heading', { name: 'Consent Invitation Link' })).toBeInTheDocument();
+      expect(
+        screen.getByRole('heading', { name: 'Consent Invitation Dispatched' }),
+      ).toBeInTheDocument();
     });
 
     expect(createSpy).toHaveBeenCalledWith('req-789', 'cand-456', 'alex@example.com');
     expect(onSuccess).toHaveBeenCalledWith(MOCK_INVITATION);
-    expect(
-      screen.getByDisplayValue('https://app.talentlens.ai/consent#token=mock-token-xyz'),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /copy link/i })).toBeInTheDocument();
+    expect(screen.getByText('Email Invitation Dispatched')).toBeInTheDocument();
+    expect(screen.getAllByText('alex@example.com').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/Privacy & Security Policy/i)).toBeInTheDocument();
+
+    // Verify bearer token / URL copy input is NOT present
+    expect(screen.queryByLabelText(/invitation url/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /copy link/i })).toBeNull();
 
     // Clicking Done calls onClose
     fireEvent.click(screen.getByRole('button', { name: /done/i }));

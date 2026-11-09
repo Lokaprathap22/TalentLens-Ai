@@ -1,7 +1,7 @@
 import { AlertCircle, Eye, EyeOff, Lock, ShieldCheck, Sparkles, Users } from 'lucide-react';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
-import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router';
+import { Link, Navigate, useLocation, useNavigate, useSearchParams } from 'react-router';
 
 import { useAuth } from '../../app/auth.js';
 import { SessionInitializationErrorScreen } from '../../app/protected-route.js';
@@ -380,6 +380,15 @@ function LoginSignInView({
                     </div>
                   )}
                 </Field>
+
+                <div className="flex items-center justify-end">
+                  <Link
+                    to="/reset-password"
+                    className="text-xs font-medium text-accent hover:underline focus:outline-none focus:ring-1 focus:ring-focus"
+                  >
+                    Forgot password?
+                  </Link>
+                </div>
 
                 <div className="pt-2">
                   <Button

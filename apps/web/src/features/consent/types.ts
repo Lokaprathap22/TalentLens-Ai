@@ -17,8 +17,6 @@ export interface ConsentInvitationDto {
   deliveryError: string | null;
   expiresAt: string;
   createdAt: string;
-  invitationUrl?: string;
-  rawToken?: string;
 }
 
 export interface ConsentNoticeDto {
@@ -59,4 +57,14 @@ export interface ConsentWithdrawalConfirmResult {
   candidateId: string;
   withdrawnAt: string;
   heldJobCount: number;
+}
+
+export interface CandidateDeletionRequestResult {
+  message: string;
+}
+
+export interface CandidateDeletionConfirmResult {
+  status: 'COMPLETED';
+  candidateId: string;
+  deletionRequestId: string;
 }

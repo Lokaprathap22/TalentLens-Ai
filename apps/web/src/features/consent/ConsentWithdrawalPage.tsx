@@ -127,12 +127,12 @@ export function ConsentWithdrawalPage(): React.JSX.Element {
   }, [token]);
 
   return (
-    <div className="min-h-screen bg-bg p-4 sm:p-6 lg:p-8 flex flex-col items-center justify-center">
+    <div className="min-h-screen bg-canvas p-4 sm:p-6 lg:p-8 flex flex-col items-center justify-center">
       <div className="w-full max-w-xl space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between pb-2 border-b border-border">
           <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-accent-fg font-bold text-sm">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-on-accent font-bold text-sm">
               TL
             </div>
             <div>
@@ -161,7 +161,7 @@ export function ConsentWithdrawalPage(): React.JSX.Element {
                   </p>
                 </div>
 
-                <div className="rounded-md border border-border bg-bg-subtle p-4 text-xs text-left space-y-2">
+                <div className="rounded-md border border-border bg-surface-muted/50 p-4 text-xs text-left space-y-2">
                   <div className="flex justify-between">
                     <span className="text-fg-subtle">Withdrawal Status:</span>
                     <Badge tone="warning" dot>

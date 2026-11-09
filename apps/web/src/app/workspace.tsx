@@ -25,10 +25,11 @@ export interface WorkspaceContextValue {
 }
 
 export function createAuthenticatedWorkspace(user: AuthenticatedUser): WorkspaceContextValue {
+  const displayName = user.name?.trim() ? user.name.trim() : user.email;
   return {
     user: {
       id: user.userId,
-      name: user.email,
+      name: displayName,
       email: user.email,
       role: user.role,
       roleLabel: formatUserRoleLabel(user.role),

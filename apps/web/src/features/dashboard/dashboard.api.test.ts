@@ -1,289 +1,235 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
-import { fetchLiveDashboardData } from './dashboard.api.js';
-import * as clientApi from '../clients/client.api.js';
-import * as requisitionApi from '../requisitions/requisition.api.js';
-import * as candidateApi from '../candidates/candidate.api.js';
-import type { ClientRecord } from '../clients/types.js';
-import type { RequisitionRecord } from '../requisitions/types.js';
-import type { CandidateSummary } from '../candidates/types.js';
+import { apiClient } from '../../lib/api-client.js';
+import { fetchLiveDashboardData, isDashboardSummaryResponse } from './dashboard.api.js';
 
-describe('dashboard.api - fetchLiveDashboardData', () => {
+describe('dashboard.api', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
 
-  const mockClients: ClientRecord[] = [
-    {
-      id: 'c1',
-      name: 'Apex Financial',
-      status: 'ACTIVE',
-      createdAt: '2026-10-01T00:00:00.000Z',
-      updatedAt: '2026-10-01T00:00:00.000Z',
+  const mockRecruiterResponse = {
+    role: 'RECRUITER',
+    generatedAt: '2026-11-08T12:00:00.000Z',
+    metrics: {
+      totalActiveRequisitions: 5,
+      requisitionsRequiringAttention: 2,
+      candidatesInPipeline: 24,
+      candidatesAwaitingAssessment: 4,
+      candidatesAwaitingReview: 7,
+      pendingClientDecisions: 3,
+      upcomingConfirmedInterviews: 2,
     },
-    {
-      id: 'c2',
-      name: 'Beacon Tech',
-      status: 'ACTIVE',
-      createdAt: '2026-10-01T00:00:00.000Z',
-      updatedAt: '2026-10-01T00:00:00.000Z',
-    },
-  ];
+    pipelineStages: [
+      { key: 'intake', label: 'Intake', count: 4, hint: 'Awaiting assessment' },
+      { key: 'assessed', label: 'Assessed', count: 5, hint: 'Criteria evaluated' },
+      { key: 'review', label: 'Review', count: 7, hint: 'Recruiter verification' },
+      { key: 'shortlisted', label: 'Shortlisted', count: 3, hint: 'Approved for client' },
+      { key: 'client', label: 'Client', count: 3, hint: 'With hiring manager' },
+      { key: 'interview', label: 'Interview', count: 2, hint: 'Confirmed schedule' },
+    ],
+    recentRequisitions: [
+      {
+        id: 'req-1',
+        title: 'Senior Distributed Systems Engineer',
+        clientName: 'Acme Corp',
+        status: 'OPEN' as const,
+        candidatesCount: 12,
+        awaitingReviewCount: 4,
+        withClientCount: 2,
+        updatedAt: '2026-11-08T10:00:00.000Z',
+      },
+    ],
+    reviewQueue: [
+      {
+        candidateId: 'cand-1',
+        requisitionId: 'req-1',
+        candidateCode: 'CAN-8A4F1D',
+        requisitionTitle: 'Senior Distributed Systems Engineer',
+        assessmentStatus: 'COMPLETE' as const,
+        score: 88,
+        coverage: 92,
+        consent: 'ACTIVE' as const,
+        lastActivityAt: '2026-11-08T09:30:00.000Z',
+      },
+    ],
+    upcomingInterviews: [
+      {
+        id: 'int-1',
+        candidateCode: 'CAN-8A4F1D',
+        requisitionTitle: 'Senior Distributed Systems Engineer',
+        startAt: '2026-11-10T14:00:00.000Z',
+        endAt: '2026-11-10T15:00:00.000Z',
+        timezone: 'America/New_York',
+        format: 'VIDEO' as const,
+        status: 'ACCEPTED' as const,
+      },
+    ],
+    recentActivity: [
+      {
+        id: 'act-1',
+        kind: 'review_recorded',
+        summary: 'Recruiter verified assessment for CAN-8A4F1D',
+        actor: 'Jane Recruiter',
+        createdAt: '2026-11-08T09:30:00.000Z',
+      },
+    ],
+  };
 
-  const mockRequisitions: RequisitionRecord[] = [
-    {
-      id: 'r1',
-      clientId: 'c1',
-      clientName: 'Apex Financial',
-      title: 'Principal Distributed Systems Engineer',
-      jdText: 'Distributed consensus and high-throughput systems.',
-      status: 'OPEN',
-      createdAt: '2026-10-05T00:00:00.000Z',
-      updatedAt: '2026-10-05T00:00:00.000Z',
+  const mockClientResponse = {
+    role: 'CLIENT_HIRING_MANAGER',
+    generatedAt: '2026-11-08T12:00:00.000Z',
+    metrics: {
+      pendingCandidateReviews: 3,
+      submittedAwaitingDecisions: 3,
+      upcomingConfirmedInterviews: 1,
+      recentDecisionsCount: 4,
+      activeRequisitionsCount: 2,
     },
-    {
-      id: 'r2',
-      clientId: 'c2',
-      clientName: 'Beacon Tech',
-      title: 'Senior Frontend Architect',
-      jdText: 'React, TypeScript and microfrontends.',
-      status: 'OPEN',
-      createdAt: '2026-10-06T00:00:00.000Z',
-      updatedAt: '2026-10-06T00:00:00.000Z',
-    },
-  ];
+    pendingReviews: [
+      {
+        submissionId: 'sub-1',
+        candidateCode: 'CAN-7B3E2C',
+        requisitionId: 'req-1',
+        requisitionTitle: 'Senior Distributed Systems Engineer',
+        clientId: 'cli-1',
+        clientName: 'Client 1',
+        submittedAt: '2026-11-07T14:00:00.000Z',
+        status: 'SUBMITTED' as const,
+        criteriaCount: 4,
+        advisoryScore: 92,
+      },
+    ],
+    upcomingInterviews: [
+      {
+        id: 'int-2',
+        candidateCode: 'CAN-7B3E2C',
+        requisitionTitle: 'Senior Distributed Systems Engineer',
+        startAt: '2026-11-11T10:00:00.000Z',
+        endAt: '2026-11-11T11:00:00.000Z',
+        timezone: 'Europe/London',
+        format: 'VIDEO' as const,
+        status: 'ACCEPTED' as const,
+      },
+    ],
+    recentDecisions: [
+      {
+        id: 'dec-1',
+        candidateCode: 'CAN-6C2D1B',
+        requisitionTitle: 'Staff Backend Engineer',
+        decision: 'SHORTLIST' as const,
+        reason: 'Strong architectural experience',
+        createdAt: '2026-11-06T15:00:00.000Z',
+      },
+    ],
+    activeRequisitions: [
+      {
+        id: 'req-1',
+        title: 'Senior Distributed Systems Engineer',
+        clientId: 'cli-1',
+        clientName: 'Client 1',
+        status: 'OPEN' as const,
+        activeSubmissionsCount: 3,
+        interviewsCount: 1,
+      },
+    ],
+    recentActivity: [
+      {
+        id: 'act-2',
+        kind: 'submitted',
+        summary: 'Candidate CAN-7B3E2C submitted for review',
+        actor: 'Recruitment Team',
+        createdAt: '2026-11-07T14:00:00.000Z',
+      },
+    ],
+  };
 
-  const mockCandidatesR1Page1: CandidateSummary[] = [
-    {
-      candidateId: 'cand-1',
-      candidateCode: 'CAN-8A4F1D',
-      resumeDocumentId: 'doc-1',
-      resumeFileName: 'marcus_vance.pdf',
-      parseStatus: 'PARSED',
-      assessmentId: 'ass-1',
-      assessmentStatus: 'COMPLETE', // Canonical Prisma enum
-      overallScore: 92,
-      coverage: 0.95,
-      isComplete: true,
-      criteriaCount: 4,
-      criteriaMetCount: 4,
-      reviewStatus: 'REVIEWED',
-      reviewedAt: '2026-11-06T01:00:00.000Z',
-      isShortlisted: true,
-      shortlistedAt: '2026-11-06T02:00:00.000Z',
-      submissionId: 'sub-1',
-      submissionStatus: 'CLIENT_SHORTLISTED',
-      submittedAt: '2026-11-06T03:00:00.000Z',
-      lastActivityAt: '2026-11-06T04:00:00.000Z',
-    },
-    {
-      candidateId: 'cand-2',
-      candidateCode: 'CAN-7B3E2C',
-      resumeDocumentId: 'doc-2',
-      resumeFileName: 'sara_chen.pdf',
-      parseStatus: 'HELD_FOR_AUTHORIZATION', // Canonical Prisma enum
-      assessmentId: null,
-      assessmentStatus: null,
-      overallScore: null,
-      coverage: null,
-      isComplete: false,
-      criteriaCount: 0,
-      criteriaMetCount: 0,
-      reviewStatus: 'NOT_REVIEWED',
-      reviewedAt: null,
-      isShortlisted: false,
-      shortlistedAt: null,
-      submissionId: null,
-      submissionStatus: null,
-      submittedAt: null,
-      lastActivityAt: '2026-11-06T00:30:00.000Z',
-    },
-  ];
-
-  const mockCandidatesR1Page2: CandidateSummary[] = [
-    {
-      candidateId: 'cand-page2',
-      candidateCode: 'CAN-9D8E7F',
-      resumeDocumentId: 'doc-page2',
-      resumeFileName: 'david_kim.pdf',
-      parseStatus: 'PARSED',
-      assessmentId: 'ass-page2',
-      assessmentStatus: 'COMPLETE',
-      overallScore: 88,
-      coverage: 0.9,
-      isComplete: true,
-      criteriaCount: 4,
-      criteriaMetCount: 3,
-      reviewStatus: 'NEEDS_REVIEW', // Canonical Prisma enum
-      reviewedAt: '2026-11-06T02:30:00.000Z',
-      isShortlisted: false,
-      shortlistedAt: null,
-      submissionId: null,
-      submissionStatus: null,
-      submittedAt: null,
-      lastActivityAt: '2026-11-06T02:30:00.000Z',
-    },
-  ];
-
-  const mockCandidatesR2: CandidateSummary[] = [
-    {
-      candidateId: 'cand-3',
-      candidateCode: 'CAN-6C2D1B',
-      resumeDocumentId: 'doc-3',
-      resumeFileName: 'alex_novak.docx',
-      parseStatus: 'PENDING',
-      assessmentId: null,
-      assessmentStatus: null,
-      overallScore: null,
-      coverage: null,
-      isComplete: false,
-      criteriaCount: 0,
-      criteriaMetCount: 0,
-      reviewStatus: 'NOT_REVIEWED',
-      reviewedAt: null,
-      isShortlisted: false,
-      shortlistedAt: null,
-      submissionId: null,
-      submissionStatus: null,
-      submittedAt: null,
-      lastActivityAt: '2026-11-05T22:00:00.000Z',
-    },
-  ];
-
-  it('aggregates live clients, requisitions, and candidate metrics across multiple pages into DashboardData', async () => {
-    vi.spyOn(clientApi, 'listClients').mockResolvedValue(mockClients);
-    vi.spyOn(requisitionApi, 'listRequisitions').mockResolvedValue(mockRequisitions);
-    vi.spyOn(candidateApi, 'listCandidates').mockImplementation(async (requisitionId, query) => {
-      if (requisitionId === 'r1') {
-        if ((query?.offset ?? 0) === 0) {
-          // First page returns 2 items with total: 3
-          return { items: mockCandidatesR1Page1, total: 3 };
-        }
-        // Second page returns the remaining 1 item
-        return { items: mockCandidatesR1Page2, total: 3 };
-      }
-      if (requisitionId === 'r2') {
-        return { items: mockCandidatesR2, total: 1 };
-      }
-      return { items: [], total: 0 };
+  describe('isDashboardSummaryResponse', () => {
+    it('accepts valid recruiter summary response', () => {
+      expect(isDashboardSummaryResponse(mockRecruiterResponse)).toBe(true);
     });
 
-    const data = await fetchLiveDashboardData();
-
-    // Requisition r1 aggregated both page 1 and page 2 (total 3 candidates)
-    expect(data.requisitions).toHaveLength(2);
-    expect(data.requisitions[0]).toEqual({
-      id: 'r1',
-      title: 'Principal Distributed Systems Engineer',
-      clientName: 'Apex Financial',
-      status: 'OPEN',
-      candidates: 3,
-      awaitingReview: 0,
-      withClient: 1,
+    it('accepts valid client summary response', () => {
+      expect(isDashboardSummaryResponse(mockClientResponse)).toBe(true);
     });
 
-    // Pipeline stages
-    const pipelineMap = new Map(data.pipeline.map((p) => [p.key, p.count]));
-    expect(pipelineMap.get('new')).toBe(1); // cand-3 (PENDING)
-    expect(pipelineMap.get('consent')).toBe(1); // cand-2 (HELD_FOR_AUTHORIZATION)
-    expect(pipelineMap.get('client')).toBe(1); // cand-1 (submitted)
-    expect(pipelineMap.get('review')).toBe(1); // cand-page2 (NEEDS_REVIEW)
-
-    // Verify all 4 candidates from all pages are present in review queue
-    expect(data.reviewQueue).toHaveLength(4);
-    const page2Item = data.reviewQueue.find((i) => i.candidateCode === 'CAN-9D8E7F');
-    expect(page2Item).toBeDefined();
-    expect(page2Item?.score).toBe(88);
-    expect(page2Item?.coverage).toBe(90);
-    expect(page2Item?.assessmentStatus).toBe('COMPLETE');
-
-    const cand2Item = data.reviewQueue.find((i) => i.candidateCode === 'CAN-7B3E2C');
-    expect(cand2Item?.consent).toBe('PENDING'); // HELD_FOR_AUTHORIZATION mapped to PENDING consent
+    it('rejects null, non-objects, and missing required fields', () => {
+      expect(isDashboardSummaryResponse(null)).toBe(false);
+      expect(isDashboardSummaryResponse('invalid')).toBe(false);
+      expect(isDashboardSummaryResponse({ role: 'UNKNOWN' })).toBe(false);
+      expect(isDashboardSummaryResponse({ role: 'RECRUITER' })).toBe(false);
+      expect(
+        isDashboardSummaryResponse({
+          role: 'RECRUITER',
+          generatedAt: '2026-11-08T00:00:00Z',
+          metrics: {},
+          pipelineStages: [],
+          // missing reviewQueue, etc.
+        }),
+      ).toBe(false);
+    });
   });
 
-  it('tolerates individual requisition candidate fetch errors gracefully', async () => {
-    vi.spyOn(clientApi, 'listClients').mockResolvedValue(mockClients);
-    vi.spyOn(requisitionApi, 'listRequisitions').mockResolvedValue(mockRequisitions);
-    vi.spyOn(candidateApi, 'listCandidates').mockRejectedValueOnce(
-      new Error('Requisition candidate timeout'),
-    );
+  describe('fetchLiveDashboardData', () => {
+    it('fetches and maps recruiter dashboard data in a single request', async () => {
+      vi.spyOn(apiClient, 'get').mockResolvedValueOnce(mockRecruiterResponse);
 
-    const data = await fetchLiveDashboardData();
+      const data = await fetchLiveDashboardData();
 
-    expect(data.requisitions).toHaveLength(2);
-    expect(data.requisitions[0]?.candidates).toBe(0);
-  });
-
-  it('strictly derives review metrics only from canonical ReviewDecision values (REVIEWED, NEEDS_REVIEW, CLOSED) and ignores unknown statuses', async () => {
-    vi.spyOn(clientApi, 'listClients').mockResolvedValue([mockClients[0]!]);
-    vi.spyOn(requisitionApi, 'listRequisitions').mockResolvedValue([mockRequisitions[0]!]);
-
-    const candidatesWithVariousDecisions: CandidateSummary[] = [
-      {
-        ...mockCandidatesR1Page1[0]!,
-        candidateId: 'cand-reviewed',
-        candidateCode: 'CAN-REV',
-        reviewStatus: 'REVIEWED',
-        isShortlisted: false,
-        submissionId: null,
-        submissionStatus: null,
-      },
-      {
-        ...mockCandidatesR1Page1[0]!,
-        candidateId: 'cand-needs-review',
-        candidateCode: 'CAN-FLAG',
-        reviewStatus: 'NEEDS_REVIEW',
-        isShortlisted: false,
-        submissionId: null,
-        submissionStatus: null,
-      },
-      {
-        ...mockCandidatesR1Page1[0]!,
-        candidateId: 'cand-closed',
-        candidateCode: 'CAN-CLS',
-        reviewStatus: 'CLOSED',
-        isShortlisted: false,
-        submissionId: null,
-        submissionStatus: null,
-      },
-      {
-        ...mockCandidatesR1Page1[0]!,
-        candidateId: 'cand-unknown',
-        candidateCode: 'CAN-UNK',
-        reviewStatus: 'INVALID_STATUS' as unknown as CandidateSummary['reviewStatus'],
-        isShortlisted: false,
-        submissionId: null,
-        submissionStatus: null,
-      },
-      {
-        ...mockCandidatesR1Page1[0]!,
-        candidateId: 'cand-unreviewed',
-        candidateCode: 'CAN-UNREV',
-        reviewStatus: 'NOT_REVIEWED',
-        isShortlisted: false,
-        submissionId: null,
-        submissionStatus: null,
-      },
-    ];
-
-    vi.spyOn(candidateApi, 'listCandidates').mockResolvedValueOnce({
-      items: candidatesWithVariousDecisions,
-      total: 5,
+      expect(apiClient.get).toHaveBeenCalledWith('/dashboard/summary', {});
+      expect(data.role).toBe('RECRUITER');
+      if (data.role === 'RECRUITER') {
+        expect(data.metrics.totalActiveRequisitions).toBe(5);
+        expect(data.metrics.candidatesAwaitingReview).toBe(7);
+        expect(data.pipeline).toHaveLength(6);
+        expect(data.requisitions).toHaveLength(1);
+        expect(data.requisitions[0]?.title).toBe('Senior Distributed Systems Engineer');
+        expect(data.reviewQueue).toHaveLength(1);
+        expect(data.reviewQueue[0]?.candidateCode).toBe('CAN-8A4F1D');
+        expect(data.interviews).toHaveLength(1);
+        expect(data.interviews[0]?.timeZone).toBe('America/New_York');
+        expect(data.activity).toHaveLength(1);
+        expect(data.activity[0]?.kind).toBe('review_recorded');
+      }
     });
 
-    const data = await fetchLiveDashboardData();
-    const pipelineMap = new Map(data.pipeline.map((p) => [p.key, p.count]));
+    it('fetches and maps client hiring manager dashboard data', async () => {
+      vi.spyOn(apiClient, 'get').mockResolvedValueOnce(mockClientResponse);
 
-    // Strictly 2 active candidates with canonical REVIEWED and NEEDS_REVIEW (excluding CLOSED, unknown, and NOT_REVIEWED)
-    expect(pipelineMap.get('review')).toBe(2);
+      const data = await fetchLiveDashboardData();
 
-    // Activities only record for valid reviewed candidates
-    const reviewActivities = data.activity.filter((a) => a.kind === 'review_recorded');
-    expect(reviewActivities).toHaveLength(3);
-    const codes = reviewActivities.map((a) => a.summary);
-    expect(codes.some((s) => s.includes('CAN-REV'))).toBe(true);
-    expect(codes.some((s) => s.includes('CAN-FLAG'))).toBe(true);
-    expect(codes.some((s) => s.includes('CAN-CLS'))).toBe(true);
-    expect(codes.some((s) => s.includes('CAN-UNK'))).toBe(false);
+      expect(apiClient.get).toHaveBeenCalledWith('/dashboard/summary', {});
+      expect(data.role).toBe('CLIENT_HIRING_MANAGER');
+      if (data.role === 'CLIENT_HIRING_MANAGER') {
+        expect(data.metrics.pendingCandidateReviews).toBe(3);
+        expect(data.metrics.upcomingConfirmedInterviews).toBe(1);
+        expect(data.pendingReviews).toHaveLength(1);
+        expect(data.pendingReviews[0]?.candidateCode).toBe('CAN-7B3E2C');
+        expect(data.pendingReviews[0]?.advisoryScore).toBe(92);
+        expect(data.recentDecisions).toHaveLength(1);
+        expect(data.recentDecisions[0]?.decision).toBe('SHORTLIST');
+        expect(data.activeRequisitions).toHaveLength(1);
+        expect(data.activity).toHaveLength(1);
+      }
+    });
+
+    it('throws ApiError with 502 status when the server returns invalid data', async () => {
+      vi.spyOn(apiClient, 'get').mockResolvedValueOnce({ unexpected: true });
+
+      await expect(fetchLiveDashboardData()).rejects.toThrow(
+        'Received an unexpected dashboard summary response from the server.',
+      );
+    });
+
+    it('passes AbortSignal to apiClient.get when provided', async () => {
+      const controller = new AbortController();
+      vi.spyOn(apiClient, 'get').mockResolvedValueOnce(mockRecruiterResponse);
+
+      await fetchLiveDashboardData(controller.signal);
+
+      expect(apiClient.get).toHaveBeenCalledWith('/dashboard/summary', {
+        signal: controller.signal,
+      });
+    });
   });
 });

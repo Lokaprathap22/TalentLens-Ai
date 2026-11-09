@@ -73,12 +73,85 @@ export interface ListCandidatesResponse {
 // Query parameters for candidate listing
 // ---------------------------------------------------------------------------
 export interface ListCandidatesQuery {
-  limit?: number;
-  offset?: number;
-  processingStatus?: ResumeParseStatus;
-  assessmentStatus?: AssessmentStatus;
-  reviewDecision?: ReviewDecision;
-  submissionStatus?: SubmissionStatus;
+  limit?: number | undefined;
+  offset?: number | undefined;
+  search?: string | undefined;
+  sortBy?: ('activity' | 'score' | 'uploadedAt') | undefined;
+  sortOrder?: ('asc' | 'desc') | undefined;
+  processingStatus?: ResumeParseStatus | undefined;
+  assessmentStatus?: AssessmentStatus | undefined;
+  reviewDecision?: ReviewDecision | undefined;
+  submissionStatus?: SubmissionStatus | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Global candidate directory types (mirrors GlobalCandidateSummaryDto)
+// ---------------------------------------------------------------------------
+
+export type GlobalCandidateStatusCategory =
+  'ASSESSED' | 'AWAITING_ASSESSMENT' | 'NEEDS_REVIEW' | 'FAILED';
+
+export interface GlobalCandidateSummary {
+  candidateId: string;
+  candidateCode: string;
+  createdAt: string;
+  lastActivityAt: string;
+
+  // Requisition context
+  requisitionId: string | null;
+  requisitionTitle: string | null;
+  clientName: string | null;
+
+  // Resume info
+  resumeDocumentId: string | null;
+  resumeFileName: string | null;
+  parseStatus: string | null;
+
+  // Non-PII Profile info
+  currentRole: string | null;
+  experienceYears: number | null;
+  location: string | null;
+  skills: string[];
+
+  // Assessment info (strictly verified, never inferred or invented)
+  assessmentId: string | null;
+  assessmentStatus: string | null;
+  overallScore: number | null;
+  coverage: number | null;
+  isComplete: boolean;
+  criteriaCount: number;
+  criteriaMetCount: number;
+
+  // Review & Workflow status
+  reviewStatus: ReviewStatus;
+  reviewedAt: string | null;
+  isShortlisted: boolean;
+  shortlistedAt: string | null;
+  submissionStatus: SubmissionStatus | null;
+  submittedAt: string | null;
+
+  // Categorical indicator
+  statusCategory: GlobalCandidateStatusCategory;
+}
+
+export interface ListGlobalCandidatesResponse {
+  items: GlobalCandidateSummary[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
+
+export interface ListGlobalCandidatesQuery {
+  page?: number | undefined;
+  pageSize?: number | undefined;
+  search?: string | undefined;
+  requisitionId?: string | undefined;
+  statusCategory?: ('ALL' | GlobalCandidateStatusCategory) | undefined;
+  assessmentStatus?: ('ALL' | AssessmentStatus) | undefined;
+  reviewStatus?: ('ALL' | ReviewStatus) | undefined;
+  sortBy?: ('activity' | 'score' | 'createdAt') | undefined;
+  sortOrder?: ('asc' | 'desc') | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +159,7 @@ export interface ListCandidatesQuery {
 // Mirrors ResumeBatchUploadResult and per-file types in resume.types.ts exactly.
 // ---------------------------------------------------------------------------
 export interface AcceptedUploadItem {
+  clientFileId?: string | undefined;
   resumeDocumentId: string;
   candidateId: string;
   candidateCode: string;
@@ -97,6 +171,7 @@ export interface AcceptedUploadItem {
 }
 
 export interface DuplicateUploadItem {
+  clientFileId?: string | undefined;
   fileName: string;
   sha256: string;
   resumeDocumentId: string;
@@ -105,6 +180,7 @@ export interface DuplicateUploadItem {
 }
 
 export interface RejectedUploadItem {
+  clientFileId?: string | undefined;
   fileName: string;
   reason: string;
   status: 'REJECTED';

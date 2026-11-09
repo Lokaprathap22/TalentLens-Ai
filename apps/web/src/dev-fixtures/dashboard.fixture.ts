@@ -1,4 +1,4 @@
-import type { DashboardData, ReviewQueueItem } from '../features/dashboard/types.js';
+import type { RecruiterDashboardData, ReviewQueueItem } from '../features/dashboard/types.js';
 
 /**
  * Deterministic SYNTHETIC data for demonstrating the dashboard design before the API is
@@ -120,8 +120,18 @@ const reviewQueue: ReviewQueueItem[] = [
   },
 ];
 
-export const sampleDashboard: DashboardData = {
+export const sampleDashboard: RecruiterDashboardData = {
+  role: 'RECRUITER',
   generatedAt: '2026-11-05T04:00:00.000Z',
+  metrics: {
+    totalActiveRequisitions: 3,
+    requisitionsRequiringAttention: 2,
+    candidatesInPipeline: 52,
+    candidatesAwaitingAssessment: 8,
+    candidatesAwaitingReview: reviewQueue.length,
+    pendingClientDecisions: 6,
+    upcomingConfirmedInterviews: 2,
+  },
   pipeline: [
     { key: 'parsing', label: 'Parsing', count: 8, hint: 'Resumes being processed' },
     {
@@ -252,8 +262,18 @@ export const sampleDashboard: DashboardData = {
   ],
 };
 
-export const emptyDashboard: DashboardData = {
+export const emptyDashboard: RecruiterDashboardData = {
+  role: 'RECRUITER',
   generatedAt: sampleDashboard.generatedAt,
+  metrics: {
+    totalActiveRequisitions: 0,
+    requisitionsRequiringAttention: 0,
+    candidatesInPipeline: 0,
+    candidatesAwaitingAssessment: 0,
+    candidatesAwaitingReview: 0,
+    pendingClientDecisions: 0,
+    upcomingConfirmedInterviews: 0,
+  },
   pipeline: sampleDashboard.pipeline.map((stage) => ({ ...stage, count: 0 })),
   requisitions: [],
   reviewQueue: [],

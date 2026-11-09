@@ -96,6 +96,22 @@ function getSubmissionStatusTone(
   }
 }
 
+function getClientFeedbackDisplay(decision: string): {
+  tone: 'neutral' | 'info' | 'success';
+  label: string;
+} {
+  switch (decision) {
+    case 'SHORTLIST':
+      return { tone: 'success', label: 'Client Shortlisted' };
+    case 'PROPOSE_INTERVIEW':
+      return { tone: 'info', label: 'Interview Proposed' };
+    case 'REJECT':
+      return { tone: 'neutral', label: 'Client Declined' };
+    default:
+      return { tone: 'neutral', label: decision };
+  }
+}
+
 function getInterviewStatusTone(
   status: string,
 ): 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'accent' {
@@ -445,7 +461,7 @@ export function CandidateDetailView({
       {/* ------------------------------------------------------------------- */}
       {/* Recruiter Evaluation & Shortlist Action Workspace                   */}
       {/* ------------------------------------------------------------------- */}
-      <Card className="p-5 border-border bg-surface-raised space-y-4">
+      <Card className="p-5 border-border bg-surface space-y-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border-b border-border/60 pb-3">
           <div>
             <div className="flex items-center gap-2">
@@ -565,7 +581,7 @@ export function CandidateDetailView({
                 maxLength={2000}
                 rows={2}
                 placeholder="Enter observations, interview recommendations, or context..."
-                className="w-full rounded-md border border-border bg-bg-surface p-2 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                className="w-full rounded-md border border-border bg-surface p-2 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
               />
               <div className="flex items-center justify-between text-[11px] text-fg-subtle">
                 <span>{reviewNotes.length}/2000 characters</span>
@@ -628,7 +644,7 @@ export function CandidateDetailView({
                   authorized for hiring client submission.
                 </p>
                 {candidate.shortlist.notesInternal ? (
-                  <div className="rounded bg-bg-surface/50 p-2 text-fg-subtle text-[11px]">
+                  <div className="rounded bg-surface/50 p-2 text-fg-subtle text-[11px]">
                     <span className="font-semibold text-fg">Notes: </span>
                     {candidate.shortlist.notesInternal}
                   </div>
@@ -640,7 +656,7 @@ export function CandidateDetailView({
               </div>
             ) : (
               <div className="space-y-3">
-                <div className="rounded border border-border bg-bg-surface/40 p-2.5 text-xs space-y-1.5">
+                <div className="rounded border border-border bg-surface/40 p-2.5 text-xs space-y-1.5">
                   <div className="font-medium text-fg">Prerequisites for Shortlisting:</div>
                   <div className="space-y-1 text-[11px]">
                     <div className="flex items-center gap-1.5">
@@ -691,7 +707,7 @@ export function CandidateDetailView({
                     maxLength={2000}
                     rows={2}
                     placeholder="Enter notes for client submission..."
-                    className="w-full rounded-md border border-border bg-bg-surface p-2 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                    className="w-full rounded-md border border-border bg-surface p-2 text-xs text-fg placeholder:text-fg-subtle focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
                   />
                 </div>
 
@@ -768,7 +784,7 @@ export function CandidateDetailView({
             </div>
 
             {candidate.submission && candidate.submission.status !== 'WITHDRAWN' ? (
-              <div className="space-y-2 rounded-lg border border-border bg-bg-surface p-3 text-xs">
+              <div className="space-y-2 rounded-lg border border-border bg-surface p-3 text-xs">
                 <div className="flex items-center justify-between">
                   <span className="text-fg-subtle">Submitted To:</span>
                   <span className="font-medium text-fg">{candidate.client.name}</span>
@@ -783,24 +799,27 @@ export function CandidateDetailView({
                     <span className="font-semibold text-fg-subtle text-[11px] uppercase tracking-wider">
                       Client Feedback
                     </span>
-                    {candidate.clientFeedback.map((fb) => (
-                      <div
-                        key={fb.id}
-                        className="rounded border border-border/80 bg-surface-muted p-2 space-y-1"
-                      >
-                        <div className="flex items-center justify-between">
-                          <Badge tone={fb.decision === 'SHORTLIST' ? 'success' : 'neutral'} dot>
-                            {fb.decision === 'SHORTLIST' ? 'Client Shortlisted' : 'Client Declined'}
-                          </Badge>
-                          <span className="text-[10px] text-fg-subtle">
-                            {formatDate(fb.createdAt)}
-                          </span>
+                    {candidate.clientFeedback.map((fb) => {
+                      const feedbackDisplay = getClientFeedbackDisplay(fb.decision);
+                      return (
+                        <div
+                          key={fb.id}
+                          className="rounded border border-border/80 bg-surface-muted p-2 space-y-1"
+                        >
+                          <div className="flex items-center justify-between">
+                            <Badge tone={feedbackDisplay.tone} dot>
+                              {feedbackDisplay.label}
+                            </Badge>
+                            <span className="text-[10px] text-fg-subtle">
+                              {formatDate(fb.createdAt)}
+                            </span>
+                          </div>
+                          {fb.reason ? (
+                            <p className="text-[11px] text-fg italic">&ldquo;{fb.reason}&rdquo;</p>
+                          ) : null}
                         </div>
-                        {fb.reason ? (
-                          <p className="text-[11px] text-fg italic">&ldquo;{fb.reason}&rdquo;</p>
-                        ) : null}
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="rounded border border-info/30 bg-info/5 p-2 text-xs text-info flex items-center gap-2 mt-2">
@@ -867,7 +886,7 @@ export function CandidateDetailView({
                           </div>
 
                           {iv.reason ? (
-                            <div className="text-[11px] text-fg-subtle italic bg-bg-surface/50 p-1.5 rounded">
+                            <div className="text-[11px] text-fg-subtle italic bg-surface/50 p-1.5 rounded">
                               &ldquo;{iv.reason}&rdquo;
                             </div>
                           ) : null}
@@ -944,7 +963,7 @@ export function CandidateDetailView({
                       ))}
                     </div>
                   ) : (
-                    <div className="rounded border border-dashed border-border/80 bg-bg-surface/30 p-2 text-center text-[11px] text-fg-subtle">
+                    <div className="rounded border border-dashed border-border/80 bg-surface/30 p-2 text-center text-[11px] text-fg-subtle">
                       No interviews scheduled or proposed yet.
                     </div>
                   )}
@@ -952,7 +971,7 @@ export function CandidateDetailView({
               </div>
             ) : (
               <div className="space-y-3">
-                <div className="rounded-lg border border-border bg-bg-surface p-3 space-y-2">
+                <div className="rounded-lg border border-border bg-surface p-3 space-y-2">
                   <span className="text-xs font-medium text-fg block">
                     Submission Prerequisites:
                   </span>
@@ -1081,7 +1100,7 @@ export function CandidateDetailView({
             </div>
           ) : extraction ? (
             <div className="space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-bg-surface px-4 py-2.5 text-xs text-fg-subtle border border-border">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-surface px-4 py-2.5 text-xs text-fg-subtle border border-border">
                 <div className="flex items-center gap-3">
                   <Badge
                     tone={
@@ -1116,7 +1135,7 @@ export function CandidateDetailView({
               <div
                 tabIndex={0}
                 aria-label="Extracted candidate resume text"
-                className="max-h-[550px] overflow-y-auto rounded-lg border border-border bg-bg-surface p-4 font-mono text-xs leading-relaxed text-fg select-text whitespace-pre-wrap focus:outline-none focus:ring-1 focus:ring-accent"
+                className="max-h-[550px] overflow-y-auto rounded-lg border border-border bg-surface p-4 font-mono text-xs leading-relaxed text-fg select-text whitespace-pre-wrap focus:outline-none focus:ring-1 focus:ring-accent"
               >
                 {extraction.extractedText}
               </div>
@@ -1174,7 +1193,7 @@ export function CandidateDetailView({
         {/* TAB 2: Original CV Inspection                                     */}
         {/* ----------------------------------------------------------------- */}
         <TabPanel value="inspection" className="space-y-4 pt-2">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-bg-surface p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-surface p-4">
             <div>
               <p className="text-sm font-medium text-fg truncate" title={candidate.resume.fileName}>
                 {candidate.resume.fileName}
@@ -1320,7 +1339,7 @@ export function CandidateDetailView({
 
           {candidate.assessment && candidate.assessment.criteria.length > 0 ? (
             <div className="space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-bg-surface p-4 text-xs text-fg-subtle">
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-surface p-4 text-xs text-fg-subtle">
                 <div>
                   <span className="font-semibold text-fg">Formula Version:</span>{' '}
                   <span className="font-mono">{candidate.assessment.formulaVersion}</span>
@@ -1559,7 +1578,13 @@ export function CandidateDetailView({
                     </div>
                   </div>
                   <div className="pt-2 border-t border-border flex items-center justify-between">
-                    <span className="text-[11px] text-fg-subtle">Consent is active.</span>
+                    <span className="text-[11px] text-fg-subtle">
+                      {candidate.consent.status === 'ACTIVE'
+                        ? 'Consent is active.'
+                        : candidate.consent.status === 'WITHDRAWN'
+                          ? 'Consent has been withdrawn.'
+                          : 'Consent is no longer active.'}
+                    </span>
                     <Button
                       type="button"
                       variant="ghost"
@@ -1682,28 +1707,29 @@ export function CandidateDetailView({
                         <span className="font-semibold text-fg-subtle text-[11px] uppercase tracking-wider block">
                           Client Feedback History
                         </span>
-                        {candidate.clientFeedback.map((fb) => (
-                          <div
-                            key={fb.id}
-                            className="rounded border border-border/80 bg-surface-muted p-2 space-y-1"
-                          >
-                            <div className="flex items-center justify-between">
-                              <Badge tone={fb.decision === 'SHORTLIST' ? 'success' : 'neutral'} dot>
-                                {fb.decision === 'SHORTLIST'
-                                  ? 'Client Shortlisted'
-                                  : 'Client Declined'}
-                              </Badge>
-                              <span className="text-[10px] text-fg-subtle">
-                                {formatDate(fb.createdAt)}
-                              </span>
+                        {candidate.clientFeedback.map((fb) => {
+                          const feedbackDisplay = getClientFeedbackDisplay(fb.decision);
+                          return (
+                            <div
+                              key={fb.id}
+                              className="rounded border border-border/80 bg-surface-muted p-2 space-y-1"
+                            >
+                              <div className="flex items-center justify-between">
+                                <Badge tone={feedbackDisplay.tone} dot>
+                                  {feedbackDisplay.label}
+                                </Badge>
+                                <span className="text-[10px] text-fg-subtle">
+                                  {formatDate(fb.createdAt)}
+                                </span>
+                              </div>
+                              {fb.reason ? (
+                                <p className="text-[11px] text-fg italic">
+                                  &ldquo;{fb.reason}&rdquo;
+                                </p>
+                              ) : null}
                             </div>
-                            {fb.reason ? (
-                              <p className="text-[11px] text-fg italic">
-                                &ldquo;{fb.reason}&rdquo;
-                              </p>
-                            ) : null}
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     ) : null}
                   </>
@@ -1741,7 +1767,7 @@ export function CandidateDetailView({
                   {timeline.items.map((event) => (
                     <div
                       key={event.id}
-                      className="flex flex-col gap-1 rounded-md border border-border/50 bg-bg-surface p-2.5 text-xs"
+                      className="flex flex-col gap-1 rounded-md border border-border/50 bg-surface p-2.5 text-xs"
                     >
                       <div className="flex items-center justify-between">
                         <span className="font-semibold text-fg">

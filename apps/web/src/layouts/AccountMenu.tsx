@@ -28,36 +28,41 @@ export function AccountMenu(): React.JSX.Element {
   };
 
   const entries: MenuEntry[] = [
-    { type: 'item', label: 'Account settings', icon: Settings, disabled: true, hint: 'Soon' },
+    {
+      type: 'item',
+      label: 'Account settings',
+      icon: Settings,
+      onSelect: () => void navigate('/settings'),
+    },
     ...(import.meta.env.DEV
       ? ([
-          { type: 'separator' },
-          { type: 'label', label: 'Development' },
-          {
-            type: 'item',
-            label: 'Design system',
-            icon: Palette,
-            onSelect: () => void navigate('/design-system'),
-          },
-        ] satisfies MenuEntry[])
+        { type: 'separator' },
+        { type: 'label', label: 'Development' },
+        {
+          type: 'item',
+          label: 'Design system',
+          icon: Palette,
+          onSelect: () => void navigate('/design-system'),
+        },
+      ] satisfies MenuEntry[])
       : []),
     { type: 'separator' },
     canSignOut
       ? {
-          type: 'item',
-          label: isLoggingOut ? 'Signing out…' : 'Sign out',
-          icon: LogOut,
-          disabled: isLoggingOut,
-          ...(isLoggingOut ? { hint: 'Working…' } : {}),
-          onSelect: handleSignOut,
-        }
+        type: 'item',
+        label: isLoggingOut ? 'Signing out…' : 'Sign out',
+        icon: LogOut,
+        disabled: isLoggingOut,
+        ...(isLoggingOut ? { hint: 'Working…' } : {}),
+        onSelect: handleSignOut,
+      }
       : {
-          type: 'item',
-          label: 'Sign out',
-          icon: LogOut,
-          disabled: true,
-          hint: 'Preview mode',
-        },
+        type: 'item',
+        label: 'Sign out',
+        icon: LogOut,
+        disabled: true,
+        hint: 'Preview mode',
+      },
   ];
 
   return (

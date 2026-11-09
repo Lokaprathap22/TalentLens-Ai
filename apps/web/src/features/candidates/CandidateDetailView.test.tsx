@@ -828,4 +828,71 @@ describe('CandidateDetailView', () => {
       expect(completeSpy).toHaveBeenCalledWith(REQUISITION_ID, 'sub-001', 'prop-002');
     });
   });
+
+  it('displays withdrawn consent status accurately while holding processing and hiding active message', async () => {
+    const withdrawnCandidate: CandidateDetail = {
+      ...MOCK_CANDIDATE_DETAIL,
+      consent: {
+        id: 'consent-withdrawn-1',
+        status: 'WITHDRAWN',
+        policyVersion: '2026-11-v1',
+        capturedAt: '2026-10-25T14:28:00.000Z',
+      },
+    };
+
+    vi.spyOn(candidateApi, 'getCandidateDetail').mockResolvedValue(withdrawnCandidate);
+    vi.spyOn(candidateApi, 'getResumeExtraction').mockResolvedValue(MOCK_EXTRACTION);
+
+    render(<CandidateDetailView requisitionId={REQUISITION_ID} candidateId={CANDIDATE_ID} />);
+
+    expect(await screen.findByText(/Consent withdrawn \(v2026-11-v1\)/i)).toBeInTheDocument();
+    expect(screen.getByText('Held for Consent')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: /Consent & Audit/i }));
+    expect(await screen.findByText('Consent has been withdrawn.')).toBeInTheDocument();
+    expect(screen.queryByText('Consent is active.')).not.toBeInTheDocument();
+  });
+
+  it('distinguishes PROPOSE_INTERVIEW from Client Declined in recruiter feedback panels', async () => {
+    const candidateWithMixedFeedback: CandidateDetail = {
+      ...MOCK_CANDIDATE_DETAIL,
+      submission: {
+        id: 'sub-002',
+        status: 'CLIENT_SHORTLISTED',
+        submittedAt: '2026-11-05T14:00:00.000Z',
+        submittedById: 'recruiter-1',
+      },
+      clientFeedback: [
+        {
+          id: 'fb-shortlist',
+          decision: 'SHORTLIST',
+          reason: 'Strong distributed systems interview',
+          proposedAt: null,
+          timezone: null,
+          createdAt: '2026-11-07T12:00:00.000Z',
+        },
+        {
+          id: 'fb-interview',
+          decision: 'PROPOSE_INTERVIEW',
+          reason: null,
+          proposedAt: '2026-11-11T15:00:00.000Z',
+          timezone: 'UTC',
+          createdAt: '2026-11-06T12:00:00.000Z',
+        },
+      ],
+    };
+
+    vi.spyOn(candidateApi, 'getCandidateDetail').mockResolvedValue(candidateWithMixedFeedback);
+    vi.spyOn(candidateApi, 'getResumeExtraction').mockResolvedValue(MOCK_EXTRACTION);
+
+    render(<CandidateDetailView requisitionId={REQUISITION_ID} candidateId={CANDIDATE_ID} />);
+
+    expect(await screen.findByText('Interview Proposed')).toBeInTheDocument();
+    expect(screen.getByText('Client Shortlisted')).toBeInTheDocument();
+    expect(screen.queryByText('Client Declined')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: /Consent & Audit/i }));
+    expect(await screen.findAllByText('Interview Proposed')).toHaveLength(2);
+    expect(screen.queryByText('Client Declined')).not.toBeInTheDocument();
+  });
 });

@@ -5,17 +5,22 @@ import {
   ClipboardCheck,
   FileSearch,
   Inbox,
+  LogOut,
   Send,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
   UserCheck,
+  Users,
   Video,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 
+import { useAuthOptional } from '../../app/auth.js';
+import { LogoMark, Wordmark } from '../../components/brand.js';
+import { Avatar } from '../../components/ui/avatar.js';
 import {
   Badge,
   Button,
@@ -45,9 +50,15 @@ import type { QueueTab } from './review-queue.js';
 import type {
   ActivityItem,
   ActivityKind,
-  DashboardData,
+  ClientCandidateReviewItem,
+  ClientDashboardData,
+  ClientHiringManagerMetrics,
+  ClientRecentDecisionItem,
+  ClientRequisitionSummary,
   InterviewFormatValue,
   PipelineStage,
+  RecruiterDashboardData,
+  RecruiterDashboardMetrics,
   RequisitionSummary,
   ReviewQueueItem,
   UpcomingInterview,
@@ -94,6 +105,10 @@ const ACTIVITY_ICONS: Record<ActivityKind, { icon: LucideIcon; tone: string }> =
     icon: Send,
     tone: 'border-info-border bg-info-soft text-info',
   },
+  general: {
+    icon: ClipboardCheck,
+    tone: 'border-border bg-surface-muted text-fg-muted',
+  },
 };
 
 const QUEUE_PAGE_SIZE = 4;
@@ -102,7 +117,7 @@ function ScoreCoverageCell({ item }: { item: ReviewQueueItem }): React.JSX.Eleme
   const state = evidenceState(item);
 
   if (state === 'FAILED') {
-    return <span className="text-xs text-danger-fg">Extraction or scoring failed</span>;
+    return <span className="text-xs text-danger">Extraction or scoring failed</span>;
   }
 
   if (state === 'NOT_ASSESSED') {
@@ -112,7 +127,7 @@ function ScoreCoverageCell({ item }: { item: ReviewQueueItem }): React.JSX.Eleme
   if (item.score === null) {
     return (
       <div className="leading-tight">
-        <span className="block text-xs font-medium text-warning-fg">
+        <span className="block text-xs font-medium text-warning">
           Insufficient evidence (not scored)
         </span>
         <span className="tabular text-2xs text-fg-subtle">
@@ -127,7 +142,7 @@ function ScoreCoverageCell({ item }: { item: ReviewQueueItem }): React.JSX.Eleme
   if (item.coverage === null || item.coverage < LOW_COVERAGE_THRESHOLD) {
     return (
       <div className="leading-tight">
-        <span className="block text-xs font-medium text-warning-fg">
+        <span className="block text-xs font-medium text-warning">
           Thin evidence · manual check required
         </span>
         <span className="tabular text-2xs text-fg-subtle">
@@ -144,6 +159,68 @@ function ScoreCoverageCell({ item }: { item: ReviewQueueItem }): React.JSX.Eleme
         <span className="text-xs text-fg-subtle">/ 100</span>
       </div>
       <span className="tabular text-2xs text-fg-subtle">{item.coverage}% evidence coverage</span>
+    </div>
+  );
+}
+
+function RecruiterMetricsStrip({
+  metrics,
+}: {
+  metrics: RecruiterDashboardMetrics;
+}): React.JSX.Element {
+  const cards = [
+    {
+      label: 'Active requisitions',
+      count: metrics.totalActiveRequisitions,
+      hint: `${metrics.requisitionsRequiringAttention} requiring attention`,
+      tone:
+        metrics.requisitionsRequiringAttention > 0 ? 'text-warning font-medium' : 'text-fg-subtle',
+    },
+    {
+      label: 'In pipeline',
+      count: metrics.candidatesInPipeline,
+      hint: 'Active candidate stages',
+      tone: 'text-fg-subtle',
+    },
+    {
+      label: 'Awaiting assessment',
+      count: metrics.candidatesAwaitingAssessment,
+      hint: 'Pending parsing/scoring',
+      tone: 'text-fg-subtle',
+    },
+    {
+      label: 'Awaiting review',
+      count: metrics.candidatesAwaitingReview,
+      hint:
+        metrics.candidatesAwaitingReview > 0 ? 'Recruiter action required' : 'Review queue clear',
+      tone: metrics.candidatesAwaitingReview > 0 ? 'text-accent font-medium' : 'text-fg-subtle',
+    },
+    {
+      label: 'With client',
+      count: metrics.pendingClientDecisions,
+      hint: 'Pending client decision',
+      tone: 'text-fg-subtle',
+    },
+    {
+      label: 'Upcoming interviews',
+      count: metrics.upcomingConfirmedInterviews,
+      hint: 'Confirmed schedule',
+      tone: 'text-fg-subtle',
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+      {cards.map((card) => (
+        <Card
+          key={card.label}
+          className="p-3.5 transition-all duration-150 hover:border-fg-disabled hover:shadow-xs"
+        >
+          <p className="text-xs font-medium text-fg-muted truncate">{card.label}</p>
+          <p className="mt-1.5 tabular text-2xl font-bold text-fg">{card.count}</p>
+          <p className={`mt-0.5 text-2xs truncate ${card.tone}`}>{card.hint}</p>
+        </Card>
+      ))}
     </div>
   );
 }
@@ -435,7 +512,12 @@ function RequisitionsCard({
       header: 'Requisition',
       cell: (row) => (
         <div>
-          <p className="font-medium text-fg">{row.title}</p>
+          <a
+            href={`/requisitions/${row.id}`}
+            className="font-medium text-fg hover:text-accent hover:underline"
+          >
+            {row.title}
+          </a>
           <p className="text-xs text-fg-subtle">{row.clientName}</p>
         </div>
       ),
@@ -599,7 +681,7 @@ function ActivityCard({
         <CardBody className="pt-1">
           <ol className="divide-y divide-border">
             {activity.map((entry) => {
-              const descriptor = ACTIVITY_ICONS[entry.kind];
+              const descriptor = ACTIVITY_ICONS[entry.kind] ?? ACTIVITY_ICONS.general;
               return (
                 <li key={entry.id} className="flex items-start gap-3 py-3 first:pt-1 last:pb-0">
                   <span
@@ -627,9 +709,298 @@ function ActivityCard({
   );
 }
 
+function ClientMetricsStrip({
+  metrics,
+}: {
+  metrics: ClientHiringManagerMetrics;
+}): React.JSX.Element {
+  const cards = [
+    {
+      label: 'Awaiting your review',
+      count: metrics.pendingCandidateReviews,
+      hint: metrics.pendingCandidateReviews > 0 ? 'Decision required' : 'Queue clear',
+      icon: Users,
+      tone: metrics.pendingCandidateReviews > 0 ? 'text-accent-fg font-medium' : 'text-fg-subtle',
+    },
+    {
+      label: 'Upcoming interviews',
+      count: metrics.upcomingConfirmedInterviews,
+      hint: 'Confirmed candidate calls',
+      icon: Calendar,
+      tone: 'text-fg-subtle',
+    },
+    {
+      label: 'Recent decisions',
+      count: metrics.recentDecisionsCount,
+      hint: 'Recorded candidate decisions',
+      icon: CheckCircle2,
+      tone: 'text-fg-subtle',
+    },
+    {
+      label: 'Active positions',
+      count: metrics.activeRequisitionsCount,
+      hint: 'Open hiring roles',
+      icon: Briefcase,
+      tone: 'text-fg-subtle',
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+      {cards.map((card) => {
+        const IconComponent = card.icon;
+        return (
+          <Card
+            key={card.label}
+            className="p-4 border-border bg-surface space-y-1 transition-all duration-150 hover:border-fg-disabled hover:shadow-xs"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-fg-subtle truncate">{card.label}</span>
+              <IconComponent className="size-4 text-fg-subtle shrink-0" />
+            </div>
+            <p className="text-2xl font-bold text-fg tabular">{card.count}</p>
+            <p className={`text-2xs truncate ${card.tone}`}>{card.hint}</p>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function ClientPendingReviewsCard({
+  reviews,
+  generatedAt,
+}: {
+  reviews: ClientCandidateReviewItem[];
+  generatedAt: string;
+}): React.JSX.Element {
+  const navigate = useNavigate();
+
+  const columns: Column<ClientCandidateReviewItem>[] = [
+    {
+      id: 'candidate',
+      header: 'Candidate',
+      cell: (row) => (
+        <div>
+          <span className="font-mono text-xs font-semibold text-fg">{row.candidateCode}</span>
+          <span className="block text-xs text-fg-subtle md:hidden">{row.requisitionTitle}</span>
+        </div>
+      ),
+    },
+    {
+      id: 'requisition',
+      header: 'Position',
+      showFrom: 'md',
+      cell: (row) => <span className="font-medium text-fg">{row.requisitionTitle}</span>,
+    },
+    {
+      id: 'score',
+      header: 'Advisory evaluation',
+      showFrom: 'sm',
+      cell: (row) =>
+        row.advisoryScore !== null ? (
+          <div className="leading-tight">
+            <span className="tabular text-sm font-semibold text-fg">{row.advisoryScore}</span>
+            <span className="text-xs text-fg-subtle"> / 100</span>
+            {row.criteriaCount !== null ? (
+              <span className="block tabular text-2xs text-fg-subtle">
+                {row.criteriaCount} criteria evaluated
+              </span>
+            ) : null}
+          </div>
+        ) : (
+          <span className="text-xs text-fg-subtle">Pending assessment</span>
+        ),
+    },
+    {
+      id: 'submitted',
+      header: 'Submitted',
+      showFrom: 'sm',
+      cell: (row) => (
+        <span className="tabular text-xs text-fg-subtle">
+          {formatRelative(row.submittedAt, generatedAt)}
+        </span>
+      ),
+    },
+    {
+      id: 'actions',
+      header: 'Action',
+      align: 'right',
+      cell: () => (
+        <Button variant="primary" size="sm" onClick={() => void navigate('/client-portal')}>
+          Review submission
+        </Button>
+      ),
+    },
+  ];
+
+  return (
+    <Card labelledBy="client-reviews-heading" className="overflow-hidden">
+      <CardHeader
+        title="Candidates awaiting your decision"
+        titleId="client-reviews-heading"
+        description="Candidates submitted by your recruitment team with verified scorecard evidence."
+        actions={
+          <span className="tabular text-xs font-medium text-fg-subtle">
+            {reviews.length} pending decision
+          </span>
+        }
+      />
+      <DataTable
+        caption="Candidates submitted for client review"
+        columns={columns}
+        rows={reviews}
+        getRowKey={(row) => row.submissionId}
+        empty={
+          <EmptyState
+            icon={Inbox}
+            title="No candidates awaiting review"
+            description="When your recruitment partners submit evaluated candidates for your open positions, they will appear here."
+            action={
+              <Button variant="secondary" size="sm" onClick={() => void navigate('/client-portal')}>
+                Go to Submissions
+              </Button>
+            }
+          />
+        }
+      />
+    </Card>
+  );
+}
+
+function ClientRecentDecisionsCard({
+  decisions,
+  generatedAt,
+}: {
+  decisions: ClientRecentDecisionItem[];
+  generatedAt: string;
+}): React.JSX.Element {
+  return (
+    <Card labelledBy="recent-decisions-heading">
+      <CardHeader
+        title="Recent decisions"
+        titleId="recent-decisions-heading"
+        description="Your team's recorded shortlist, interview, and decline decisions"
+      />
+      {decisions.length === 0 ? (
+        <EmptyState
+          icon={ClipboardCheck}
+          title="No decisions recorded yet"
+          description="Decisions you make on submitted candidates will be tracked here."
+        />
+      ) : (
+        <CardBody className="divide-y divide-border pt-1">
+          {decisions.map((item) => (
+            <div key={item.id} className="py-3 first:pt-1 last:pb-0 space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-xs font-semibold text-fg">
+                    {item.candidateCode}
+                  </span>
+                  <span className="text-xs text-fg-subtle">·</span>
+                  <span className="truncate text-xs font-medium text-fg">
+                    {item.requisitionTitle}
+                  </span>
+                </div>
+                {item.decision === 'SHORTLIST' ? (
+                  <Badge tone="success" dot>
+                    Shortlisted
+                  </Badge>
+                ) : item.decision === 'PROPOSE_INTERVIEW' ? (
+                  <Badge tone="accent" dot>
+                    Interview
+                  </Badge>
+                ) : (
+                  <Badge tone="neutral" dot>
+                    Declined
+                  </Badge>
+                )}
+              </div>
+              {item.reason ? (
+                <p className="text-xs text-fg-muted italic">&ldquo;{item.reason}&rdquo;</p>
+              ) : null}
+              <p className="tabular text-2xs text-fg-subtle">
+                {formatRelative(item.createdAt, generatedAt)}
+              </p>
+            </div>
+          ))}
+        </CardBody>
+      )}
+    </Card>
+  );
+}
+
+function ClientRequisitionsCard({
+  requisitions,
+}: {
+  requisitions: ClientRequisitionSummary[];
+}): React.JSX.Element {
+  const navigate = useNavigate();
+
+  const columns: Column<ClientRequisitionSummary>[] = [
+    {
+      id: 'title',
+      header: 'Position',
+      cell: (row) => <span className="font-medium text-fg">{row.title}</span>,
+    },
+    {
+      id: 'status',
+      header: 'Status',
+      cell: (row) => <StatusBadge kind="requisition" status={row.status} />,
+    },
+    {
+      id: 'submissions',
+      header: 'Active candidates',
+      align: 'right',
+      cell: (row) => (
+        <span className="tabular font-medium text-fg">{row.activeSubmissionsCount}</span>
+      ),
+    },
+    {
+      id: 'interviews',
+      header: 'Interviews',
+      align: 'right',
+      cell: (row) => <span className="tabular text-fg-muted">{row.interviewsCount}</span>,
+    },
+    {
+      id: 'actions',
+      header: 'View',
+      align: 'right',
+      cell: () => (
+        <Button variant="secondary" size="sm" onClick={() => void navigate('/client-portal')}>
+          View
+        </Button>
+      ),
+    },
+  ];
+
+  return (
+    <Card labelledBy="client-requisitions-heading" className="overflow-hidden">
+      <CardHeader
+        title="Active positions"
+        titleId="client-requisitions-heading"
+        description="Open roles currently engaged with your recruitment partners"
+      />
+      <DataTable
+        caption="Active client requisitions"
+        columns={columns}
+        rows={requisitions}
+        getRowKey={(row) => row.id}
+        empty={
+          <EmptyState
+            icon={Briefcase}
+            title="No active positions"
+            description="Active hiring positions will appear here once opened by your recruitment partner."
+          />
+        }
+      />
+    </Card>
+  );
+}
+
 function DashboardLoadingSkeleton(): React.JSX.Element {
   return (
-    <LoadingRegion label="Loading recruiter dashboard" className="space-y-6">
+    <LoadingRegion label="Loading dashboard" className="space-y-6">
       <Card>
         <div className="space-y-4 p-5">
           <Skeleton className="h-5 w-44" />
@@ -809,17 +1180,19 @@ function GovernanceDialog({
   );
 }
 
-function DashboardReadyContent({
+function RecruiterDashboardContent({
   data,
   onResetEmptyPreview,
 }: {
-  data: DashboardData;
+  data: RecruiterDashboardData;
   onResetEmptyPreview?: (() => void) | undefined;
 }): React.JSX.Element {
   const [selectedCandidate, setSelectedCandidate] = useState<ReviewQueueItem | null>(null);
 
   return (
     <div className="space-y-6">
+      <RecruiterMetricsStrip metrics={data.metrics} />
+
       <PipelineOverview stages={data.pipeline} />
 
       <ReviewQueueCard
@@ -847,7 +1220,35 @@ function DashboardReadyContent({
   );
 }
 
+function ClientDashboardContent({ data }: { data: ClientDashboardData }): React.JSX.Element {
+  return (
+    <div className="space-y-6">
+      <ClientMetricsStrip metrics={data.metrics} />
+
+      <ClientPendingReviewsCard reviews={data.pendingReviews} generatedAt={data.generatedAt} />
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
+        <div className="space-y-6 xl:col-span-7">
+          <InterviewsCard interviews={data.upcomingInterviews} />
+          <ClientRequisitionsCard requisitions={data.activeRequisitions} />
+        </div>
+        <div className="space-y-6 xl:col-span-5">
+          <ClientRecentDecisionsCard
+            decisions={data.recentDecisions}
+            generatedAt={data.generatedAt}
+          />
+          <ActivityCard activity={data.activity} generatedAt={data.generatedAt} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function DashboardPage(): React.JSX.Element {
+  const navigate = useNavigate();
+  const auth = useAuthOptional();
+  const user = auth?.state.status === 'authenticated' ? auth.state.user : null;
+  const isLoggingOut = auth?.isLoggingOut ?? false;
   const { state, isSample, reload } = useDashboardData();
   const [searchParams, setSearchParams] = useSearchParams();
   const [governanceOpen, setGovernanceOpen] = useState(false);
@@ -862,6 +1263,112 @@ export function DashboardPage(): React.JSX.Element {
       setSearchParams({ state: next }, { replace: true });
     }
   };
+
+  const handleSignOut = async (): Promise<void> => {
+    try {
+      if (auth?.logout) {
+        await auth.logout();
+      }
+      void navigate('/login', { replace: true });
+    } catch {
+      // Handled in auth context
+    }
+  };
+
+  const isClient =
+    user?.role === 'CLIENT_HIRING_MANAGER' ||
+    (state.status === 'ready' && state.data.role === 'CLIENT_HIRING_MANAGER');
+
+  if (isClient) {
+    return (
+      <div className="flex min-h-dvh flex-col bg-canvas">
+        {/* Client Portal Header */}
+        <header className="border-b border-border bg-surface px-4 sm:px-6 lg:px-8">
+          <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4">
+            <div className="flex items-center gap-6">
+              <div className="flex items-center gap-3">
+                <LogoMark className="size-8" />
+                <div className="flex items-baseline gap-2">
+                  <Wordmark className="text-base text-fg" />
+                  <span className="rounded bg-accent-soft px-1.5 py-0.5 text-2xs font-semibold text-accent-fg uppercase tracking-wider">
+                    Client Portal
+                  </span>
+                </div>
+              </div>
+
+              <nav className="flex items-center gap-2" aria-label="Client Portal Sections">
+                <a
+                  href="/dashboard"
+                  aria-current="page"
+                  className="rounded-md bg-accent-soft px-3 py-1.5 text-xs font-semibold text-accent-fg"
+                >
+                  Dashboard
+                </a>
+                <a
+                  href="/client-portal"
+                  className="rounded-md px-3 py-1.5 text-xs font-medium text-fg-muted hover:bg-surface-muted hover:text-fg"
+                >
+                  Submissions
+                </a>
+                <a
+                  href="/interviews"
+                  className="rounded-md px-3 py-1.5 text-xs font-medium text-fg-muted hover:bg-surface-muted hover:text-fg"
+                >
+                  Interviews
+                </a>
+              </nav>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <div className="hidden md:flex items-center gap-2 text-right">
+                <Avatar name={user?.email ?? ''} size="sm" />
+                <div>
+                  <p className="text-xs font-medium text-fg">{user?.email}</p>
+                  <p className="text-2xs text-fg-subtle">Hiring Manager</p>
+                </div>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={LogOut}
+                loading={isLoggingOut}
+                onClick={handleSignOut}
+              >
+                {isLoggingOut ? 'Signing out…' : 'Sign out'}
+              </Button>
+            </div>
+          </div>
+        </header>
+
+        {/* Main Client Container */}
+        <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6 lg:px-8 space-y-6">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight text-fg">Client Dashboard</h1>
+            <p className="mt-1 text-xs text-fg-subtle">
+              Active candidate submissions, interview schedules, and hiring decisions for your
+              organization.
+            </p>
+          </div>
+
+          {state.status === 'loading' ? <DashboardLoadingSkeleton /> : null}
+
+          {state.status === 'error' ? (
+            <Card>
+              <ErrorState
+                title="Unable to load dashboard workspace"
+                description="The dashboard summary could not be retrieved. Check your connection or retry loading the workspace."
+                onRetry={reload}
+              />
+            </Card>
+          ) : null}
+
+          {state.status === 'ready' && state.data.role === 'CLIENT_HIRING_MANAGER' ? (
+            <ClientDashboardContent data={state.data} />
+          ) : null}
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -949,8 +1456,8 @@ export function DashboardPage(): React.JSX.Element {
         </Card>
       ) : null}
 
-      {state.status === 'ready' ? (
-        <DashboardReadyContent
+      {state.status === 'ready' && state.data.role === 'RECRUITER' ? (
+        <RecruiterDashboardContent
           data={state.data}
           onResetEmptyPreview={
             activePreview === 'empty' ? () => setPreviewState('sample') : undefined

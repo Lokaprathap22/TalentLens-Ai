@@ -51,6 +51,13 @@ const catalogue = {
     ACTIVE: { label: 'Active', tone: 'success' },
     INACTIVE: { label: 'Inactive', tone: 'neutral' },
   },
+  member: {
+    ACTIVE: { label: 'Active', tone: 'success' },
+    INVITED: { label: 'Invited', tone: 'warning' },
+    SUSPENDED: { label: 'Suspended', tone: 'danger' },
+    REVOKED: { label: 'Revoked', tone: 'neutral' },
+    DEACTIVATED: { label: 'Deactivated', tone: 'neutral' },
+  },
   scorecard: {
     DRAFT: { label: 'Draft', tone: 'warning' },
     APPROVED: { label: 'Approved', tone: 'success' },
