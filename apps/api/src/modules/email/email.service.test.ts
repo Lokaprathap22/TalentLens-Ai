@@ -320,6 +320,43 @@ describe('TransactionalEmailService & Outbox Subsystem', () => {
       expect(records[0]?.sentAt).toBeDefined();
     });
 
+    it('dispatches existing outbox record directly without creating duplicate outbox entry when outboxRecordId is provided', async () => {
+      const provider = new InMemoryEmailProvider();
+      const outboxStore = new InMemoryEmailOutboxStore();
+      const service = new TransactionalEmailService({ provider, outboxStore });
+
+      // Simulate repository already enqueued record inside business transaction
+      const { record: preEnqueued } = await outboxStore.enqueue({
+        idempotencyKey: 'idemp-pre-enqueued-1',
+        template: 'consent_invitation',
+        recipientEmail: 'candidate@example.com',
+        recipientRole: 'CANDIDATE',
+        subject: 'Pre-enqueued invitation',
+        html: '<p>Invitation</p>',
+        text: 'Invitation',
+      });
+
+      expect(await outboxStore.listRecords()).toHaveLength(1);
+
+      // Now service is called with outboxRecordId
+      const result = await service.sendConsentInvitation({
+        to: 'candidate@example.com',
+        organizationName: 'Acme',
+        requisitionTitle: 'Engineer',
+        invitationUrl: 'https://app.talentlens.ai/consent#token=tok',
+        expiresAt: new Date(Date.now() + 86400000),
+        outboxRecordId: preEnqueued.id,
+      });
+
+      expect(result.delivered).toBe(true);
+      // Still exactly 1 outbox record — no duplicate enqueue!
+      const records = await outboxStore.listRecords();
+      expect(records).toHaveLength(1);
+      expect(records[0]?.id).toBe(preEnqueued.id);
+      expect(records[0]?.status).toBe('SENT');
+      expect(provider.sentMessages).toHaveLength(1);
+    });
+
     it('records FAILED status and schedules exponential retry on provider failure', async () => {
       const provider = new InMemoryEmailProvider();
       provider.shouldFail = true;

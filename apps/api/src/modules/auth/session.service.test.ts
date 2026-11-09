@@ -12,6 +12,7 @@ import {
 const user = {
   id: 'user-1',
   organizationId: 'organization-1',
+  name: null,
   email: 'recruiter@example.com',
   role: 'RECRUITER' as const,
   status: 'ACTIVE' as const,
@@ -41,6 +42,20 @@ function createFakeRepository() {
         session.revokedAt = revokedAt;
       }
     }),
+    revokeAllForUser: vi.fn(async (_userId: string, revokedAt: Date) => {
+      for (const session of sessions.values()) {
+        session.revokedAt = revokedAt;
+      }
+    }),
+    revokeOthersForUser: vi.fn(
+      async (_userId: string, currentTokenHash: string, revokedAt: Date) => {
+        for (const [hash, session] of sessions.entries()) {
+          if (hash !== currentTokenHash) {
+            session.revokedAt = revokedAt;
+          }
+        }
+      },
+    ),
   };
 
   return { repository, sessions };
@@ -87,6 +102,7 @@ describe('session service', () => {
       organizationName: user.organization.name,
       email: user.email,
       role: user.role,
+      name: null,
     };
     expect(first.token).not.toBe(second.token);
     expect(principal).toEqual(expected);
@@ -130,6 +146,7 @@ describe('session service', () => {
           select: {
             id: true,
             organizationId: true,
+            name: true,
             email: true,
             role: true,
             status: true,

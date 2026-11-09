@@ -18,14 +18,14 @@ export class MultipartUploadError extends Error {
 }
 
 export class FileTooLargeError extends MultipartUploadError {
-  constructor(maxSizeMb = 10) {
+  constructor(maxSizeMb = 15) {
     super(`File exceeds maximum allowed size of ${maxSizeMb} MB`, 413);
     this.name = 'FileTooLargeError';
   }
 }
 
 export class TooManyFilesError extends MultipartUploadError {
-  constructor(maxFiles = 10) {
+  constructor(maxFiles = 100) {
     super(`Exceeded maximum upload limit of ${maxFiles} files per batch`, 400);
     this.name = 'TooManyFilesError';
   }
@@ -35,15 +35,19 @@ export interface ParsedUploadedFile {
   tempPath: string;
   originalFileName: string;
   sanitizedFileName: string;
-  fileType: ResumeFileType;
+  fileType: ResumeFileType | null;
+  rejectionReason?: string | undefined;
   sizeBytes: number;
   sha256: string;
+  clientFileId?: string | undefined;
   cleanup: () => Promise<void>;
 }
 
 export interface MultipartOptions {
-  maxFileSize?: number; // default 10MB
-  maxFiles?: number; // default 10
+  maxFileSize?: number; // default 15MB
+  maxFiles?: number; // default 500 total
+  maxBodySize?: number; // default 50MB per multipart request (matching Nginx client_max_body_size 50M)
+  maxTotalBytes?: number; // default 1GB cumulative batch limit
   tempDir?: string;
 }
 
@@ -65,8 +69,10 @@ export async function parseMultipartUpload(
   req: IncomingMessage,
   options: MultipartOptions = {},
 ): Promise<ParsedUploadedFile[]> {
-  const maxFileSize = options.maxFileSize ?? 10 * 1024 * 1024; // 10MB
-  const maxFiles = options.maxFiles ?? 10;
+  const maxFileSize = options.maxFileSize ?? 15 * 1024 * 1024; // 15MB
+  const maxFiles = options.maxFiles ?? 500;
+  const maxBodySize = options.maxBodySize ?? 50 * 1024 * 1024; // 50MB
+  const maxTotalBytes = options.maxTotalBytes ?? 1024 * 1024 * 1024; // 1GB
   const tempDir = options.tempDir ?? os.tmpdir();
 
   const contentType = req.headers['content-type'] ?? '';
@@ -106,8 +112,11 @@ export async function parseMultipartUpload(
     let currentBytes = 0;
     let currentHeaderBuffer = Buffer.alloc(0);
     let currentOriginalName = '';
+    let currentClientFileId: string | undefined = undefined;
     let currentFileType: ResumeFileType | null = null;
     let insideFileBody = false;
+    let totalStreamedBytes = 0;
+    let totalFilesBytes = 0;
 
     const finishCurrentFile = async () => {
       if (currentFileStream && currentTempPath) {
@@ -119,11 +128,33 @@ export async function parseMultipartUpload(
         });
 
         if (currentBytes === 0) {
-          // Discard empty files
+          // Discard temp file for empty uploads, but preserve slot entry so service records rejection & clientFileId
           await fs.unlink(currentTempPath).catch(() => {});
+          files.push({
+            tempPath: '',
+            originalFileName: currentOriginalName,
+            sanitizedFileName: sanitizeFileName(currentOriginalName),
+            fileType: null,
+            rejectionReason: 'Uploaded file is empty (0 bytes)',
+            sizeBytes: 0,
+            sha256: currentHash.digest('hex'),
+            clientFileId: currentClientFileId,
+            cleanup: async () => {},
+          });
         } else if (!currentFileType) {
-          // Discard files with unrecognized magic bytes
+          // Unlink untrusted bytes immediately, but preserve slot entry so service records rejection & clientFileId
           await fs.unlink(currentTempPath).catch(() => {});
+          files.push({
+            tempPath: '',
+            originalFileName: currentOriginalName,
+            sanitizedFileName: sanitizeFileName(currentOriginalName),
+            fileType: null,
+            rejectionReason: 'Unsupported or corrupted file signature (expected PDF or DOCX)',
+            sizeBytes: currentBytes,
+            sha256: currentHash.digest('hex'),
+            clientFileId: currentClientFileId,
+            cleanup: async () => {},
+          });
         } else {
           const filePath = currentTempPath;
           files.push({
@@ -133,6 +164,7 @@ export async function parseMultipartUpload(
             fileType: currentFileType,
             sizeBytes: currentBytes,
             sha256: currentHash.digest('hex'),
+            clientFileId: currentClientFileId,
             cleanup: async () => {
               await fs.unlink(filePath).catch(() => {});
             },
@@ -145,11 +177,16 @@ export async function parseMultipartUpload(
       currentBytes = 0;
       currentHeaderBuffer = Buffer.alloc(0);
       currentOriginalName = '';
+      currentClientFileId = undefined;
       currentFileType = null;
       insideFileBody = false;
     };
 
     for await (const chunk of req as AsyncIterable<Buffer>) {
+      totalStreamedBytes += chunk.length;
+      if (totalStreamedBytes > maxBodySize) {
+        throw new FileTooLargeError(Math.round(maxBodySize / (1024 * 1024)));
+      }
       buffer = Buffer.concat([buffer, chunk]);
 
       let processMore = true;
@@ -196,7 +233,18 @@ export async function parseMultipartUpload(
               throw new TooManyFilesError(maxFiles);
             }
 
+            const nameMatch = /Content-Disposition:[^\r\n]*\bname="([^"]+)"/i.exec(headersRaw);
+            let clientFileId: string | undefined;
+            if (nameMatch && nameMatch[1]?.startsWith('file:')) {
+              clientFileId = nameMatch[1].slice(5);
+            }
+            const clientFileIdHeader = /X-Client-File-Id:\s*([^\r\n]+)/i.exec(headersRaw);
+            if (clientFileIdHeader?.[1]) {
+              clientFileId = clientFileIdHeader[1].trim();
+            }
+
             currentOriginalName = rawFileName;
+            currentClientFileId = clientFileId;
             currentTempPath = path.join(tempDir, `talentlens-upload-${randomUUID()}.tmp`);
             tempPathsToClean.push(currentTempPath);
             currentFileStream = createWriteStream(currentTempPath);
@@ -231,8 +279,12 @@ export async function parseMultipartUpload(
 
           if (chunkToWrite.length > 0) {
             currentBytes += chunkToWrite.length;
+            totalFilesBytes += chunkToWrite.length;
             if (currentBytes > maxFileSize) {
               throw new FileTooLargeError(Math.round(maxFileSize / (1024 * 1024)));
+            }
+            if (totalFilesBytes > maxTotalBytes) {
+              throw new MultipartUploadError('Total batch upload size exceeds 1 GB limit', 413);
             }
 
             currentHash.update(chunkToWrite);

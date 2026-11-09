@@ -121,4 +121,40 @@ describe('Streaming Multipart Upload Parser', () => {
 
     await expect(parseMultipartUpload(req)).rejects.toThrow(MultipartUploadError);
   });
+
+  it('preserves empty and unsupported-signature parts as rejected entries with clientFileId', async () => {
+    const boundary = '----TestBoundaryReject';
+    const chunks = [
+      Buffer.from(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="file:slot-empty"; filename="empty.pdf"\r\n` +
+          `Content-Type: application/pdf\r\n\r\n\r\n` +
+          `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="file:slot-bad"; filename="malware.exe"\r\n` +
+          `Content-Type: application/octet-stream\r\n\r\n`,
+      ),
+      Buffer.from([0x4d, 0x5a, 0x90, 0x00]),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ];
+    const req = Readable.from([Buffer.concat(chunks)]) as unknown as IncomingMessage;
+    req.headers = { 'content-type': `multipart/form-data; boundary=${boundary}` };
+
+    const parsed = await parseMultipartUpload(req);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]).toMatchObject({
+      clientFileId: 'slot-empty',
+      fileType: null,
+      sizeBytes: 0,
+      tempPath: '',
+    });
+    expect(parsed[0]?.rejectionReason).toContain('empty');
+
+    expect(parsed[1]).toMatchObject({
+      clientFileId: 'slot-bad',
+      fileType: null,
+      sizeBytes: 4,
+      tempPath: '',
+    });
+    expect(parsed[1]?.rejectionReason).toContain('Unsupported');
+  });
 });

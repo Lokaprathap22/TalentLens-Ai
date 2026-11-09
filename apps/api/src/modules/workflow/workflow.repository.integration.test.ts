@@ -4,6 +4,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../../../../packages/database/dist/generated/prisma/client.js';
 import { createConsentRepository, type ConsentRepository } from '../consent/consent.repository.js';
 import {
+  WorkflowConsentRequiredError,
   WorkflowInterviewNotFoundError,
   WorkflowInterviewStateError,
   WorkflowProhibitedFeedbackError,
@@ -12,6 +13,7 @@ import {
   WorkflowSubmissionStateError,
 } from './workflow.errors.js';
 import { createWorkflowRepository, type WorkflowRepository } from './workflow.repository.js';
+import { createWorkflowService } from './workflow.service.js';
 
 const RUN_INTEGRATION = process.env['TALENTLENS_RUN_PG_INTEGRATION'] === '1';
 
@@ -619,6 +621,27 @@ maybeDescribe('workflow repository & service — live postgresql integration tes
       },
     });
     expect(withdrewEvent).not.toBeNull();
+
+    // 6. Verify recruiter candidate detail surfaces WITHDRAWN status while authorization gates still fail closed
+    const detailAfterWithdrawal = await repository.getCandidateDetail(
+      fx.orgId,
+      fx.recruiterUserId,
+      fx.requisitionId,
+      fx.candidateId,
+    );
+    expect(detailAfterWithdrawal?.consent?.status).toBe('WITHDRAWN');
+    expect(
+      await repository.findActiveConsentForRequisition(fx.orgId, fx.candidateId, fx.requisitionId),
+    ).toBeNull();
+
+    const workflowService = createWorkflowService(repository);
+    await expect(
+      workflowService.recordShortlist(
+        { userId: fx.recruiterUserId, organizationId: fx.orgId, role: 'RECRUITER' },
+        fx.requisitionId,
+        fx.candidateId,
+      ),
+    ).rejects.toThrow(WorkflowConsentRequiredError);
   });
 
   it('proves strict cross-client tenant isolation: Client B cannot view Client A submissions', async () => {

@@ -4,7 +4,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
 import type { AuthenticatedPrincipal, SessionService } from '../auth/session.service.js';
-import type { AuthorizationService } from '../authorization/authorization.service.js';
+import {
+  AuthorizationDeniedError,
+  type AuthorizationService,
+} from '../authorization/authorization.service.js';
 import {
   WorkflowClientConflictError,
   WorkflowClientNotFoundError,
@@ -247,7 +250,28 @@ describe('workflow.routes', () => {
             },
           ],
         },
-        feedbackHistory: [],
+        feedbackHistory: [
+          {
+            id: 'dec-iv-1',
+            decision: 'PROPOSE_INTERVIEW',
+            reason: 'Round 1 technical interview',
+            proposedAt: '2026-11-10T10:00:00.000Z',
+            timezone: 'UTC',
+            createdAt: new Date().toISOString(),
+          },
+        ],
+        interviews: [
+          {
+            id: 'iv-1',
+            startAt: '2026-11-10T10:00:00.000Z',
+            endAt: '2026-11-10T10:45:00.000Z',
+            timezone: 'UTC',
+            format: 'VIDEO',
+            status: 'COMPLETED',
+            reason: 'Round 1 technical interview',
+            createdAt: new Date().toISOString(),
+          },
+        ],
       }),
     };
 
@@ -272,6 +296,8 @@ describe('workflow.routes', () => {
     expect(response.body.phone).toBeUndefined();
     expect(response.body.candidateCode).toBeUndefined();
     expect(response.body.assessment.criteria[0].label).toBe('TypeScript');
+    expect(response.body.interviews).toHaveLength(1);
+    expect(response.body.interviews[0].status).toBe('COMPLETED');
   });
 
   it('client feedback rejects decline without reason with 400', async () => {
@@ -328,6 +354,70 @@ describe('workflow.routes', () => {
 
     expect(response.status).toBe(200);
     expect(response.body.decision).toBe('REJECT');
+  });
+
+  it('client feedback enforces client role, active client membership, and CSRF protection (R-02)', async () => {
+    const recruiterSessionService = createMockSessionService(recruiterPrincipal);
+    const hmSessionService = createMockSessionService(hiringManagerPrincipal);
+    const mockService: Partial<WorkflowService> = {
+      recordClientFeedback: vi.fn(),
+    };
+
+    const recruiterApp = createApp({
+      workflow: {
+        service: mockService as WorkflowService,
+        sessionService: recruiterSessionService,
+        authorizationService: createMockAuthService(),
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const recruiterAttempt = await request(recruiterApp)
+      .post(`/api/v1/clients/${clientId}/submissions/${submissionId}/feedback`)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('Origin', applicationOrigin)
+      .set('x-csrf-token', deriveCsrfToken(rawToken))
+      .send({ decision: 'SHORTLIST', reason: 'Strong fit' });
+    expect(recruiterAttempt.status).toBe(403);
+
+    const unauthorizedMembershipAuth = {
+      authorizeClientMembership: vi.fn().mockRejectedValue(new AuthorizationDeniedError()),
+    };
+    const unauthorizedClientApp = createApp({
+      workflow: {
+        service: mockService as WorkflowService,
+        sessionService: hmSessionService,
+        authorizationService: unauthorizedMembershipAuth,
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const crossTenantAttempt = await request(unauthorizedClientApp)
+      .post(`/api/v1/clients/${clientId}/submissions/${submissionId}/feedback`)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('Origin', applicationOrigin)
+      .set('x-csrf-token', deriveCsrfToken(rawToken))
+      .send({ decision: 'SHORTLIST', reason: 'Strong fit' });
+    expect(crossTenantAttempt.status).toBe(403);
+
+    const authorizedClientApp = createApp({
+      workflow: {
+        service: mockService as WorkflowService,
+        sessionService: hmSessionService,
+        authorizationService: createMockAuthService(),
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+    const missingCsrfAttempt = await request(authorizedClientApp)
+      .post(`/api/v1/clients/${clientId}/submissions/${submissionId}/feedback`)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('Origin', applicationOrigin)
+      .send({ decision: 'SHORTLIST', reason: 'Strong fit' });
+    expect(missingCsrfAttempt.status).toBe(403);
+    expect(mockService.recordClientFeedback).not.toHaveBeenCalled();
   });
 
   it('client interview proposal rejects past datetime with 400', async () => {

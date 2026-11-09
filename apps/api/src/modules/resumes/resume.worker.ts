@@ -2,7 +2,13 @@ import type { ResumeRepository } from './resume.repository.js';
 import { createResumeRepository } from './resume.repository.js';
 import type { DocumentStorageService } from './resume.types.js';
 import { createDocumentStorageService } from './resume.storage.js';
-import { createResumeParsingService, type ResumeParsingService } from './resume.parser.js';
+import {
+  createResumeParsingService,
+  EncryptedDocumentError,
+  InvalidDocumentFormatError,
+  SecurityLimitExceededError,
+  type ResumeParsingService,
+} from './resume.parser.js';
 
 export interface ResumeWorkerDependencies {
   repository?: ResumeRepository;
@@ -51,12 +57,16 @@ export class ResumeWorkerProcessor {
       return true;
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : 'Unknown parsing error';
+      const isPermanent =
+        err instanceof SecurityLimitExceededError ||
+        err instanceof InvalidDocumentFormatError ||
+        err instanceof EncryptedDocumentError;
 
       await this.repository.failProcessingJob(
         job.id,
         job.resumeDocumentId,
         errorMessage,
-        false, // will become permanent if attempts >= 3
+        isPermanent, // permanent for deterministic malformed/limit/encrypted docs; otherwise attempts >= 3
       );
 
       return true;

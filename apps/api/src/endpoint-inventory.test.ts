@@ -132,7 +132,7 @@ describe('API Endpoint Inventory Verification', () => {
     const uniqueSet = new Set(enumeratedEndpoints.map((e) => `${e.method} ${e.path}`));
     console.log(`DISTINCT METHOD+PATH COUNT: ${uniqueSet.size}`);
 
-    expect(enumeratedEndpoints.length).toBe(53);
-    expect(uniqueSet.size).toBe(53);
+    expect(enumeratedEndpoints.length).toBe(71);
+    expect(uniqueSet.size).toBe(71);
   });
 });

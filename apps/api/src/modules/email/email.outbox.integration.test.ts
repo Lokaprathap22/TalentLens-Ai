@@ -351,5 +351,404 @@ maybeDescribe(
       expect(provider.sentMessages).toHaveLength(1);
       expect(provider.sentMessages[0]?.to).toBe('manager@example.com');
     });
+
+    describe('Deletion / Email Dispatch Race Concurrency Scenarios (A - E)', () => {
+      it('Scenario A: Dispatch reads message, deletion begins, dispatch tries to claim — claim is rejected', async () => {
+        const key = `test-race-scenario-a-${Date.now()}`;
+        const { record } = await outboxStore.enqueue({
+          organizationId: orgId,
+          idempotencyKey: key,
+          template: 'consent_invitation',
+          recipientEmail: 'candidate-a@example.com',
+          recipientRole: 'CANDIDATE',
+          subject: 'Consent Invitation A',
+          html: '<p>Invite</p>',
+          text: 'Invite',
+        });
+
+        // 1. Candidate deletion begins and cancels pending message
+        await prisma.emailOutbox.update({
+          where: { id: record.id },
+          data: {
+            status: 'FAILED',
+            lastErrorCode: 'CANDIDATE_DELETION_PENDING',
+            lastError: 'Candidate deletion requested; pending email cancelled',
+            encryptedPayload: null,
+          },
+        });
+
+        // 2. Dispatch tries to claim the message for sending
+        const acquired = await outboxStore.markSending(record.id);
+        expect(acquired).toBe(false);
+
+        // 3. Status remains FAILED and cancelled
+        const fresh = await outboxStore.getRecord(record.id);
+        expect(fresh?.status).toBe('FAILED');
+        expect(fresh?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+      });
+
+      it('Scenario B: Dispatch claims message, deletion begins before provider transmission — dispatch halts', async () => {
+        const key = `test-race-scenario-b-${Date.now()}`;
+        const provider = new InMemoryEmailProvider();
+        const service = new TransactionalEmailService({
+          provider,
+          outboxStore,
+          immediateDispatch: false,
+        });
+
+        const { record } = await outboxStore.enqueue({
+          organizationId: orgId,
+          idempotencyKey: key,
+          template: 'consent_invitation',
+          recipientEmail: 'candidate-b@example.com',
+          recipientRole: 'CANDIDATE',
+          subject: 'Consent Invitation B',
+          html: '<p>Invite</p>',
+          text: 'Invite',
+        });
+
+        // 1. Dispatch acquires lease
+        const acquired = await outboxStore.markSending(record.id);
+        expect(acquired).toBe(true);
+        const leasedRecord = await outboxStore.getRecord(record.id);
+        expect(leasedRecord?.status).toBe('SENDING');
+
+        // 2. Deletion cancels and redacts the message before provider send
+        await prisma.emailOutbox.update({
+          where: { id: record.id },
+          data: {
+            status: 'FAILED',
+            lastErrorCode: 'CANDIDATE_DELETION_PENDING',
+            encryptedPayload: null,
+          },
+        });
+
+        // 3. Dispatch tries to send
+        const dispatchResult = await service.dispatchRecord(
+          record.id,
+          leasedRecord?.leaseToken ?? undefined,
+        );
+        expect(dispatchResult.delivered).toBe(false);
+        expect(dispatchResult.error).toContain('cancelled or redacted');
+        expect(provider.sentMessages).toHaveLength(0);
+      });
+
+      it('Scenario C: Deletion redacts message before worker dispatch — claimForDispatch skips cancelled record', async () => {
+        const key = `test-race-scenario-c-${Date.now()}`;
+        const { record } = await outboxStore.enqueue({
+          organizationId: orgId,
+          idempotencyKey: key,
+          template: 'consent_invitation',
+          recipientEmail: 'candidate-c@example.com',
+          recipientRole: 'CANDIDATE',
+          subject: 'Consent Invitation C',
+          html: '<p>Invite</p>',
+          text: 'Invite',
+        });
+
+        // Deletion redacts message before worker poll
+        await prisma.emailOutbox.update({
+          where: { id: record.id },
+          data: {
+            status: 'FAILED',
+            lastErrorCode: 'CANDIDATE_DELETION_PENDING',
+            encryptedPayload: null,
+          },
+        });
+
+        // Worker claim skips the cancelled record
+        const claimed = await outboxStore.claimForDispatch('worker-scenario-c', 10);
+        const found = claimed.find((r) => r.id === record.id);
+        expect(found).toBeUndefined();
+      });
+
+      it('Scenario D: Stale lease tries to mark a cancelled message SENT — update is fenced out', async () => {
+        const key = `test-race-scenario-d-${Date.now()}`;
+        const { record } = await outboxStore.enqueue({
+          organizationId: orgId,
+          idempotencyKey: key,
+          template: 'consent_invitation',
+          recipientEmail: 'candidate-d@example.com',
+          recipientRole: 'CANDIDATE',
+          subject: 'Consent Invitation D',
+          html: '<p>Invite</p>',
+          text: 'Invite',
+        });
+
+        // 1. Worker acquires lease
+        await outboxStore.markSending(record.id);
+        const leasedRecord = await outboxStore.getRecord(record.id);
+        const staleLeaseToken = leasedRecord?.leaseToken ?? undefined;
+        expect(staleLeaseToken).toBeDefined();
+
+        // 2. Deletion cancels the message
+        await prisma.emailOutbox.update({
+          where: { id: record.id },
+          data: {
+            status: 'FAILED',
+            lastErrorCode: 'CANDIDATE_DELETION_PENDING',
+            encryptedPayload: null,
+          },
+        });
+
+        // 3. Stale worker tries to mark SENT
+        await outboxStore.markSent(record.id, 'provider-msg-id-123', staleLeaseToken);
+
+        // 4. Record MUST remain FAILED (not overwritten by SENT)
+        const finalRecord = await outboxStore.getRecord(record.id);
+        expect(finalRecord?.status).toBe('FAILED');
+        expect(finalRecord?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+      });
+
+      it('Scenario E: Candidate does not exist or database lookup fails — manualRetry is blocked', async () => {
+        const key = `test-race-scenario-e-${Date.now()}`;
+        const { record } = await outboxStore.enqueue({
+          organizationId: orgId,
+          idempotencyKey: key,
+          template: 'consent_invitation',
+          recipientEmail: 'candidate-e@example.com',
+          recipientRole: 'CANDIDATE',
+          subject: 'Consent Invitation E',
+          html: '<p>Invite</p>',
+          text: 'Invite',
+        });
+
+        // Mark as cancelled due to candidate deletion
+        await prisma.emailOutbox.update({
+          where: { id: record.id },
+          data: {
+            status: 'FAILED',
+            lastErrorCode: 'CANDIDATE_DELETION_PENDING',
+            encryptedPayload: null,
+          },
+        });
+
+        // Manual retry must be blocked on terminal cancelled record
+        const retryResult = await outboxStore.manualRetry(record.id);
+        expect(retryResult).toBeNull();
+      });
+    });
+
+    describe('CandidateId Retention, Claim Filtering & Manual Retry Safety', () => {
+      it('markSent preserves payloadJson.candidateId while recording messageId', async () => {
+        const cand = await prisma.candidate.create({
+          data: {
+            organizationId: orgId,
+            candidateCode: `CAN-OUTBOX-${randomUUID().slice(0, 6).toUpperCase()}`,
+            recordStatus: 'ACTIVE',
+          },
+        });
+
+        const key = `test-marksent-cand-${Date.now()}`;
+        let recordId = '';
+        try {
+          const { record } = await outboxStore.enqueue({
+            organizationId: orgId,
+            idempotencyKey: key,
+            template: 'consent_invitation',
+            recipientEmail: 'cand-preserve@example.com',
+            recipientRole: 'CANDIDATE',
+            subject: 'Preserve CandidateId',
+            html: '<p>Hi</p>',
+            text: 'Hi',
+            metadata: { candidateId: cand.id },
+          });
+          recordId = record.id;
+
+          const acquired = await outboxStore.markSending(record.id, 'test-worker');
+          expect(acquired).toBe(true);
+          const leased = await outboxStore.getRecord(record.id);
+
+          await outboxStore.markSent(
+            record.id,
+            'msg-preserved-123',
+            leased?.leaseToken ?? undefined,
+          );
+
+          const rawRow = await prisma.emailOutbox.findUnique({ where: { id: record.id } });
+          expect(rawRow?.status).toBe('SENT');
+          const pj = rawRow?.payloadJson as Record<string, unknown> | null;
+          expect(pj?.['candidateId']).toBe(cand.id);
+          expect(pj?.['messageId']).toBe('msg-preserved-123');
+        } finally {
+          if (recordId) {
+            await prisma.emailOutbox.deleteMany({ where: { id: recordId } }).catch(() => {});
+          }
+          await prisma.candidate.deleteMany({ where: { id: cand.id } }).catch(() => {});
+        }
+      });
+
+      it('manualRetry refuses PERMANENTLY_REJECTED, SENDING, and DELETION_PENDING candidate emails', async () => {
+        const cand = await prisma.candidate.create({
+          data: {
+            organizationId: orgId,
+            candidateCode: `CAN-RETRY-${randomUUID().slice(0, 6).toUpperCase()}`,
+            recordStatus: 'ACTIVE',
+          },
+        });
+
+        const permKey = `test-retry-perm-${Date.now()}`;
+        const sendKey = `test-retry-send-${Date.now()}`;
+        const delKey = `test-retry-del-${Date.now()}`;
+        const createdIds: string[] = [];
+
+        try {
+          const perm = await outboxStore.enqueue({
+            organizationId: orgId,
+            idempotencyKey: permKey,
+            template: 'consent_invitation',
+            recipientEmail: 'perm@example.com',
+            recipientRole: 'CANDIDATE',
+            subject: 'Perm',
+            html: '<p>Perm</p>',
+            text: 'Perm',
+          });
+          createdIds.push(perm.record.id);
+          await outboxStore.markSending(perm.record.id);
+          const permLeased = await outboxStore.getRecord(perm.record.id);
+          await outboxStore.markFailed(
+            perm.record.id,
+            '550 permanent',
+            true,
+            permLeased?.leaseToken ?? undefined,
+          );
+          expect(await outboxStore.manualRetry(perm.record.id)).toBeNull();
+          expect((await outboxStore.getRecord(perm.record.id))?.status).toBe(
+            'PERMANENTLY_REJECTED',
+          );
+
+          const sending = await outboxStore.enqueue({
+            organizationId: orgId,
+            idempotencyKey: sendKey,
+            template: 'consent_invitation',
+            recipientEmail: 'sending@example.com',
+            recipientRole: 'CANDIDATE',
+            subject: 'Sending',
+            html: '<p>Sending</p>',
+            text: 'Sending',
+          });
+          createdIds.push(sending.record.id);
+          await outboxStore.markSending(sending.record.id);
+          expect(await outboxStore.manualRetry(sending.record.id)).toBeNull();
+          expect((await outboxStore.getRecord(sending.record.id))?.status).toBe('SENDING');
+
+          const del = await outboxStore.enqueue({
+            organizationId: orgId,
+            idempotencyKey: delKey,
+            template: 'consent_invitation',
+            recipientEmail: 'del-retry@example.com',
+            recipientRole: 'CANDIDATE',
+            subject: 'Del Retry',
+            html: '<p>Del</p>',
+            text: 'Del',
+            metadata: { candidateId: cand.id },
+          });
+          createdIds.push(del.record.id);
+          await outboxStore.markSending(del.record.id);
+          const delLeased = await outboxStore.getRecord(del.record.id);
+          await outboxStore.markFailed(
+            del.record.id,
+            '421 transient',
+            false,
+            delLeased?.leaseToken ?? undefined,
+          );
+          // Candidate moves to DELETION_PENDING before admin manualRetry
+          await prisma.candidate.update({
+            where: { id: cand.id },
+            data: { recordStatus: 'DELETION_PENDING' },
+          });
+
+          const blocked = await outboxStore.manualRetry(del.record.id);
+          expect(blocked).toBeNull();
+          const finalDel = await prisma.emailOutbox.findUnique({ where: { id: del.record.id } });
+          expect(finalDel?.status).toBe('FAILED');
+          expect(finalDel?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+          expect(finalDel?.encryptedPayload).toBeNull();
+        } finally {
+          if (createdIds.length > 0) {
+            await prisma.emailOutbox
+              .deleteMany({ where: { id: { in: createdIds } } })
+              .catch(() => {});
+          }
+          await prisma.candidate.deleteMany({ where: { id: cand.id } }).catch(() => {});
+        }
+      });
+
+      it('claimForDispatch cancels DELETION_PENDING candidate emails and continues to claim eligible active emails', async () => {
+        // Ensure clean slate of unowned pending items before queue test
+        await prisma.emailOutbox.deleteMany({
+          where: {
+            organizationId: orgId,
+            status: 'PENDING',
+          },
+        });
+
+        const candDeleted = await prisma.candidate.create({
+          data: {
+            organizationId: orgId,
+            candidateCode: `CAN-SKIP-${randomUUID().slice(0, 6).toUpperCase()}`,
+            recordStatus: 'DELETION_PENDING',
+          },
+        });
+        const candActive = await prisma.candidate.create({
+          data: {
+            organizationId: orgId,
+            candidateCode: `CAN-OK-${randomUUID().slice(0, 6).toUpperCase()}`,
+            recordStatus: 'ACTIVE',
+          },
+        });
+
+        const createdIds: string[] = [];
+        try {
+          const cancelledItem = await outboxStore.enqueue({
+            organizationId: orgId,
+            idempotencyKey: `test-claim-skip-del-${Date.now()}`,
+            template: 'consent_invitation',
+            recipientEmail: 'skip-me@example.com',
+            recipientRole: 'CANDIDATE',
+            subject: 'Should be cancelled',
+            html: '<p>Skip</p>',
+            text: 'Skip',
+            metadata: { candidateId: candDeleted.id },
+          });
+          createdIds.push(cancelledItem.record.id);
+
+          const activeItem = await outboxStore.enqueue({
+            organizationId: orgId,
+            idempotencyKey: `test-claim-ok-act-${Date.now()}`,
+            template: 'consent_invitation',
+            recipientEmail: 'claim-me@example.com',
+            recipientRole: 'CANDIDATE',
+            subject: 'Should be claimed',
+            html: '<p>Claim</p>',
+            text: 'Claim',
+            metadata: { candidateId: candActive.id },
+          });
+          createdIds.push(activeItem.record.id);
+
+          const claimed = await outboxStore.claimForDispatch('worker-filter-test', 5);
+          expect(claimed.some((r) => r.id === activeItem.record.id)).toBe(true);
+          expect(claimed.some((r) => r.id === cancelledItem.record.id)).toBe(false);
+
+          const cancelledRow = await prisma.emailOutbox.findUnique({
+            where: { id: cancelledItem.record.id },
+          });
+          expect(cancelledRow?.status).toBe('FAILED');
+          expect(cancelledRow?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+          expect(cancelledRow?.encryptedPayload).toBeNull();
+        } finally {
+          if (createdIds.length > 0) {
+            await prisma.emailOutbox
+              .deleteMany({ where: { id: { in: createdIds } } })
+              .catch(() => {});
+          }
+          await prisma.candidate
+            .deleteMany({
+              where: { id: { in: [candDeleted.id, candActive.id] } },
+            })
+            .catch(() => {});
+        }
+      });
+    });
   },
 );

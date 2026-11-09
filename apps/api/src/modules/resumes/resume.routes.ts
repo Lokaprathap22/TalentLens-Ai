@@ -8,6 +8,7 @@ import { createRequireSession } from '../../middleware/require-session.js';
 import { createRequireSameOrigin } from '../../middleware/origin-protection.js';
 import type { AuthenticatedPrincipal, SessionService } from '../auth/session.service.js';
 import {
+  BatchNotFoundError,
   ExtractionNotFoundError,
   RequisitionNotFoundError,
   ResumeNotFoundError,
@@ -35,7 +36,8 @@ function handleError(error: unknown, response: Response): void {
   if (
     error instanceof RequisitionNotFoundError ||
     error instanceof ResumeNotFoundError ||
-    error instanceof ExtractionNotFoundError
+    error instanceof ExtractionNotFoundError ||
+    error instanceof BatchNotFoundError
   ) {
     response.status(404).json({ error: 'not_found' });
   } else if (error instanceof ResumeRoleError) {
@@ -69,12 +71,70 @@ export function createResumeRouter(dependencies: ResumeRouterDependencies): Rout
       return;
     }
 
+    const rawBatchId =
+      (typeof request.query['batchId'] === 'string' ? request.query['batchId'] : undefined) ??
+      (typeof request.headers['x-batch-id'] === 'string'
+        ? request.headers['x-batch-id']
+        : undefined);
+    const existingBatchId = rawBatchId ? (parseUuid(rawBatchId) ?? undefined) : undefined;
+    const isFinal = request.query['isFinal'] === 'true' || request.headers['x-is-final'] === 'true';
+
     try {
       const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
-      const result = await dependencies.service.uploadResumes(principal, requisitionId, request);
+      const result = await dependencies.service.uploadResumes(
+        principal,
+        requisitionId,
+        request,
+        existingBatchId,
+      );
+
+      if (isFinal && result.batchId) {
+        await dependencies.service.finalizeBatch(principal, requisitionId, result.batchId);
+      }
 
       const statusCode = result.acceptedCount > 0 ? 201 : 200;
       response.status(statusCode).json(result);
+    } catch (error) {
+      handleError(error, response);
+    }
+  });
+
+  // 1b. Finalize a resume processing batch
+  router.post(
+    '/:requisitionId/resumes/batches/:batchId/finalize',
+    sameOrigin,
+    requireCsrf,
+    async (request, response) => {
+      const requisitionId = parseUuid(request.params['requisitionId']);
+      const batchId = parseUuid(request.params['batchId']);
+      if (!requisitionId || !batchId) {
+        response.status(400).json({ error: 'invalid_request' });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const result = await dependencies.service.finalizeBatch(principal, requisitionId, batchId);
+        response.status(200).json(result);
+      } catch (error) {
+        handleError(error, response);
+      }
+    },
+  );
+
+  // 1c. Read-only batch status lookup for safe retry/finalization reconciliation
+  router.get('/:requisitionId/resumes/batches/:batchId', async (request, response) => {
+    const requisitionId = parseUuid(request.params['requisitionId']);
+    const batchId = parseUuid(request.params['batchId']);
+    if (!requisitionId || !batchId) {
+      response.status(400).json({ error: 'invalid_request' });
+      return;
+    }
+
+    try {
+      const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+      const result = await dependencies.service.getBatchStatus(principal, requisitionId, batchId);
+      response.status(200).json(result);
     } catch (error) {
       handleError(error, response);
     }

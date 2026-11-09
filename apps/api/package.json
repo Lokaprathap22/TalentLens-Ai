@@ -12,6 +12,7 @@
     "bootstrap": "tsx src/scripts/bootstrap.ts"
   },
   "dependencies": {
+    "@google/genai": "3.0.0",
     "@talentlens/assessment-engine": "0.1.0",
     "@talentlens/database": "0.1.0",
     "@talentlens/document-processing": "0.1.0",

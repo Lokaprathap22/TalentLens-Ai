@@ -5,9 +5,13 @@ import type {
   CandidateShortlistDto,
   CandidateSubmissionDto,
   CandidateTimelineDto,
+  ClientMemberDto,
   ClientSubmissionDetailDto,
   ClientSubmissionSummaryDto,
+  DashboardSummaryResponseDto,
   InterviewProposalDto,
+  ListGlobalCandidatesResponseDto,
+  ListInterviewsResponseDto,
   RecruiterCandidateDetailDto,
   RecruiterCandidateSummaryDto,
 } from './workflow.dto.js';
@@ -28,7 +32,13 @@ import {
   WorkflowShortlistRequiredError,
   WorkflowSubmissionNotFoundError,
 } from './workflow.errors.js';
-import type { CreateClientInput, UpdateClientInput } from './workflow.schemas.js';
+import type {
+  CreateClientInput,
+  InviteClientMemberInput,
+  ListGlobalCandidatesInput,
+  ListInterviewsInput,
+  UpdateClientInput,
+} from './workflow.schemas.js';
 
 export interface WorkflowService {
   listCandidatesForRequisition(
@@ -37,6 +47,9 @@ export interface WorkflowService {
     options: {
       limit: number;
       offset: number;
+      search?: string | undefined;
+      sortBy?: 'activity' | 'score' | 'uploadedAt' | undefined;
+      sortOrder?: 'asc' | 'desc' | undefined;
       processingStatus?: string | undefined;
       assessmentStatus?: string | undefined;
       reviewDecision?: string | undefined;
@@ -108,6 +121,16 @@ export interface WorkflowService {
       reason: string | null;
       proposedAt: string | null;
       timezone: string | null;
+      createdAt: string;
+    }>;
+    interviews?: Array<{
+      id: string;
+      startAt: string;
+      endAt: string;
+      timezone: string;
+      format: string;
+      status: string;
+      reason: string | null;
       createdAt: string;
     }>;
   }>;
@@ -191,15 +214,47 @@ export interface WorkflowService {
     input: UpdateClientInput,
   ): Promise<AuthorizedClientDto>;
 
+  getClient(principal: AuthenticatedPrincipal, clientId: string): Promise<AuthorizedClientDto>;
+
+  listClientMembers(
+    principal: AuthenticatedPrincipal,
+    clientId: string,
+  ): Promise<ClientMemberDto[]>;
+
+  inviteClientMember(
+    principal: AuthenticatedPrincipal,
+    clientId: string,
+    input: InviteClientMemberInput,
+  ): Promise<ClientMemberDto>;
+
   getCandidateTimeline(
     principal: AuthenticatedPrincipal,
     requisitionId: string,
     candidateId: string,
     options: { limit: number; offset: number },
   ): Promise<CandidateTimelineDto>;
+
+  listGlobalCandidates(
+    principal: AuthenticatedPrincipal,
+    options: ListGlobalCandidatesInput,
+  ): Promise<ListGlobalCandidatesResponseDto>;
+
+  listInterviews(
+    principal: AuthenticatedPrincipal,
+    options: ListInterviewsInput,
+  ): Promise<ListInterviewsResponseDto>;
+
+  getDashboardSummary(principal: AuthenticatedPrincipal): Promise<DashboardSummaryResponseDto>;
 }
 
-export function createWorkflowService(repository: WorkflowRepository): WorkflowService {
+export interface WorkflowServiceOptions {
+  applicationOrigin?: string | undefined;
+}
+
+export function createWorkflowService(
+  repository: WorkflowRepository,
+  options?: WorkflowServiceOptions,
+): WorkflowService {
   function requireRecruiter(principal: AuthenticatedPrincipal): void {
     if (principal.role !== 'RECRUITER') {
       throw new WorkflowRequisitionAccessDeniedError('Principal must be a RECRUITER');
@@ -667,6 +722,7 @@ export function createWorkflowService(repository: WorkflowRepository): WorkflowS
           timezone: f.timezone ?? null,
           createdAt: f.createdAt.toISOString(),
         })),
+        ...(submission.interviews ? { interviews: submission.interviews } : {}),
       };
     },
 
@@ -726,6 +782,7 @@ export function createWorkflowService(repository: WorkflowRepository): WorkflowS
           timezone: f.timezone ?? null,
           createdAt: f.createdAt.toISOString(),
         })),
+        ...(submission.interviews ? { interviews: submission.interviews } : {}),
       };
     },
 
@@ -942,6 +999,67 @@ export function createWorkflowService(repository: WorkflowRepository): WorkflowS
       };
     },
 
+    async getClient(principal, clientId) {
+      if (principal.role !== 'RECRUITER' && principal.role !== 'CLIENT_HIRING_MANAGER') {
+        throw new WorkflowClientUnauthorizedError('Not authorized to view client');
+      }
+
+      if (!repository.getClient) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      const client = await repository.getClient(principal.organizationId, clientId);
+      if (!client) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      if (principal.role === 'CLIENT_HIRING_MANAGER') {
+        const authorized = await repository.listAuthorizedClients?.(
+          principal.organizationId,
+          principal.userId,
+          principal.role,
+        );
+        const hasAccess = authorized?.some((c) => c.id === clientId);
+        if (!hasAccess) {
+          throw new WorkflowClientNotFoundError();
+        }
+      }
+
+      return {
+        id: client.id,
+        name: client.name,
+        status: client.status,
+        createdAt: client.createdAt.toISOString(),
+        updatedAt: client.updatedAt.toISOString(),
+      };
+    },
+
+    async listClientMembers(principal, clientId) {
+      requireRecruiter(principal);
+
+      if (!repository.listClientMembers) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      return await repository.listClientMembers(principal.organizationId, clientId);
+    },
+
+    async inviteClientMember(principal, clientId, input) {
+      requireRecruiter(principal);
+
+      if (!repository.inviteClientMember) {
+        throw new WorkflowClientNotFoundError();
+      }
+
+      return await repository.inviteClientMember(
+        principal.organizationId,
+        principal.userId,
+        clientId,
+        input,
+        { applicationOrigin: options?.applicationOrigin },
+      );
+    },
+
     async getCandidateTimeline(principal, requisitionId, candidateId, options) {
       requireRecruiter(principal);
 
@@ -987,6 +1105,52 @@ export function createWorkflowService(repository: WorkflowRepository): WorkflowS
         limit: options.limit,
         offset: options.offset,
       };
+    },
+
+    async listGlobalCandidates(principal, options) {
+      requireRecruiter(principal);
+
+      if (!repository.listGlobalCandidates) {
+        throw new Error('Global candidate listing is not supported by the configured repository');
+      }
+
+      return repository.listGlobalCandidates(principal.organizationId, principal.userId, options);
+    },
+
+    async listInterviews(principal, options) {
+      if (principal.role !== 'RECRUITER' && principal.role !== 'CLIENT_HIRING_MANAGER') {
+        throw new WorkflowClientUnauthorizedError(
+          'Only recruiters and client hiring managers may view interviews.',
+        );
+      }
+
+      if (!repository.listInterviews) {
+        throw new Error('Interview listing is not supported by the configured repository');
+      }
+
+      return repository.listInterviews(principal, options);
+    },
+
+    async getDashboardSummary(principal) {
+      if (principal.role === 'RECRUITER') {
+        if (!repository.getRecruiterDashboardSummary) {
+          throw new Error(
+            'Recruiter dashboard summary is not supported by the configured repository',
+          );
+        }
+        return repository.getRecruiterDashboardSummary(principal.organizationId);
+      }
+
+      if (principal.role === 'CLIENT_HIRING_MANAGER') {
+        if (!repository.getClientDashboardSummary) {
+          throw new Error('Client dashboard summary is not supported by the configured repository');
+        }
+        return repository.getClientDashboardSummary(principal);
+      }
+
+      throw new WorkflowClientUnauthorizedError(
+        'Only recruiters and client hiring managers may view the dashboard summary.',
+      );
     },
   };
 }

@@ -97,6 +97,19 @@ export class WorkflowClientConflictError extends Error {
   }
 }
 
+export class WorkflowClientMemberConflictError extends Error {
+  readonly code: string;
+
+  constructor(
+    message = 'A member conflict occurred for this client',
+    code = 'duplicate_membership',
+  ) {
+    super(message);
+    this.name = 'WorkflowClientMemberConflictError';
+    this.code = code;
+  }
+}
+
 export class WorkflowInterviewNotFoundError extends Error {
   constructor(message = 'Interview proposal record not found') {
     super(message);

@@ -1,5 +1,6 @@
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
+import zlib from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
@@ -27,15 +28,16 @@ const hiringManagerPrincipal: AuthenticatedPrincipal = {
 };
 
 function createMockUploadStream(
-  files: Array<{ filename: string; content: Buffer }>,
+  files: Array<{ filename: string; content: Buffer; fieldname?: string }>,
   boundary = '----TestBoundaryXYZ',
 ): IncomingMessage {
   const chunks: Buffer[] = [];
   for (const f of files) {
+    const nameField = f.fieldname ?? 'files';
     chunks.push(
       Buffer.from(
         `--${boundary}\r\n` +
-          `Content-Disposition: form-data; name="files"; filename="${f.filename}"\r\n` +
+          `Content-Disposition: form-data; name="${nameField}"; filename="${f.filename}"\r\n` +
           `Content-Type: application/octet-stream\r\n\r\n`,
       ),
     );
@@ -544,6 +546,163 @@ describe('Resume Ingestion Service — Security and Ingestion Controls', () => {
       expect(result.rejectedCount).toBe(1);
       expect(result.rejected[0]?.reason).toContain('Win.Test.EICAR_HDB-1');
       expect(saveSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Per-slot clientFileId correlation', () => {
+    it('propagates clientFileId from file:<id> multipart fields across accepted, duplicate, and rejected items', async () => {
+      const pdfBytes = Buffer.from('%PDF-1.4 same-name valid pdf');
+      const mockRepo: Partial<ResumeRepository> = {
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'req-uuid-1',
+          title: 'Engineer',
+          organizationId: 'org-uuid-1',
+        })),
+        findExistingResumeBySha256: vi.fn(async () => null),
+        createResumeBatch: vi.fn<ResumeRepository['createResumeBatch']>(async (_p, _r, files) => ({
+          batchId: 'batch-client-id',
+          accepted: files.map((file, idx) => ({
+            clientFileId: file.clientFileId,
+            resumeDocumentId: `doc-${idx + 1}`,
+            candidateId: `cand-${idx + 1}`,
+            candidateCode: `CAN-900${idx + 1}`,
+            fileName: file.fileName,
+            fileType: file.fileType,
+            sizeBytes: file.sizeBytes,
+            sha256: file.sha256,
+          })),
+        })),
+      };
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+        storageService: mockStorageService,
+      });
+
+      const req = createMockUploadStream([
+        { fieldname: 'file:slot-a', filename: 'resume.pdf', content: pdfBytes },
+        { fieldname: 'file:slot-b', filename: 'resume.pdf', content: pdfBytes }, // intra-batch duplicate
+        { fieldname: 'file:slot-c', filename: 'resume.pdf', content: Buffer.from('not a pdf') }, // rejected
+      ]);
+
+      const result = await service.uploadResumes(recruiterPrincipal, 'req-uuid-1', req);
+
+      expect(result.acceptedCount).toBe(1);
+      expect(result.duplicateCount).toBe(1);
+      expect(result.rejectedCount).toBe(1);
+
+      expect(result.accepted[0]?.clientFileId).toBe('slot-a');
+      expect(result.duplicates[0]?.clientFileId).toBe('slot-b');
+      expect(result.rejected[0]?.clientFileId).toBe('slot-c');
+    });
+
+    it('preserves existingBatchId when a retry chunk produces 0 accepted files so finalization can close the batch', async () => {
+      const mockRepo: Partial<ResumeRepository> = {
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'req-uuid-1',
+          title: 'Engineer',
+          organizationId: 'org-uuid-1',
+        })),
+        findExistingResumeBySha256: vi.fn(async () => ({
+          id: 'existing-doc-1',
+          sha256: 'hash',
+          candidateId: 'cand-1',
+          candidateCode: 'CAN-1',
+          parseStatus: 'PARSED',
+        })),
+        createResumeBatch: vi.fn(),
+      };
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+        storageService: mockStorageService,
+      });
+
+      const existingBatchId = 'batch-open-123';
+      const reqWithExisting = createMockUploadStream([
+        { filename: 'dup.pdf', content: Buffer.from('%PDF-1.4 already exists') },
+      ]);
+      const withBatchResult = await service.uploadResumes(
+        recruiterPrincipal,
+        'req-uuid-1',
+        reqWithExisting,
+        existingBatchId,
+      );
+
+      expect(withBatchResult.acceptedCount).toBe(0);
+      expect(withBatchResult.duplicateCount).toBe(1);
+      expect(withBatchResult.batchId).toBe(existingBatchId);
+      expect(mockRepo.createResumeBatch).not.toHaveBeenCalled();
+
+      const reqWithoutExisting = createMockUploadStream([
+        { filename: 'dup.pdf', content: Buffer.from('%PDF-1.4 already exists') },
+      ]);
+      const withoutBatchResult = await service.uploadResumes(
+        recruiterPrincipal,
+        'req-uuid-1',
+        reqWithoutExisting,
+      );
+      expect(withoutBatchResult.acceptedCount).toBe(0);
+      expect(withoutBatchResult.batchId).toBeNull();
+    });
+  });
+
+  describe('P1-01 Decompression bomb pre-validation at upload boundary', () => {
+    it('rejects compressed DOCX bombs and oversized PDF image/page bombs before persisting to storage', async () => {
+      const saveSpy = vi.fn();
+      const createBatchSpy = vi.fn();
+      const mockStorage: DocumentStorageService = {
+        save: saveSpy,
+        saveFromPath: saveSpy,
+        read: vi.fn(),
+        delete: vi.fn(),
+        exists: vi.fn(),
+      };
+      const mockRepo: Partial<ResumeRepository> = {
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'req-1',
+          title: 'Role',
+          organizationId: 'org-1',
+        })),
+        findExistingResumeBySha256: vi.fn(async () => null),
+        createResumeBatch: createBatchSpy,
+      };
+
+      const docxXmlBomb = Buffer.from(
+        `<w:document><w:body><w:p><w:t>${'Z'.repeat(300_000)}</w:t></w:p></w:body></w:document>`,
+        'utf8',
+      );
+      const docxDeflated = zlib.deflateRawSync(docxXmlBomb);
+      const docxName = Buffer.from('word/document.xml', 'utf8');
+      const docxHeader = Buffer.alloc(30);
+      docxHeader.writeUInt32LE(0x04034b50, 0);
+      docxHeader.writeUInt16LE(8, 8);
+      docxHeader.writeUInt32LE(docxDeflated.length, 18);
+      docxHeader.writeUInt32LE(docxXmlBomb.length, 22);
+      docxHeader.writeUInt16LE(docxName.length, 26);
+      const docxBomb = Buffer.concat([docxHeader, docxName, docxDeflated]);
+
+      const oversizedPdf = Buffer.from(
+        '%PDF-1.4\n1 0 obj << /Type /XObject /Subtype /Image /Width 30000 /Height 30000 >> endobj\n%%EOF',
+        'latin1',
+      );
+
+      const service = createResumeService({
+        repository: mockRepo as ResumeRepository,
+        storageService: mockStorage,
+      });
+
+      const req = createMockUploadStream([
+        { filename: 'bomb.docx', content: docxBomb },
+        { filename: 'huge-image.pdf', content: oversizedPdf },
+      ]);
+
+      const result = await service.uploadResumes(recruiterPrincipal, 'req-1', req);
+
+      expect(result.acceptedCount).toBe(0);
+      expect(result.rejectedCount).toBe(2);
+      expect(saveSpy).not.toHaveBeenCalled();
+      expect(createBatchSpy).not.toHaveBeenCalled();
     });
   });
 });

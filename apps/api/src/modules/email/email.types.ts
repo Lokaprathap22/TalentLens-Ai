@@ -1,9 +1,12 @@
 export type EmailTemplateType =
   | 'consent_invitation'
   | 'withdrawal_verification'
+  | 'candidate_deletion_verification'
   | 'client_submission'
   | 'client_feedback'
-  | 'interview_notification';
+  | 'interview_notification'
+  | 'account_activation'
+  | 'password_reset';
 
 export type OutboxStatus = 'PENDING' | 'SENDING' | 'SENT' | 'FAILED' | 'PERMANENTLY_REJECTED';
 

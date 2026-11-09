@@ -9,6 +9,8 @@ import type {
   RecipientRole,
 } from './email.types.js';
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export interface EmailOutboxStore {
   enqueue(
     input: EnqueueEmailInput,
@@ -86,6 +88,12 @@ export class InMemoryEmailOutboxStore implements EmailOutboxStore {
       if (record.status !== 'PENDING') {
         continue;
       }
+      if (
+        record.lastErrorCode === 'CANDIDATE_DELETION_PENDING' ||
+        record.metadata?.['erased'] === true
+      ) {
+        continue;
+      }
       if (record.nextAttemptAt && new Date(record.nextAttemptAt).getTime() > now) {
         continue;
       }
@@ -126,7 +134,14 @@ export class InMemoryEmailOutboxStore implements EmailOutboxStore {
     leaseDurationSeconds = 120,
   ): Promise<boolean> {
     const record = this.records.get(id);
-    if (!record || record.status === 'SENT' || record.status === 'PERMANENTLY_REJECTED') {
+    if (
+      !record ||
+      record.status === 'SENT' ||
+      record.status === 'PERMANENTLY_REJECTED' ||
+      record.lastErrorCode === 'CANDIDATE_DELETION_PENDING' ||
+      record.metadata?.['erased'] === true ||
+      (!record.recipientEmail && record.status === 'FAILED')
+    ) {
       return false;
     }
 
@@ -144,9 +159,20 @@ export class InMemoryEmailOutboxStore implements EmailOutboxStore {
   public async markSent(id: string, messageId?: string, leaseToken?: string): Promise<void> {
     const record = this.records.get(id);
     if (!record) return;
+    if (record.status !== 'SENDING') return;
+    if (
+      record.lastErrorCode === 'CANDIDATE_DELETION_PENDING' ||
+      record.metadata?.['erased'] === true
+    ) {
+      return;
+    }
 
     if (leaseToken && record.leaseToken && record.leaseToken !== leaseToken) {
       return; // Fenced stale worker
+    }
+
+    if (record.leaseExpiresAt && new Date(record.leaseExpiresAt).getTime() <= Date.now()) {
+      return; // Expired lease
     }
 
     record.status = 'SENT';
@@ -155,8 +181,8 @@ export class InMemoryEmailOutboxStore implements EmailOutboxStore {
     record.leaseExpiresAt = null;
     record.lockedBy = null;
     record.lastError = undefined;
-    if (messageId && record.metadata) {
-      record.metadata['messageId'] = messageId;
+    if (messageId) {
+      record.metadata = { ...(record.metadata ?? {}), messageId };
     }
   }
 
@@ -168,6 +194,13 @@ export class InMemoryEmailOutboxStore implements EmailOutboxStore {
   ): Promise<void> {
     const record = this.records.get(id);
     if (!record) return;
+    if (
+      record.status !== 'SENDING' ||
+      record.lastErrorCode === 'CANDIDATE_DELETION_PENDING' ||
+      record.metadata?.['erased'] === true
+    ) {
+      return;
+    }
 
     if (leaseToken && record.leaseToken && record.leaseToken !== leaseToken) {
       return; // Fenced stale worker
@@ -223,8 +256,15 @@ export class InMemoryEmailOutboxStore implements EmailOutboxStore {
     const record = this.records.get(id);
     if (!record) return null;
 
-    if (record.status === 'SENT') {
-      return record;
+    if (
+      record.status === 'SENT' ||
+      record.status === 'PERMANENTLY_REJECTED' ||
+      record.status === 'SENDING' ||
+      record.lastErrorCode === 'CANDIDATE_DELETION_PENDING' ||
+      record.metadata?.['erased'] === true ||
+      !record.recipientEmail
+    ) {
+      return null;
     }
 
     record.status = 'PENDING';
@@ -353,6 +393,12 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
       { recordId: id, idempotencyKey: input.idempotencyKey },
     );
 
+    const rawCandidateId = input.metadata?.['candidateId'];
+    const candidateId =
+      typeof rawCandidateId === 'string' && rawCandidateId.trim().length > 0
+        ? rawCandidateId.trim()
+        : undefined;
+
     try {
       const created = await client.emailOutbox.create({
         data: {
@@ -365,6 +411,7 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
           subject: null,
           html: null,
           text: null,
+          payloadJson: candidateId ? ({ candidateId } as Prisma.InputJsonValue) : Prisma.DbNull,
           encryptedPayload,
           keyId,
           status: 'PENDING',
@@ -391,51 +438,143 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
     const rows = await this.database.emailOutbox.findMany({
       where: {
         status: 'PENDING',
-        OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
+        encryptedPayload: { not: null },
+        OR: [{ lastErrorCode: null }, { lastErrorCode: { not: 'CANDIDATE_DELETION_PENDING' } }],
+        AND: [{ OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }] }],
       },
       orderBy: { createdAt: 'asc' },
       take: limit,
     });
 
-    return rows.map((r) => this.mapPrismaRecord(r));
+    return rows
+      .filter((r) => {
+        const pj = r.payloadJson as Record<string, unknown> | null;
+        return pj?.['erased'] !== true;
+      })
+      .map((r) => this.mapPrismaRecord(r));
   }
 
   /**
-   * Atomically claims eligible pending records or expired leases using SELECT ... FOR UPDATE SKIP LOCKED.
+   * Atomically claims eligible pending records or expired leases using
+   * Global Lock Order: candidates FOR UPDATE -> email_outbox FOR UPDATE SKIP LOCKED.
    */
   public async claimForDispatch(
     workerId: string,
     limit = 10,
     leaseDurationSeconds = 120,
   ): Promise<OutboxRecord[]> {
-    return this.database.$transaction(async (tx) => {
-      const eligible = await tx.$queryRaw<
-        Array<{ id: string; attempts: number; max_attempts: number; status: string }>
-      >(
-        Prisma.sql`
-          SELECT id, attempts, max_attempts, status
+    const claimed: OutboxRecord[] = [];
+    const skippedIds: string[] = [];
+    const maxIterations = Math.max(limit * 10, 100);
+
+    for (let iter = 0; iter < maxIterations && claimed.length < limit; iter += 1) {
+      const step = await this.database.$transaction(async (tx) => {
+        const excludeClause =
+          skippedIds.length > 0
+            ? Prisma.sql`AND id NOT IN (${Prisma.join(skippedIds.map((id) => Prisma.sql`${id}::uuid`))})`
+            : Prisma.empty;
+
+        // Peek unlocked row first so candidate lock can always be acquired BEFORE email_outbox lock
+        const peekRows = await tx.$queryRaw<
+          Array<{ id: string; candidate_id: string | null }>
+        >(Prisma.sql`
+          SELECT id, payload_json->>'candidateId' AS candidate_id
           FROM email_outbox
           WHERE (
             (status = 'PENDING' AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
             OR (status = 'SENDING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= clock_timestamp())
           )
+          AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+          AND COALESCE((payload_json->>'erased')::boolean, false) = false
+          AND encrypted_payload IS NOT NULL
+          ${excludeClause}
           ORDER BY created_at ASC
-          LIMIT ${limit}
+          LIMIT 1
+        `);
+
+        const peek = peekRows[0];
+        if (!peek) {
+          return { kind: 'empty' as const };
+        }
+
+        if (peek.candidate_id) {
+          let isCandidateActive = false;
+          if (UUID_REGEX.test(peek.candidate_id)) {
+            const candRows = await tx.$queryRaw<Array<{ record_status: string }>>(Prisma.sql`
+              SELECT record_status
+              FROM "candidates"
+              WHERE id = ${peek.candidate_id}::uuid
+              FOR UPDATE
+            `);
+            isCandidateActive = candRows[0]?.record_status === 'ACTIVE';
+          }
+
+          if (!isCandidateActive) {
+            const lockedForCancel = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+              SELECT id
+              FROM email_outbox
+              WHERE id = ${peek.id}::uuid
+                AND (
+                  (status = 'PENDING' AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
+                  OR (status = 'SENDING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= clock_timestamp())
+                )
+                AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+                AND COALESCE((payload_json->>'erased')::boolean, false) = false
+                AND encrypted_payload IS NOT NULL
+              FOR UPDATE SKIP LOCKED
+            `);
+
+            if (lockedForCancel.length > 0) {
+              const erasedAtIso = new Date().toISOString();
+              await tx.$executeRaw(Prisma.sql`
+                UPDATE email_outbox
+                SET status = 'FAILED',
+                    last_error = 'Candidate does not exist or is not active (deletion in progress or completed); email cancelled and erased to protect candidate privacy',
+                    last_error_code = 'CANDIDATE_DELETION_PENDING',
+                    idempotency_key = 'erased:' || id::text,
+                    encrypted_payload = NULL,
+                    key_id = NULL,
+                    recipient_email = NULL,
+                    subject = NULL,
+                    html = NULL,
+                    text = NULL,
+                    payload_json = jsonb_build_object('erased', true, 'erasedAt', ${erasedAtIso}::text),
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    locked_by = NULL,
+                    next_attempt_at = NULL,
+                    updated_at = NOW()
+                WHERE id = ${peek.id}::uuid
+              `);
+            }
+            return { kind: 'skip' as const, id: peek.id };
+          }
+        }
+
+        const lockedRows = await tx.$queryRaw<
+          Array<{ id: string; attempts: number; max_attempts: number }>
+        >(Prisma.sql`
+          SELECT id, attempts, max_attempts
+          FROM email_outbox
+          WHERE id = ${peek.id}::uuid
+            AND (
+              (status = 'PENDING' AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
+              OR (status = 'SENDING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= clock_timestamp())
+            )
+            AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+            AND COALESCE((payload_json->>'erased')::boolean, false) = false
+            AND encrypted_payload IS NOT NULL
           FOR UPDATE SKIP LOCKED
-        `,
-      );
+        `);
 
-      if (!eligible || eligible.length === 0) {
-        return [];
-      }
+        const job = lockedRows[0];
+        if (!job) {
+          return { kind: 'skip' as const, id: peek.id };
+        }
 
-      const claimed: OutboxRecord[] = [];
-      const leaseExpiresAt = new Date(Date.now() + leaseDurationSeconds * 1000);
-
-      for (const row of eligible) {
-        if (row.attempts >= row.max_attempts) {
+        if (job.attempts >= job.max_attempts) {
           await tx.emailOutbox.update({
-            where: { id: row.id },
+            where: { id: job.id },
             data: {
               status: 'FAILED',
               lastErrorCode: 'STALE_LEASE_EXPIRED_MAX_ATTEMPTS_EXHAUSTED',
@@ -446,12 +585,13 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
               nextAttemptAt: null,
             },
           });
-          continue;
+          return { kind: 'skip' as const, id: peek.id };
         }
 
         const leaseToken = randomUUID();
+        const leaseExpiresAt = new Date(Date.now() + leaseDurationSeconds * 1000);
         const updated = await tx.emailOutbox.update({
-          where: { id: row.id },
+          where: { id: job.id },
           data: {
             status: 'SENDING',
             attempts: { increment: 1 },
@@ -461,11 +601,20 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
           },
         });
 
-        claimed.push(this.mapPrismaRecord(updated));
-      }
+        return { kind: 'claimed' as const, record: this.mapPrismaRecord(updated) };
+      });
 
-      return claimed;
-    });
+      if (step.kind === 'empty') {
+        break;
+      }
+      if (step.kind === 'skip') {
+        skippedIds.push(step.id);
+        continue;
+      }
+      claimed.push(step.record);
+    }
+
+    return claimed;
   }
 
   public async markSending(
@@ -473,61 +622,130 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
     workerId?: string,
     leaseDurationSeconds = 120,
   ): Promise<boolean> {
-    const leaseExpiresAt = new Date(Date.now() + leaseDurationSeconds * 1000);
-    const leaseToken = randomUUID();
+    if (!UUID_REGEX.test(id)) {
+      return false;
+    }
 
-    const result = await this.database.emailOutbox.updateMany({
-      where: {
-        id,
-        status: { in: ['PENDING', 'FAILED'] },
-      },
-      data: {
-        status: 'SENDING',
-        attempts: { increment: 1 },
-        leaseToken,
-        leaseExpiresAt,
-        lockedBy: workerId ?? null,
-      },
+    return this.database.$transaction(async (tx) => {
+      const peekRows = await tx.$queryRaw<
+        Array<{ id: string; candidate_id: string | null; is_erased: boolean }>
+      >(Prisma.sql`
+        SELECT
+          id,
+          payload_json->>'candidateId' AS candidate_id,
+          COALESCE((payload_json->>'erased')::boolean, false) AS is_erased
+        FROM email_outbox
+        WHERE id = ${id}::uuid
+      `);
+
+      const peek = peekRows[0];
+      if (!peek || peek.is_erased) {
+        return false;
+      }
+
+      if (peek.candidate_id) {
+        let isCandidateActive = false;
+        if (UUID_REGEX.test(peek.candidate_id)) {
+          const candRows = await tx.$queryRaw<Array<{ record_status: string }>>(Prisma.sql`
+            SELECT record_status
+            FROM "candidates"
+            WHERE id = ${peek.candidate_id}::uuid
+            FOR UPDATE
+          `);
+          isCandidateActive = candRows[0]?.record_status === 'ACTIVE';
+        }
+
+        if (!isCandidateActive) {
+          const erasedAtIso = new Date().toISOString();
+          await tx.$executeRaw(Prisma.sql`
+            UPDATE email_outbox
+            SET status = 'FAILED',
+                last_error = 'Candidate does not exist or is not active (deletion in progress or completed); email cancelled and erased to protect candidate privacy',
+                last_error_code = 'CANDIDATE_DELETION_PENDING',
+                idempotency_key = 'erased:' || id::text,
+                encrypted_payload = NULL,
+                key_id = NULL,
+                recipient_email = NULL,
+                subject = NULL,
+                html = NULL,
+                text = NULL,
+                payload_json = jsonb_build_object('erased', true, 'erasedAt', ${erasedAtIso}::text),
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                locked_by = NULL,
+                next_attempt_at = NULL,
+                updated_at = NOW()
+            WHERE id = ${id}::uuid
+              AND status IN ('PENDING', 'FAILED', 'SENDING')
+              AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+          `);
+          return false;
+        }
+      }
+
+      const leaseExpiresAt = new Date(Date.now() + leaseDurationSeconds * 1000);
+      const leaseToken = randomUUID();
+
+      const updatedCount = await tx.$executeRaw(Prisma.sql`
+        UPDATE email_outbox
+        SET status = 'SENDING',
+            attempts = attempts + 1,
+            lease_token = ${leaseToken}::uuid,
+            lease_expires_at = ${leaseExpiresAt},
+            locked_by = ${workerId ?? null},
+            updated_at = NOW()
+        WHERE id = ${id}::uuid
+          AND status IN ('PENDING', 'FAILED')
+          AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+          AND COALESCE((payload_json->>'erased')::boolean, false) = false
+          AND encrypted_payload IS NOT NULL
+      `);
+
+      return updatedCount > 0;
     });
-
-    return result.count > 0;
   }
 
   public async markSent(id: string, messageId?: string, leaseToken?: string): Promise<void> {
-    const whereClause: Prisma.EmailOutboxWhereInput = { id };
-    if (leaseToken) {
-      whereClause.leaseToken = leaseToken;
+    if (!UUID_REGEX.test(id)) {
+      return;
+    }
+    if (leaseToken && !UUID_REGEX.test(leaseToken)) {
+      return;
     }
 
-    const record = await this.database.emailOutbox.findFirst({ where: whereClause });
-    if (!record) {
-      return; // Fenced out or non-existent
-    }
+    const leaseFilter = leaseToken
+      ? Prisma.sql`AND lease_token = ${leaseToken}::uuid AND lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()`
+      : Prisma.empty;
 
-    const payload = (record.payloadJson as Record<string, unknown>) ?? {};
-    if (messageId) {
-      payload['messageId'] = messageId;
-    }
-
-    // Post-delivery erasure: crypto-shred sensitive payload, bodies, recipient, and subject
-    await this.database.emailOutbox.update({
-      where: { id: record.id },
-      data: {
-        status: 'SENT',
-        sentAt: new Date(),
-        encryptedPayload: null,
-        recipientEmail: null,
-        subject: null,
-        html: null,
-        text: null,
-        payloadJson: messageId ? ({ messageId } as Prisma.InputJsonValue) : Prisma.DbNull,
-        leaseToken: null,
-        leaseExpiresAt: null,
-        lockedBy: null,
-        lastError: null,
-        lastErrorCode: null,
-      },
-    });
+    // Atomic conditional update matching active lease token, SENDING status, non-cancelled/non-erased state,
+    // and preserving existing payload_json keys (such as candidateId) while merging optional messageId.
+    await this.database.$executeRaw(Prisma.sql`
+      UPDATE "email_outbox"
+      SET status = 'SENT',
+          sent_at = clock_timestamp(),
+          encrypted_payload = NULL,
+          key_id = NULL,
+          recipient_email = NULL,
+          subject = NULL,
+          html = NULL,
+          text = NULL,
+          payload_json = CASE
+            WHEN ${messageId ?? null}::text IS NOT NULL
+              THEN COALESCE(payload_json, '{}'::jsonb) || jsonb_build_object('messageId', ${messageId ?? null}::text)
+            ELSE payload_json
+          END,
+          lease_token = NULL,
+          lease_expires_at = NULL,
+          locked_by = NULL,
+          last_error = NULL,
+          last_error_code = NULL,
+          updated_at = NOW()
+      WHERE id = ${id}::uuid
+        AND status = 'SENDING'
+        AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+        AND COALESCE((payload_json->>'erased')::boolean, false) = false
+        ${leaseFilter}
+    `);
   }
 
   public async markFailed(
@@ -536,46 +754,46 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
     isPermanentFailure = false,
     leaseToken?: string,
   ): Promise<void> {
-    const whereClause: Prisma.EmailOutboxWhereInput = { id };
-    if (leaseToken) {
-      whereClause.leaseToken = leaseToken;
+    if (!UUID_REGEX.test(id)) {
+      return;
+    }
+    if (leaseToken && !UUID_REGEX.test(leaseToken)) {
+      return;
     }
 
-    const record = await this.database.emailOutbox.findFirst({ where: whereClause });
-    if (!record) {
-      return; // Fenced out or non-existent
-    }
+    const leaseFilter = leaseToken
+      ? Prisma.sql`AND lease_token = ${leaseToken}::uuid`
+      : Prisma.empty;
 
-    const isExhausted = record.attempts >= record.maxAttempts;
-
-    if (isPermanentFailure || isExhausted) {
-      await this.database.emailOutbox.update({
-        where: { id: record.id },
-        data: {
-          status: isPermanentFailure ? 'PERMANENTLY_REJECTED' : 'FAILED',
-          lastError: error,
-          lastErrorCode: isPermanentFailure ? 'PERMANENT_REJECTION' : 'MAX_ATTEMPTS_EXHAUSTED',
-          leaseToken: null,
-          leaseExpiresAt: null,
-          lockedBy: null,
-          nextAttemptAt: null,
-        },
-      });
-    } else {
-      const backoffMs = Math.min(60000, 1000 * Math.pow(2, record.attempts - 1));
-      await this.database.emailOutbox.update({
-        where: { id: record.id },
-        data: {
-          status: 'PENDING',
-          lastError: error,
-          lastErrorCode: 'TRANSIENT_FAILURE',
-          leaseToken: null,
-          leaseExpiresAt: null,
-          lockedBy: null,
-          nextAttemptAt: new Date(Date.now() + backoffMs),
-        },
-      });
-    }
+    await this.database.$executeRaw(Prisma.sql`
+      UPDATE "email_outbox"
+      SET status = CASE
+            WHEN ${isPermanentFailure}::boolean THEN 'PERMANENTLY_REJECTED'::"EmailDeliveryStatus"
+            WHEN attempts >= max_attempts THEN 'FAILED'::"EmailDeliveryStatus"
+            ELSE 'PENDING'::"EmailDeliveryStatus"
+          END,
+          last_error = ${error},
+          last_error_code = CASE
+            WHEN ${isPermanentFailure}::boolean THEN 'PERMANENT_REJECTION'
+            WHEN attempts >= max_attempts THEN 'MAX_ATTEMPTS_EXHAUSTED'
+            ELSE 'TRANSIENT_FAILURE'
+          END,
+          lease_token = NULL,
+          lease_expires_at = NULL,
+          locked_by = NULL,
+          next_attempt_at = CASE
+            WHEN ${isPermanentFailure}::boolean OR attempts >= max_attempts THEN NULL
+            ELSE clock_timestamp() + (
+              LEAST(60000, 1000 * POWER(2, GREATEST(attempts - 1, 0))) * INTERVAL '1 millisecond'
+            )
+          END,
+          updated_at = NOW()
+      WHERE id = ${id}::uuid
+        AND status = 'SENDING'
+        AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+        AND COALESCE((payload_json->>'erased')::boolean, false) = false
+        ${leaseFilter}
+    `);
   }
 
   public async getRecord(id: string): Promise<OutboxRecord | null> {
@@ -614,28 +832,126 @@ export class PostgresEmailOutboxStore implements EmailOutboxStore {
   }
 
   public async manualRetry(id: string): Promise<OutboxRecord | null> {
-    const record = await this.database.emailOutbox.findUnique({ where: { id } });
-    if (!record) return null;
-
-    if (record.status === 'SENT') {
-      return this.mapPrismaRecord(record);
+    if (!UUID_REGEX.test(id)) {
+      return null;
     }
 
-    const updated = await this.database.emailOutbox.update({
-      where: { id },
-      data: {
-        status: 'PENDING',
-        attempts: 0,
-        lastError: null,
-        lastErrorCode: null,
-        nextAttemptAt: null,
-        leaseToken: null,
-        leaseExpiresAt: null,
-        lockedBy: null,
-      },
-    });
+    return this.database.$transaction(async (tx) => {
+      const peekRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          last_error_code: string | null;
+          encrypted_payload: string | null;
+          candidate_id: string | null;
+          is_erased: boolean;
+        }>
+      >(Prisma.sql`
+        SELECT
+          id,
+          status::text AS status,
+          last_error_code,
+          encrypted_payload,
+          payload_json->>'candidateId' AS candidate_id,
+          COALESCE((payload_json->>'erased')::boolean, false) AS is_erased
+        FROM "email_outbox"
+        WHERE id = ${id}::uuid
+      `);
 
-    return this.mapPrismaRecord(updated);
+      const peek = peekRows[0];
+      if (!peek || peek.is_erased) {
+        return null;
+      }
+
+      if (peek.candidate_id) {
+        let isCandidateActive = false;
+        if (UUID_REGEX.test(peek.candidate_id)) {
+          const candRows = await tx.$queryRaw<Array<{ record_status: string }>>(Prisma.sql`
+            SELECT record_status
+            FROM "candidates"
+            WHERE id = ${peek.candidate_id}::uuid
+            FOR UPDATE
+          `);
+          isCandidateActive = candRows[0]?.record_status === 'ACTIVE';
+        }
+
+        if (!isCandidateActive) {
+          const erasedAtIso = new Date().toISOString();
+          await tx.$executeRaw(Prisma.sql`
+            UPDATE "email_outbox"
+            SET status = 'FAILED',
+                last_error = 'Candidate does not exist or is not active (deletion in progress or completed); email cancelled and erased to protect candidate privacy',
+                last_error_code = 'CANDIDATE_DELETION_PENDING',
+                idempotency_key = 'erased:' || id::text,
+                encrypted_payload = NULL,
+                key_id = NULL,
+                recipient_email = NULL,
+                subject = NULL,
+                html = NULL,
+                text = NULL,
+                payload_json = jsonb_build_object('erased', true, 'erasedAt', ${erasedAtIso}::text),
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                locked_by = NULL,
+                next_attempt_at = NULL,
+                updated_at = NOW()
+            WHERE id = ${id}::uuid
+              AND status != 'SENT'
+              AND (last_error_code IS NULL OR last_error_code != 'CANDIDATE_DELETION_PENDING')
+          `);
+          return null;
+        }
+      }
+
+      const lockedRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          status: string;
+          last_error_code: string | null;
+          encrypted_payload: string | null;
+          is_erased: boolean;
+        }>
+      >(Prisma.sql`
+        SELECT
+          id,
+          status::text AS status,
+          last_error_code,
+          encrypted_payload,
+          COALESCE((payload_json->>'erased')::boolean, false) AS is_erased
+        FROM "email_outbox"
+        WHERE id = ${id}::uuid
+        FOR UPDATE
+      `);
+
+      const record = lockedRows[0];
+      if (
+        !record ||
+        record.status === 'SENT' ||
+        record.status === 'PERMANENTLY_REJECTED' ||
+        record.status === 'SENDING' ||
+        record.last_error_code === 'CANDIDATE_DELETION_PENDING' ||
+        record.is_erased ||
+        !record.encrypted_payload
+      ) {
+        return null;
+      }
+
+      const updated = await tx.emailOutbox.update({
+        where: { id },
+        data: {
+          status: 'PENDING',
+          attempts: 0,
+          lastError: null,
+          lastErrorCode: null,
+          nextAttemptAt: null,
+          leaseToken: null,
+          leaseExpiresAt: null,
+          lockedBy: null,
+        },
+      });
+
+      return this.mapPrismaRecord(updated);
+    });
   }
 
   public async clear(): Promise<void> {

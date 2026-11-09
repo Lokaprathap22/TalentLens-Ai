@@ -130,11 +130,16 @@ describe('Resume Parsing — PDF and DOCX Extractors', () => {
       expect(String(result.pageMapJson['warning'])).toContain('OCR is required');
     });
 
-    it('handles corrupt PDF structure gracefully', async () => {
-      const corruptPdf = Buffer.from('%PDF-1.4\n1 0 obj << truncated');
-      const result = await pdfExtractor.parse(corruptPdf);
+    it('fails closed on unterminated PDF dictionary and degrades cleanly when valid PDF has unreadable text', async () => {
+      const truncatedPdf = Buffer.from('%PDF-1.4\n1 0 obj << truncated');
+      await expect(pdfExtractor.parse(truncatedPdf)).rejects.toThrow(InvalidDocumentFormatError);
 
-      expect(result.qualityStatus).toBe('NEEDS_REVIEW'); // no text found
+      const unreadableContentPdf = Buffer.from(
+        '%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n2 0 obj << /Length 8 >> stream\nGARBAGE!\nendstream\nendobj\n%%EOF',
+      );
+      const result = await pdfExtractor.parse(unreadableContentPdf);
+
+      expect(result.qualityStatus).toBe('NEEDS_REVIEW'); // no extractable text found
       expect(result.extractedText).toBe('');
     });
   });

@@ -265,5 +265,122 @@ export function createConsentRouter(dependencies: ConsentRouterDependencies): Ro
     }
   });
 
+  // 6b. Candidate Public Endpoint: Request Candidate Data Erasure (Deletion)
+  router.post('/consent/deletion/request', defaultWithdrawalLimiter, async (request, response) => {
+    const parsed = requestWithdrawalSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).json({
+        error: 'validation_error',
+        details: parsed.error.issues,
+      });
+      return;
+    }
+
+    try {
+      const result = await dependencies.consentService.requestCandidateDeletion(
+        parsed.data.email,
+        parsed.data.candidateCode,
+      );
+      response.status(200).json(result);
+    } catch (err: unknown) {
+      if (err instanceof ConsentError) {
+        response.status(err.statusCode).json({
+          error: err.code,
+          message: err.message,
+        });
+        return;
+      }
+      response.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // 6c. Candidate Public Endpoint: Confirm Candidate Data Erasure (Deletion)
+  router.post('/consent/deletion/confirm', defaultActionLimiter, async (request, response) => {
+    const parsed = confirmWithdrawalSchema.safeParse(request.body);
+    if (!parsed.success) {
+      response.status(400).json({
+        error: 'validation_error',
+        details: parsed.error.issues,
+      });
+      return;
+    }
+
+    try {
+      const result = await dependencies.consentService.confirmCandidateDeletion(parsed.data.token);
+      response.status(200).json(result);
+    } catch (err: unknown) {
+      if (err instanceof ConsentError) {
+        response.status(err.statusCode).json({
+          error: err.code,
+          message: err.message,
+        });
+        return;
+      }
+      response.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // 7. Recruiter Endpoint: Create Candidate Deletion Request
+  router.post(
+    '/candidates/:candidateId/deletion-requests',
+    requireSession,
+    requireRecruiterRole,
+    sameOrigin,
+    requireCsrf,
+    async (request, response) => {
+      const candidateId = parseUuid(request.params['candidateId']);
+      if (!candidateId) {
+        response.status(400).json({ error: 'invalid_parameters' });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const result = await dependencies.consentService.createDeletionRequest(
+          principal,
+          candidateId,
+        );
+        response.status(201).json(result);
+      } catch (err: unknown) {
+        if (err instanceof ConsentError) {
+          response.status(err.statusCode).json({ error: err.code, message: err.message });
+          return;
+        }
+        response.status(500).json({ error: 'internal_error' });
+      }
+    },
+  );
+
+  // 8. Recruiter Endpoint: Process Candidate Deletion Request
+  router.post(
+    '/deletion-requests/:requestId/process',
+    requireSession,
+    requireRecruiterRole,
+    sameOrigin,
+    requireCsrf,
+    async (request, response) => {
+      const requestId = parseUuid(request.params['requestId']);
+      if (!requestId) {
+        response.status(400).json({ error: 'invalid_parameters' });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const result = await dependencies.consentService.processDeletionRequest(
+          principal,
+          requestId,
+        );
+        response.status(200).json(result);
+      } catch (err: unknown) {
+        if (err instanceof ConsentError) {
+          response.status(err.statusCode).json({ error: err.code, message: err.message });
+          return;
+        }
+        response.status(500).json({ error: 'internal_error' });
+      }
+    },
+  );
+
   return router;
 }

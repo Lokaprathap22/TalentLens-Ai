@@ -5,6 +5,7 @@ export type ResumeParseStatus = 'PENDING' | 'PROCESSING' | 'PARSED' | 'NEEDS_REV
 export type ExtractionQualityStatus = 'COMPLETE' | 'NEEDS_REVIEW' | 'FAILED';
 
 export interface AcceptedUploadItem {
+  clientFileId?: string | undefined;
   resumeDocumentId: string;
   candidateId: string;
   candidateCode: string;
@@ -16,14 +17,16 @@ export interface AcceptedUploadItem {
 }
 
 export interface DuplicateUploadItem {
+  clientFileId?: string | undefined;
   fileName: string;
   sha256: string;
-  resumeDocumentId: string;
+  resumeDocumentId?: string | undefined;
   status: 'DUPLICATE';
   message: string;
 }
 
 export interface RejectedUploadItem {
+  clientFileId?: string | undefined;
   fileName: string;
   reason: string;
   status: 'REJECTED';

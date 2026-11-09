@@ -2,8 +2,17 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import type { EmailDeliveryService } from './consent.email.js';
 import { createEmailIdempotencyKey } from '../email/email.crypto.js';
-import { renderConsentInvitation, renderWithdrawalVerification } from '../email/email.templates.js';
-import { generateConsentNotice, isPolicyApproved, type ApprovedPolicy } from './consent.policy.js';
+import {
+  renderCandidateDeletionVerification,
+  renderConsentInvitation,
+  renderWithdrawalVerification,
+} from '../email/email.templates.js';
+import {
+  generateConsentNotice,
+  isPolicyApproved,
+  verifyNoticeIntegrity,
+  type ApprovedPolicy,
+} from './consent.policy.js';
 import type { ConsentRepository } from './consent.repository.js';
 import type {
   ConsentAcceptResult,
@@ -12,8 +21,14 @@ import type {
   ConsentNoticeDto,
   ConsentWithdrawalConfirmResult,
   ConsentWithdrawalRequestResult,
+  DeletionRequestDto,
   InvitationDeliveryStatus,
+  ProcessDeletionResult,
 } from './consent.types.js';
+import {
+  createDocumentStorageService,
+  type DocumentStorageService,
+} from '../resumes/resume.storage.js';
 
 export class ConsentError extends Error {
   public readonly code: string;
@@ -70,6 +85,7 @@ export class ConsentPolicyUnapprovedError extends ConsentError {
 export interface ConsentServiceOptions {
   repository: ConsentRepository;
   emailDeliveryService: EmailDeliveryService;
+  storageService?: DocumentStorageService;
   applicationOrigin?: string;
   approvedPolicies?: readonly ApprovedPolicy[] | Set<string>;
   approvedPolicyVersions?: readonly string[] | Set<string>;
@@ -92,6 +108,22 @@ export interface ConsentService {
   requestWithdrawal(email: string, candidateCode?: string): Promise<ConsentWithdrawalRequestResult>;
 
   confirmWithdrawal(token: string): Promise<ConsentWithdrawalConfirmResult>;
+
+  requestCandidateDeletion(email: string, candidateCode?: string): Promise<{ message: string }>;
+
+  confirmCandidateDeletion(
+    token: string,
+  ): Promise<{ status: 'COMPLETED'; candidateId: string; deletionRequestId: string }>;
+
+  createDeletionRequest(
+    principal: AuthenticatedPrincipal,
+    candidateId: string,
+  ): Promise<DeletionRequestDto>;
+
+  processDeletionRequest(
+    principal: AuthenticatedPrincipal,
+    requestId: string,
+  ): Promise<ProcessDeletionResult>;
 }
 
 export function hashToken(rawToken: string): string {
@@ -99,7 +131,7 @@ export function hashToken(rawToken: string): string {
 }
 
 export function createConsentService(options: ConsentServiceOptions): ConsentService {
-  const { repository, emailDeliveryService, approvedPolicies } = options;
+  const { repository, emailDeliveryService, approvedPolicies, approvedPolicyVersions } = options;
   const appOrigin = options.applicationOrigin?.replace(/\/+$/, '') ?? 'http://localhost:5173';
 
   function requireRecruiter(principal: AuthenticatedPrincipal): void {
@@ -172,6 +204,7 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         email: email.trim().toLowerCase(),
         policyVersion: notice.policyVersion,
         noticeTextHash: notice.noticeTextHash,
+        noticeText: notice.noticeText,
         expiresAt,
         emailPayload: {
           subject: renderedEmail.subject,
@@ -184,10 +217,14 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
       const delivery = await emailDeliveryService.sendConsentInvitation({
         to: invitation.email,
         candidateName: context.candidate.candidateCode,
+        candidateId,
         organizationName: context.requisition.organizationName,
         requisitionTitle: context.requisition.title,
         invitationUrl,
         expiresAt,
+        organizationId: principal.organizationId,
+        idempotencyKey: emailIdempotencyKey,
+        outboxRecordId: invitation.outboxId,
       });
 
       const deliveryStatus: InvitationDeliveryStatus = delivery.delivered
@@ -202,8 +239,6 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         ...invitation,
         deliveryStatus,
         deliveryError: delivery.error ?? null,
-        invitationUrl,
-        rawToken,
       };
     },
 
@@ -215,24 +250,45 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         throw new InvitationInvalidOrExpiredError();
       }
 
-      // Always render server-controlled policy text matching the stored noticeTextHash
-      const generated = generateConsentNotice({
-        organizationName: noticeData.organizationName,
-        requisitionTitle: noticeData.requisitionTitle,
-        clientName: noticeData.clientName,
-        candidateCode: noticeData.candidateCode,
-      });
+      // If stored notice text snapshot exists, verify cryptographic integrity against noticeTextHash
+      if (
+        noticeData.noticeText &&
+        !verifyNoticeIntegrity(noticeData.noticeText, noticeData.noticeTextHash)
+      ) {
+        throw new ConsentError(
+          'Consent notice integrity verification failed: text does not match cryptographic hash',
+          'NOTICE_INTEGRITY_COMPROMISED',
+          400,
+        );
+      }
 
-      const isApproved = isPolicyApproved(
+      const noticeText =
+        noticeData.noticeText ??
+        generateConsentNotice({
+          organizationName: noticeData.organizationName,
+          requisitionTitle: noticeData.requisitionTitle,
+          clientName: noticeData.clientName,
+          candidateCode: noticeData.candidateCode,
+        }).noticeText;
+
+      let isApproved = isPolicyApproved(
         noticeData.policyVersion,
         noticeData.noticeTextHash,
         approvedPolicies,
+        approvedPolicyVersions,
       );
+
+      if (!isApproved && repository.isPolicyApprovedForOrganization) {
+        isApproved = await repository.isPolicyApprovedForOrganization(
+          noticeData.organizationId,
+          noticeData.policyVersion,
+        );
+      }
 
       return {
         ...noticeData,
         isPolicyApproved: isApproved,
-        noticeText: generated.noticeText,
+        noticeText,
       };
     },
 
@@ -250,9 +306,33 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
         throw new InvitationInvalidOrExpiredError();
       }
 
+      // If stored notice text snapshot exists, verify cryptographic integrity against noticeTextHash
       if (
-        !isPolicyApproved(noticeData.policyVersion, noticeData.noticeTextHash, approvedPolicies)
+        noticeData.noticeText &&
+        !verifyNoticeIntegrity(noticeData.noticeText, noticeData.noticeTextHash)
       ) {
+        throw new ConsentError(
+          'Consent notice integrity verification failed: text does not match cryptographic hash',
+          'NOTICE_INTEGRITY_COMPROMISED',
+          400,
+        );
+      }
+
+      let isApproved = isPolicyApproved(
+        noticeData.policyVersion,
+        noticeData.noticeTextHash,
+        approvedPolicies,
+        approvedPolicyVersions,
+      );
+
+      if (!isApproved && repository.isPolicyApprovedForOrganization) {
+        isApproved = await repository.isPolicyApprovedForOrganization(
+          noticeData.organizationId,
+          noticeData.policyVersion,
+        );
+      }
+
+      if (!isApproved) {
         throw new ConsentPolicyUnapprovedError(noticeData.policyVersion, noticeData.noticeTextHash);
       }
 
@@ -312,7 +392,7 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
           `${consentItem.consentId}:${tokenHash}`,
         );
 
-        await repository.createWithdrawalRequest({
+        const withdrawalReq = await repository.createWithdrawalRequest({
           organizationId: consentItem.organizationId,
           candidateId: consentItem.candidateId,
           consentId: consentItem.consentId,
@@ -327,11 +407,19 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
           },
         });
 
+        if (!withdrawalReq) {
+          continue;
+        }
+
         await emailDeliveryService.sendWithdrawalVerification({
           to: normalizedEmail,
           organizationName: consentItem.organizationName,
           withdrawalUrl,
           expiresAt,
+          organizationId: consentItem.organizationId,
+          candidateId: consentItem.candidateId,
+          idempotencyKey: emailIdempotencyKey,
+          outboxRecordId: withdrawalReq.outboxId,
         });
       }
 
@@ -347,6 +435,115 @@ export function createConsentService(options: ConsentServiceOptions): ConsentSer
       }
 
       return result;
+    },
+
+    async requestCandidateDeletion(email, candidateCode) {
+      const safeResponse = {
+        message:
+          'If an active candidate record is associated with this email, a verification link has been sent.',
+      };
+
+      const normalizedEmail = email.trim().toLowerCase();
+      const candidates = await repository.findCandidatesForDeletionByEmail(
+        normalizedEmail,
+        candidateCode,
+      );
+
+      // Anti-enumeration: always return the identical generic response
+      if (candidates.length === 0) {
+        return safeResponse;
+      }
+
+      for (const candidate of candidates) {
+        const rawToken = randomBytes(32).toString('hex');
+        const tokenHash = hashToken(rawToken);
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24-hour expiration
+        const deletionUrl = `${appOrigin}/consent/deletion#token=${rawToken}`;
+
+        const renderedDeletion = renderCandidateDeletionVerification({
+          organizationName: candidate.organizationName,
+          deletionUrl,
+          expiresAt,
+        });
+
+        const emailIdempotencyKey = createEmailIdempotencyKey(
+          'deletion_verification',
+          normalizedEmail,
+          `${candidate.candidateId}:${tokenHash}`,
+        );
+
+        const verification = await repository.createDeletionVerification({
+          organizationId: candidate.organizationId,
+          candidateId: candidate.candidateId,
+          tokenHash,
+          email: normalizedEmail,
+          expiresAt,
+          emailPayload: {
+            subject: renderedDeletion.subject,
+            html: renderedDeletion.html,
+            text: renderedDeletion.text,
+            idempotencyKey: emailIdempotencyKey,
+          },
+        });
+
+        // Skip sending if candidate is no longer ACTIVE or a recent pending verification was coalesced
+        if (!verification || verification.coalesced) {
+          continue;
+        }
+
+        await emailDeliveryService.sendDeletionVerification({
+          to: normalizedEmail,
+          organizationName: candidate.organizationName,
+          deletionUrl,
+          expiresAt,
+          organizationId: candidate.organizationId,
+          candidateId: candidate.candidateId,
+          idempotencyKey: emailIdempotencyKey,
+          outboxRecordId: verification.outboxId,
+        });
+      }
+
+      return safeResponse;
+    },
+
+    async confirmCandidateDeletion(token) {
+      const tokenHash = hashToken(token);
+      const storage = options.storageService ?? createDocumentStorageService();
+      const result = await repository.confirmCandidateDeletion(tokenHash, async (key: string) => {
+        await storage.delete(key);
+      });
+
+      if (!result) {
+        throw new WithdrawalInvalidOrExpiredError();
+      }
+
+      return result;
+    },
+
+    async createDeletionRequest(principal, candidateId) {
+      if (principal.role !== 'RECRUITER') {
+        throw new ConsentRoleError('Only recruiters can create deletion requests');
+      }
+      return repository.createDeletionRequest(
+        principal.organizationId,
+        candidateId,
+        principal.userId,
+      );
+    },
+
+    async processDeletionRequest(principal, requestId) {
+      if (principal.role !== 'RECRUITER') {
+        throw new ConsentRoleError('Only recruiters can process deletion requests');
+      }
+      const storage = options.storageService ?? createDocumentStorageService();
+      return repository.processDeletion(
+        principal.organizationId,
+        requestId,
+        async (key: string) => {
+          await storage.delete(key);
+        },
+        principal.userId,
+      );
     },
   };
 }

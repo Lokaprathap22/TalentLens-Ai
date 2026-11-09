@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
   getDatabaseClient,
   type ClientDecisionType,
   type InterviewFormat,
   type InterviewProposalStatus,
+  type Prisma,
   type PrismaClient,
   type ResumeParseStatus,
   type ReviewDecision,
@@ -11,16 +12,40 @@ import {
   type UserRole,
 } from '@talentlens/database';
 import { redactCandidateIdentifiers } from '../assessments/assessment.redactor.js';
+import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import { createEmailIdempotencyKey, encryptEmailPayload } from '../email/email.crypto.js';
 import {
+  renderAccountActivation,
   renderClientFeedback,
   renderClientSubmission,
   renderInterviewNotification,
 } from '../email/email.templates.js';
 import { evaluateFeedbackFairness } from './feedback.fairness.js';
 import { isValidIanaTimezone } from './workflow.schemas.js';
+import type {
+  InviteClientMemberInput,
+  ListGlobalCandidatesInput,
+  ListInterviewsInput,
+} from './workflow.schemas.js';
+import type {
+  ClientCandidateReviewItemDto,
+  ClientDashboardSummaryDto,
+  ClientMemberDto,
+  ClientRecentDecisionItemDto,
+  ClientRequisitionSummaryDto,
+  DashboardActivityItemDto,
+  GlobalCandidateStatusCategory,
+  GlobalCandidateSummaryDto,
+  InterviewItemDto,
+  ListInterviewsResponseDto,
+  RecentRequisitionDto,
+  RecruiterDashboardSummaryDto,
+  ReviewQueueSummaryItemDto,
+} from './workflow.dto.js';
 import {
   WorkflowClientConflictError,
+  WorkflowClientMemberConflictError,
+  WorkflowClientNotFoundError,
   WorkflowConsentRequiredError,
   WorkflowInterviewNotFoundError,
   WorkflowInterviewStateError,
@@ -91,6 +116,9 @@ export interface WorkflowRepository {
     options: {
       limit: number;
       offset: number;
+      search?: string | undefined;
+      sortBy?: 'activity' | 'score' | 'uploadedAt' | undefined;
+      sortOrder?: 'asc' | 'desc' | undefined;
       processingStatus?: string | undefined;
       assessmentStatus?: string | undefined;
       reviewDecision?: string | undefined;
@@ -524,6 +552,27 @@ export interface WorkflowRepository {
     updatedAt: Date;
   } | null>;
 
+  getClient?(
+    organizationId: string,
+    clientId: string,
+  ): Promise<{
+    id: string;
+    name: string;
+    status: string;
+    createdAt: Date;
+    updatedAt: Date;
+  } | null>;
+
+  listClientMembers?(organizationId: string, clientId: string): Promise<ClientMemberDto[]>;
+
+  inviteClientMember?(
+    organizationId: string,
+    recruiterId: string,
+    clientId: string,
+    input: InviteClientMemberInput,
+    options?: { applicationOrigin?: string | undefined },
+  ): Promise<ClientMemberDto>;
+
   getCandidateTimeline?(
     organizationId: string,
     recruiterId: string,
@@ -543,6 +592,134 @@ export interface WorkflowRepository {
     }>;
     total: number;
   } | null>;
+
+  listGlobalCandidates?(
+    organizationId: string,
+    recruiterId: string,
+    options: ListGlobalCandidatesInput,
+  ): Promise<{
+    items: GlobalCandidateSummaryDto[];
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+  }>;
+
+  listInterviews?(
+    principal: AuthenticatedPrincipal,
+    options: ListInterviewsInput,
+  ): Promise<ListInterviewsResponseDto>;
+
+  getRecruiterDashboardSummary?(organizationId: string): Promise<RecruiterDashboardSummaryDto>;
+
+  getClientDashboardSummary?(
+    authenticatedUser: AuthenticatedPrincipal,
+  ): Promise<ClientDashboardSummaryDto>;
+}
+
+function formatAuditLogToActivityItem(log: {
+  id: string;
+  action: string;
+  resourceType: string;
+  createdAt: Date;
+  metadataJson: unknown;
+  actor: { email: string; role: string } | null;
+  candidate: { candidateCode: string } | null;
+  requisition: { title: string } | null;
+  client: { name: string } | null;
+}): DashboardActivityItemDto {
+  const actorRole = log.actor?.role;
+  const actorName =
+    actorRole === 'RECRUITER'
+      ? 'Recruiter'
+      : actorRole === 'CLIENT_HIRING_MANAGER'
+        ? 'Client Hiring Manager'
+        : actorRole === 'DELIVERY_HEAD'
+          ? 'Delivery Head'
+          : log.actor?.email
+            ? 'User'
+            : 'System';
+
+  const candCode = log.candidate?.candidateCode ?? 'Candidate';
+  const reqTitle = log.requisition?.title ?? 'Requisition';
+  const clientName = log.client?.name ?? 'Client';
+
+  let kind: DashboardActivityItemDto['kind'] = 'general';
+  let summary = `${log.action} recorded`;
+
+  switch (log.action) {
+    case 'CANDIDATE_SUBMITTED_TO_CLIENT':
+      kind = 'submitted';
+      summary = `${candCode} submitted to client for ${reqTitle}`;
+      break;
+    case 'CLIENT_DECISION_RECORDED': {
+      const meta = log.metadataJson as Record<string, unknown> | null;
+      const dec = meta && typeof meta['decision'] === 'string' ? meta['decision'] : '';
+      if (dec === 'SHORTLIST') {
+        kind = 'client_shortlisted';
+        summary = `${candCode} shortlisted by client for ${reqTitle}`;
+      } else if (dec === 'REJECT') {
+        kind = 'review_recorded';
+        summary = `${candCode} declined by client for ${reqTitle}`;
+      } else {
+        kind = 'review_recorded';
+        summary = `Client decision recorded for ${candCode} (${reqTitle})`;
+      }
+      break;
+    }
+    case 'INTERVIEW_PROPOSED':
+      kind = 'interview_proposed';
+      summary = `Interview proposed for ${candCode} (${reqTitle})`;
+      break;
+    case 'INTERVIEW_ACCEPTED':
+      kind = 'interview_proposed';
+      summary = `Interview confirmed for ${candCode} (${reqTitle})`;
+      break;
+    case 'INTERVIEW_REJECTED':
+      kind = 'review_recorded';
+      summary = `Interview proposal declined for ${candCode} (${reqTitle})`;
+      break;
+    case 'INTERVIEW_COMPLETED':
+      kind = 'review_recorded';
+      summary = `Interview completed for ${candCode} (${reqTitle})`;
+      break;
+    case 'CANDIDATE_REVIEWED':
+      kind = 'review_recorded';
+      summary = `Recruiter review recorded for ${candCode} (${reqTitle})`;
+      break;
+    case 'CANDIDATE_SHORTLISTED':
+      kind = 'review_recorded';
+      summary = `${candCode} shortlisted for ${reqTitle}`;
+      break;
+    case 'CONSENT_WITHDRAWN':
+      kind = 'consent_withdrawn';
+      summary = `Consent withdrawn by candidate for ${reqTitle}`;
+      break;
+    case 'CONSENT_CAPTURED':
+      kind = 'assessment_complete';
+      summary = `Requisition consent confirmed for ${candCode} (${reqTitle})`;
+      break;
+    case 'CLIENT_CREATED':
+      kind = 'general';
+      summary = `Client organization ${clientName} created`;
+      break;
+    case 'CLIENT_MEMBER_INVITED':
+      kind = 'general';
+      summary = `Client hiring manager invited for ${clientName}`;
+      break;
+    default:
+      kind = 'general';
+      summary = `${log.action.toLowerCase().replace(/_/g, ' ')} for ${candCode}`;
+      break;
+  }
+
+  return {
+    id: log.id,
+    kind,
+    summary,
+    actor: actorName,
+    createdAt: log.createdAt.toISOString(),
+  };
 }
 
 export function createWorkflowRepository(
@@ -622,10 +799,11 @@ export function createWorkflowRepository(
         return { items: [], total: 0 };
       }
 
-      // Base query: find all resume documents ingested for this requisition
+      // Base query: find all resume documents ingested for this requisition (excluding deleted/pending deletion candidates)
       const resumes = await database.resumeDocument.findMany({
         where: {
           organizationId,
+          candidate: { recordStatus: 'ACTIVE' },
           processingJobs: {
             some: {
               batch: {
@@ -699,6 +877,57 @@ export function createWorkflowRepository(
           (r) => r.candidateSubmissions[0]?.status === options.submissionStatus,
         );
       }
+      if (options.search && options.search.trim().length > 0) {
+        const q = options.search.trim().toLowerCase();
+        filtered = filtered.filter((r) => {
+          const codeMatch = r.candidate.candidateCode.toLowerCase().includes(q);
+          const fileName = (r.objectKey.split('/').pop() || '').toLowerCase();
+          return codeMatch || fileName.includes(q);
+        });
+      }
+
+      const isAsc = options.sortOrder === 'asc';
+      if (options.sortBy === 'score') {
+        filtered.sort((a, b) => {
+          const scoreA =
+            a.assessments[0]?.status === 'COMPLETE' && a.assessments[0].score !== null
+              ? Number(a.assessments[0].score)
+              : null;
+          const scoreB =
+            b.assessments[0]?.status === 'COMPLETE' && b.assessments[0].score !== null
+              ? Number(b.assessments[0].score)
+              : null;
+
+          if (scoreA !== null && scoreB !== null) {
+            if (scoreA !== scoreB) {
+              return isAsc ? scoreA - scoreB : scoreB - scoreA;
+            }
+          } else if (scoreA !== null) {
+            return -1;
+          } else if (scoreB !== null) {
+            return 1;
+          }
+          const timeA = a.updatedAt.getTime();
+          const timeB = b.updatedAt.getTime();
+          if (timeA !== timeB) return timeB - timeA;
+          return a.candidate.id.localeCompare(b.candidate.id);
+        });
+      } else if (options.sortBy === 'uploadedAt') {
+        filtered.sort((a, b) => {
+          const timeA = a.uploadedAt.getTime();
+          const timeB = b.uploadedAt.getTime();
+          if (timeA !== timeB) return isAsc ? timeA - timeB : timeB - timeA;
+          return a.candidate.id.localeCompare(b.candidate.id);
+        });
+      } else {
+        // default 'activity'
+        filtered.sort((a, b) => {
+          const timeA = a.updatedAt.getTime();
+          const timeB = b.updatedAt.getTime();
+          if (timeA !== timeB) return isAsc ? timeA - timeB : timeB - timeA;
+          return a.candidate.id.localeCompare(b.candidate.id);
+        });
+      }
 
       const total = filtered.length;
       const paginated = filtered.slice(options.offset, options.offset + options.limit);
@@ -769,7 +998,7 @@ export function createWorkflowRepository(
       if (!requisition) return null;
 
       const candidate = await database.candidate.findFirst({
-        where: { id: candidateId, organizationId },
+        where: { id: candidateId, organizationId, recordStatus: 'ACTIVE' },
         select: { id: true, candidateCode: true },
       });
       if (!candidate) return null;
@@ -796,24 +1025,38 @@ export function createWorkflowRepository(
           )
         : false;
 
-      const consent = await database.candidateConsent.findFirst({
+      const consentRecords = await database.candidateConsent.findMany({
         where: {
           candidateId,
           requisitionId,
           organizationId,
           purpose: 'HIRING_USE',
-          status: 'ACTIVE',
-          withdrawnAt: null,
+          status: { in: ['ACTIVE', 'WITHDRAWN', 'EXPIRED'] },
           policyVersion: { not: '' },
         },
-        orderBy: { capturedAt: 'desc' },
+        orderBy: [{ capturedAt: 'desc' }, { updatedAt: 'desc' }],
+        take: 10,
         select: {
           id: true,
           status: true,
           policyVersion: true,
           capturedAt: true,
+          withdrawnAt: true,
         },
       });
+
+      const activeConsentRecord = consentRecords.find(
+        (c) => c.status === 'ACTIVE' && c.withdrawnAt === null,
+      );
+      const selectedConsentRecord = activeConsentRecord ?? consentRecords[0] ?? null;
+      const consent = selectedConsentRecord
+        ? {
+            id: selectedConsentRecord.id,
+            status: selectedConsentRecord.status,
+            policyVersion: selectedConsentRecord.policyVersion,
+            capturedAt: selectedConsentRecord.capturedAt,
+          }
+        : null;
 
       const assessmentRecord = await database.candidateAssessment.findFirst({
         where: {
@@ -1276,6 +1519,7 @@ export function createWorkflowRepository(
                 subject: null,
                 html: null,
                 text: null,
+                payloadJson: { candidateId },
                 encryptedPayload,
                 keyId,
                 status: 'PENDING',
@@ -1394,6 +1638,7 @@ export function createWorkflowRepository(
           organizationId,
           clientId,
           status: { not: 'WITHDRAWN' },
+          candidate: { recordStatus: 'ACTIVE' },
         },
         include: {
           requisition: { select: { id: true, title: true } },
@@ -1465,6 +1710,7 @@ export function createWorkflowRepository(
           clientId,
           organizationId,
           status: { not: 'WITHDRAWN' },
+          candidate: { recordStatus: 'ACTIVE' },
         },
         include: {
           candidate: {
@@ -1659,12 +1905,12 @@ export function createWorkflowRepository(
               },
             },
             candidate: {
-              select: { candidateCode: true },
+              select: { candidateCode: true, recordStatus: true },
             },
           },
         });
 
-        if (!submission) {
+        if (!submission || submission.candidate.recordStatus !== 'ACTIVE') {
           throw new WorkflowSubmissionNotFoundError();
         }
 
@@ -1719,13 +1965,23 @@ export function createWorkflowRepository(
               ? 'INTERVIEW_PROPOSED'
               : 'SUBMITTED_TO_CLIENT';
 
-        await tx.candidateSubmission.update({
-          where: { id: submissionId },
+        const updatedSubmission = await tx.candidateSubmission.updateMany({
+          where: {
+            id: submissionId,
+            organizationId,
+            clientId,
+            status: submission.status,
+          },
           data: {
             status: newStatus,
             updatedAt: new Date(),
           },
         });
+        if (updatedSubmission.count === 0) {
+          throw new WorkflowSubmissionStateError(
+            'Submission state changed concurrently while recording client feedback.',
+          );
+        }
 
         await tx.pipelineEvent.create({
           data: {
@@ -1812,6 +2068,7 @@ export function createWorkflowRepository(
               subject: null,
               html: null,
               text: null,
+              payloadJson: { candidateId: submission.candidateId },
               encryptedPayload,
               keyId,
               status: 'PENDING',
@@ -1908,12 +2165,12 @@ export function createWorkflowRepository(
               },
             },
             candidate: {
-              select: { candidateCode: true },
+              select: { candidateCode: true, recordStatus: true },
             },
           },
         });
 
-        if (!submission) {
+        if (!submission || submission.candidate.recordStatus !== 'ACTIVE') {
           throw new WorkflowSubmissionNotFoundError();
         }
 
@@ -2065,6 +2322,7 @@ export function createWorkflowRepository(
               subject: null,
               html: null,
               text: null,
+              payloadJson: { candidateId: submission.candidateId },
               encryptedPayload,
               keyId,
               status: 'PENDING',
@@ -2290,6 +2548,7 @@ export function createWorkflowRepository(
                 subject: null,
                 html: null,
                 text: null,
+                payloadJson: { candidateId: submission.candidateId },
                 encryptedPayload,
                 keyId,
                 status: 'PENDING',
@@ -2493,6 +2752,7 @@ export function createWorkflowRepository(
                 subject: null,
                 html: null,
                 text: null,
+                payloadJson: { candidateId: submission.candidateId },
                 encryptedPayload,
                 keyId,
                 status: 'PENDING',
@@ -2630,12 +2890,12 @@ export function createWorkflowRepository(
               },
             },
             candidate: {
-              select: { candidateCode: true },
+              select: { candidateCode: true, recordStatus: true },
             },
           },
         });
 
-        if (!submission) {
+        if (!submission || submission.candidate.recordStatus !== 'ACTIVE') {
           throw new WorkflowSubmissionNotFoundError();
         }
 
@@ -2793,6 +3053,7 @@ export function createWorkflowRepository(
                 subject: null,
                 html: null,
                 text: null,
+                payloadJson: { candidateId: submission.candidateId },
                 encryptedPayload,
                 keyId,
                 status: 'PENDING',
@@ -2883,6 +3144,7 @@ export function createWorkflowRepository(
                 subject: null,
                 html: null,
                 text: null,
+                payloadJson: { candidateId: submission.candidateId },
                 encryptedPayload,
                 keyId,
                 status: 'PENDING',
@@ -3100,6 +3362,285 @@ export function createWorkflowRepository(
       }
     },
 
+    async getClient(organizationId, clientId) {
+      const client = await database.client.findFirst({
+        where: {
+          id: clientId,
+          organizationId,
+        },
+        select: {
+          id: true,
+          name: true,
+          status: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+      return client;
+    },
+
+    async listClientMembers(organizationId, clientId) {
+      const client = await database.client.findFirst({
+        where: { id: clientId, organizationId },
+        select: { id: true },
+      });
+      if (!client) {
+        throw new WorkflowClientNotFoundError('Client not found');
+      }
+
+      const memberships = await database.clientMembership.findMany({
+        where: {
+          clientId,
+          organizationId,
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              role: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          },
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+      });
+
+      return memberships.map((m) => ({
+        id: m.id,
+        membershipId: m.id,
+        userId: m.user.id,
+        clientId: m.clientId,
+        organizationId: m.organizationId,
+        name: m.user.name,
+        email: m.user.email,
+        role: m.role,
+        membershipStatus: m.status,
+        userStatus: m.user.status,
+        createdAt: m.createdAt.toISOString(),
+        updatedAt: m.updatedAt.toISOString(),
+      }));
+    },
+
+    async inviteClientMember(organizationId, recruiterId, clientId, input, options) {
+      const normalizedEmail = input.email.trim().toLowerCase();
+      const trimmedName = input.name?.trim() ? input.name.trim() : null;
+
+      try {
+        return await database.$transaction(async (tx) => {
+          // 1. Verify client exists and belongs to the recruiter's organization
+          const client = await tx.client.findFirst({
+            where: { id: clientId, organizationId },
+            include: {
+              organization: {
+                select: { id: true, name: true },
+              },
+            },
+          });
+          if (!client) {
+            throw new WorkflowClientNotFoundError('Client not found');
+          }
+
+          // 2. Check if a user with this normalized email already exists in this organization
+          const existingUser = await tx.user.findFirst({
+            where: {
+              organizationId,
+              normalizedEmail,
+            },
+          });
+
+          if (existingUser) {
+            // Never convert a recruiter or privileged user into a client manager
+            if (existingUser.role !== 'CLIENT_HIRING_MANAGER') {
+              throw new WorkflowClientMemberConflictError(
+                'A user with this email already exists as a recruiter or delivery head in your organization.',
+                'role_conflict',
+              );
+            }
+
+            // Check if membership already exists for this client
+            const existingMembership = await tx.clientMembership.findFirst({
+              where: {
+                clientId,
+                userId: existingUser.id,
+                organizationId,
+              },
+            });
+
+            if (existingMembership) {
+              if (existingUser.status === 'INVITED') {
+                throw new WorkflowClientMemberConflictError(
+                  'An invitation is already pending for this email address with this client.',
+                  'duplicate_invitation',
+                );
+              }
+              throw new WorkflowClientMemberConflictError(
+                'A member with this email address already exists for this client.',
+                'duplicate_membership',
+              );
+            }
+
+            // Existing client hiring manager in another client in same organization
+            throw new WorkflowClientMemberConflictError(
+              'A user with this email address already exists in your organization.',
+              'existing_user_conflict',
+            );
+          }
+
+          // 3. Create the invited User record
+          const user = await tx.user.create({
+            data: {
+              organizationId,
+              email: input.email.trim(),
+              normalizedEmail,
+              name: trimmedName,
+              role: 'CLIENT_HIRING_MANAGER',
+              status: 'INVITED',
+              passwordHash: null,
+            },
+            select: {
+              id: true,
+              email: true,
+              name: true,
+              role: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          });
+
+          // 4. Create ClientMembership
+          const membership = await tx.clientMembership.create({
+            data: {
+              clientId,
+              userId: user.id,
+              organizationId,
+              role: 'CLIENT_HIRING_MANAGER',
+              status: 'ACTIVE',
+            },
+            select: {
+              id: true,
+              clientId: true,
+              userId: true,
+              organizationId: true,
+              role: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          });
+
+          // 5. Generate secure activation token and store hash
+          const rawToken = randomBytes(32).toString('base64url');
+          const tokenHash = createHash('sha256').update(rawToken, 'utf8').digest('hex');
+          const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48 hours
+
+          await tx.userSecurityToken.create({
+            data: {
+              organizationId,
+              userId: user.id,
+              type: 'ACTIVATION',
+              tokenHash,
+              expiresAt,
+            },
+          });
+
+          // 6. Enqueue activation email in outbox
+          const applicationOrigin = options?.applicationOrigin ?? 'http://localhost:5173';
+          const activationUrl = `${applicationOrigin}/activate#token=${rawToken}`;
+          const rendered = renderAccountActivation({
+            userName: user.name ?? undefined,
+            organizationName: client.organization.name,
+            activationUrl,
+            expiresAt,
+          });
+
+          const outboxId = randomUUID();
+          const idempotencyKey = createEmailIdempotencyKey(
+            'account_activation',
+            user.email,
+            `${client.organization.name}:${activationUrl}`,
+          );
+
+          const { encryptedPayload, keyId } = encryptEmailPayload(
+            {
+              recipientEmail: user.email,
+              subject: rendered.subject,
+              html: rendered.html,
+              text: rendered.text,
+            },
+            { recordId: outboxId, idempotencyKey },
+          );
+
+          await tx.emailOutbox.create({
+            data: {
+              id: outboxId,
+              organizationId,
+              idempotencyKey,
+              messageType: 'account_activation',
+              recipientEmail: null,
+              recipientRole: 'CLIENT_HIRING_MANAGER',
+              subject: null,
+              html: null,
+              text: null,
+              encryptedPayload,
+              keyId,
+              status: 'PENDING',
+              attempts: 0,
+              maxAttempts: 3,
+            },
+          });
+
+          // 7. Record AuditLog
+          await tx.auditLog.create({
+            data: {
+              organizationId,
+              actorId: recruiterId,
+              action: 'CLIENT_MEMBER_INVITED',
+              resourceType: 'ClientMembership',
+              resourceId: membership.id,
+              clientId,
+              metadataJson: {
+                invitedUserId: user.id,
+                invitedEmail: user.email,
+                invitedRole: user.role,
+                membershipId: membership.id,
+              },
+            },
+          });
+
+          // 8. Return member DTO without exposing raw token
+          return {
+            id: membership.id,
+            membershipId: membership.id,
+            userId: user.id,
+            clientId,
+            organizationId,
+            name: user.name,
+            email: user.email,
+            role: 'CLIENT_HIRING_MANAGER' as const,
+            membershipStatus: membership.status,
+            userStatus: user.status,
+            createdAt: membership.createdAt.toISOString(),
+            updatedAt: membership.updatedAt.toISOString(),
+          };
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          throw new WorkflowClientMemberConflictError(
+            'A member or pending invitation with this email address already exists for this client.',
+            'duplicate_membership',
+          );
+        }
+        throw error;
+      }
+    },
+
     async getCandidateTimeline(organizationId, recruiterId, requisitionId, candidateId, options) {
       if (!organizationId || !recruiterId || !requisitionId || !candidateId) {
         return null;
@@ -3118,6 +3659,7 @@ export function createWorkflowRepository(
         where: {
           id: candidateId,
           organizationId,
+          recordStatus: 'ACTIVE',
           resumes: {
             some: {
               processingJobs: {
@@ -3171,6 +3713,1084 @@ export function createWorkflowRepository(
           createdAt: ev.createdAt,
         })),
         total,
+      };
+    },
+
+    async listGlobalCandidates(organizationId, _recruiterId, options) {
+      const candidateWhere: Record<string, unknown> = {
+        organizationId,
+        recordStatus: 'ACTIVE',
+      };
+
+      if (options.requisitionId) {
+        candidateWhere['OR'] = [
+          {
+            resumes: {
+              some: {
+                processingJobs: {
+                  some: {
+                    batch: { requisitionId: options.requisitionId },
+                  },
+                },
+              },
+            },
+          },
+          {
+            assessments: {
+              some: { requisitionId: options.requisitionId },
+            },
+          },
+          {
+            reviews: {
+              some: { requisitionId: options.requisitionId },
+            },
+          },
+          {
+            shortlists: {
+              some: { requisitionId: options.requisitionId },
+            },
+          },
+          {
+            submissions: {
+              some: { requisitionId: options.requisitionId },
+            },
+          },
+        ];
+      }
+
+      const candidates = await database.candidate.findMany({
+        where: candidateWhere,
+        include: {
+          profiles: {
+            orderBy: { profileVersion: 'desc' },
+            take: 1,
+            include: {
+              skills: {
+                select: { skillNameNormalized: true },
+              },
+            },
+          },
+          resumes: {
+            orderBy: { uploadedAt: 'desc' },
+            take: 1,
+            include: {
+              processingJobs: {
+                take: 1,
+                include: {
+                  batch: {
+                    include: {
+                      requisition: {
+                        select: {
+                          id: true,
+                          title: true,
+                          client: { select: { id: true, name: true } },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          assessments: {
+            ...(options.requisitionId ? { where: { requisitionId: options.requisitionId } } : {}),
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            include: {
+              requisition: {
+                select: {
+                  id: true,
+                  title: true,
+                  client: { select: { id: true, name: true } },
+                },
+              },
+              criterionAssessments: {
+                select: { id: true, status: true },
+              },
+            },
+          },
+          reviews: {
+            ...(options.requisitionId ? { where: { requisitionId: options.requisitionId } } : {}),
+            orderBy: { reviewedAt: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              decision: true,
+              reviewedAt: true,
+            },
+          },
+          shortlists: {
+            ...(options.requisitionId ? { where: { requisitionId: options.requisitionId } } : {}),
+            orderBy: { shortlistedAt: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              shortlistedAt: true,
+            },
+          },
+          submissions: {
+            ...(options.requisitionId ? { where: { requisitionId: options.requisitionId } } : {}),
+            orderBy: { submittedAt: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              status: true,
+              submittedAt: true,
+            },
+          },
+        },
+      });
+
+      let mapped = candidates.map((c) => {
+        const latestResume = c.resumes[0] ?? null;
+        const latestAssessment = c.assessments[0] ?? null;
+        const latestReview = c.reviews[0] ?? null;
+        const latestShortlist = c.shortlists[0] ?? null;
+        const latestSubmission = c.submissions[0] ?? null;
+        const latestProfile = c.profiles[0] ?? null;
+
+        let reqId: string | null = null;
+        let reqTitle: string | null = null;
+        let clientName: string | null = null;
+
+        if (latestAssessment?.requisition) {
+          reqId = latestAssessment.requisition.id;
+          reqTitle = latestAssessment.requisition.title;
+          clientName = latestAssessment.requisition.client?.name ?? null;
+        } else if (latestResume?.processingJobs[0]?.batch?.requisition) {
+          const req = latestResume.processingJobs[0].batch.requisition;
+          reqId = req.id;
+          reqTitle = req.title;
+          clientName = req.client?.name ?? null;
+        }
+
+        const isAssessed =
+          latestAssessment?.status === 'COMPLETE' && latestAssessment.score !== null;
+        const overallScore = isAssessed ? Number(latestAssessment.score) : null;
+        const isComplete = isAssessed;
+        const criteriaCount = latestAssessment?.criterionAssessments.length ?? 0;
+        const criteriaMetCount =
+          latestAssessment?.criterionAssessments.filter((ca) => ca.status === 'MATCH').length ?? 0;
+
+        let statusCategory: GlobalCandidateStatusCategory = 'AWAITING_ASSESSMENT';
+        if (isAssessed) {
+          statusCategory = 'ASSESSED';
+        } else if (
+          latestAssessment?.status === 'NEEDS_REVIEW' ||
+          latestResume?.parseStatus === 'NEEDS_REVIEW' ||
+          latestReview?.decision === 'NEEDS_REVIEW'
+        ) {
+          statusCategory = 'NEEDS_REVIEW';
+        } else if (
+          latestAssessment?.status === 'FAILED' ||
+          latestResume?.parseStatus === 'FAILED'
+        ) {
+          statusCategory = 'FAILED';
+        } else {
+          statusCategory = 'AWAITING_ASSESSMENT';
+        }
+
+        const timestamps: number[] = [c.updatedAt.getTime(), c.createdAt.getTime()];
+        if (latestResume?.updatedAt) timestamps.push(latestResume.updatedAt.getTime());
+        if (latestAssessment?.updatedAt) timestamps.push(latestAssessment.updatedAt.getTime());
+        if (latestReview?.reviewedAt) timestamps.push(latestReview.reviewedAt.getTime());
+        if (latestShortlist?.shortlistedAt)
+          timestamps.push(latestShortlist.shortlistedAt.getTime());
+        if (latestSubmission?.submittedAt) timestamps.push(latestSubmission.submittedAt.getTime());
+        const maxActivityTimestamp = Math.max(...timestamps);
+        const lastActivityAt = new Date(maxActivityTimestamp).toISOString();
+
+        const resumeFileName = latestResume
+          ? latestResume.objectKey.split('/').pop() || 'resume'
+          : null;
+
+        const skills = (latestProfile?.skills ?? []).map((s) => s.skillNameNormalized);
+
+        const dto: GlobalCandidateSummaryDto = {
+          candidateId: c.id,
+          candidateCode: c.candidateCode,
+          createdAt: c.createdAt.toISOString(),
+          lastActivityAt,
+          requisitionId: reqId,
+          requisitionTitle: reqTitle,
+          clientName,
+          resumeDocumentId: latestResume?.id ?? null,
+          resumeFileName,
+          parseStatus: latestResume?.parseStatus ?? null,
+          currentRole: latestProfile?.currentRole ?? null,
+          experienceYears:
+            latestProfile?.experienceYears !== null && latestProfile?.experienceYears !== undefined
+              ? Number(latestProfile.experienceYears)
+              : null,
+          location: latestProfile?.location ?? null,
+          skills,
+          assessmentId: latestAssessment?.id ?? null,
+          assessmentStatus: latestAssessment?.status ?? null,
+          overallScore,
+          coverage: latestAssessment?.coverage ? Number(latestAssessment.coverage) : null,
+          isComplete,
+          criteriaCount,
+          criteriaMetCount,
+          reviewStatus: (latestReview?.decision as ReviewDecision) ?? 'NOT_REVIEWED',
+          reviewedAt: latestReview?.reviewedAt?.toISOString() ?? null,
+          isShortlisted: Boolean(latestShortlist),
+          shortlistedAt: latestShortlist?.shortlistedAt?.toISOString() ?? null,
+          submissionStatus: (latestSubmission?.status as SubmissionStatus) ?? null,
+          submittedAt: latestSubmission?.submittedAt?.toISOString() ?? null,
+          statusCategory,
+        };
+
+        return {
+          dto,
+          activityTimestamp: maxActivityTimestamp,
+          createdTimestamp: c.createdAt.getTime(),
+        };
+      });
+
+      if (options.search && options.search.trim().length > 0) {
+        const query = options.search.trim().toLowerCase();
+        mapped = mapped.filter(({ dto }) => {
+          if (dto.candidateCode.toLowerCase().includes(query)) return true;
+          if (dto.resumeFileName && dto.resumeFileName.toLowerCase().includes(query)) return true;
+          if (dto.currentRole && dto.currentRole.toLowerCase().includes(query)) return true;
+          if (dto.location && dto.location.toLowerCase().includes(query)) return true;
+          if (dto.skills.some((s) => s.toLowerCase().includes(query))) return true;
+          if (dto.requisitionTitle && dto.requisitionTitle.toLowerCase().includes(query))
+            return true;
+          if (dto.clientName && dto.clientName.toLowerCase().includes(query)) return true;
+          return false;
+        });
+      }
+
+      if (options.statusCategory && options.statusCategory !== 'ALL') {
+        mapped = mapped.filter(({ dto }) => dto.statusCategory === options.statusCategory);
+      }
+
+      if (options.assessmentStatus && options.assessmentStatus !== 'ALL') {
+        mapped = mapped.filter(({ dto }) => dto.assessmentStatus === options.assessmentStatus);
+      }
+
+      if (options.reviewStatus && options.reviewStatus !== 'ALL') {
+        mapped = mapped.filter(({ dto }) => dto.reviewStatus === options.reviewStatus);
+      }
+
+      const isAsc = options.sortOrder === 'asc';
+      mapped.sort((a, b) => {
+        if (options.sortBy === 'score') {
+          const scoreA = a.dto.overallScore;
+          const scoreB = b.dto.overallScore;
+          if (scoreA !== null && scoreB !== null) {
+            if (scoreA !== scoreB) {
+              return isAsc ? scoreA - scoreB : scoreB - scoreA;
+            }
+          } else if (scoreA !== null) {
+            return -1;
+          } else if (scoreB !== null) {
+            return 1;
+          }
+          if (a.activityTimestamp !== b.activityTimestamp) {
+            return b.activityTimestamp - a.activityTimestamp;
+          }
+          return a.dto.candidateId.localeCompare(b.dto.candidateId);
+        } else if (options.sortBy === 'createdAt') {
+          if (a.createdTimestamp !== b.createdTimestamp) {
+            return isAsc
+              ? a.createdTimestamp - b.createdTimestamp
+              : b.createdTimestamp - a.createdTimestamp;
+          }
+          return a.dto.candidateId.localeCompare(b.dto.candidateId);
+        } else {
+          // 'activity'
+          if (a.activityTimestamp !== b.activityTimestamp) {
+            return isAsc
+              ? a.activityTimestamp - b.activityTimestamp
+              : b.activityTimestamp - a.activityTimestamp;
+          }
+          return a.dto.candidateId.localeCompare(b.dto.candidateId);
+        }
+      });
+
+      const total = mapped.length;
+      const page = Math.max(1, options.page ?? 1);
+      const pageSize = Math.min(100, Math.max(1, options.pageSize ?? 20));
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const offset = (page - 1) * pageSize;
+      const items = mapped.slice(offset, offset + pageSize).map((m) => m.dto);
+
+      return {
+        items,
+        total,
+        page,
+        pageSize,
+        totalPages,
+      };
+    },
+
+    async listInterviews(principal, options) {
+      let authorizedClientIds: string[] | null = null;
+      if (principal.role === 'CLIENT_HIRING_MANAGER') {
+        const memberships = await database.clientMembership.findMany({
+          where: {
+            userId: principal.userId,
+            organizationId: principal.organizationId,
+            status: 'ACTIVE',
+          },
+          select: { clientId: true },
+        });
+
+        if (memberships.length === 0) {
+          return {
+            items: [],
+            total: 0,
+            page: options.page ?? 1,
+            pageSize: options.pageSize ?? 20,
+            totalPages: 0,
+            counts: { total: 0, upcoming: 0, pendingAction: 0, completed: 0, rejected: 0 },
+          };
+        }
+        authorizedClientIds = memberships.map((m) => m.clientId);
+      }
+
+      const baseWhere: Prisma.InterviewProposalWhereInput = {
+        organizationId: principal.organizationId,
+      };
+
+      if (authorizedClientIds !== null) {
+        if (options.clientId) {
+          if (!authorizedClientIds.includes(options.clientId)) {
+            return {
+              items: [],
+              total: 0,
+              page: options.page ?? 1,
+              pageSize: options.pageSize ?? 20,
+              totalPages: 0,
+              counts: { total: 0, upcoming: 0, pendingAction: 0, completed: 0, rejected: 0 },
+            };
+          }
+          baseWhere.submission = {
+            clientId: options.clientId,
+            status: { not: 'WITHDRAWN' },
+          };
+        } else {
+          baseWhere.submission = {
+            clientId: { in: authorizedClientIds },
+            status: { not: 'WITHDRAWN' },
+          };
+        }
+      } else if (options.clientId) {
+        baseWhere.submission = {
+          clientId: options.clientId,
+        };
+      }
+
+      if (options.requisitionId) {
+        baseWhere.requisitionId = options.requisitionId;
+      }
+
+      if (options.fromDate || options.toDate) {
+        const dateFilter: Prisma.DateTimeFilter = {};
+        if (options.fromDate) {
+          dateFilter.gte = new Date(options.fromDate);
+        }
+        if (options.toDate) {
+          dateFilter.lte = new Date(options.toDate);
+        }
+        baseWhere.startAt = dateFilter;
+      }
+
+      const sortOrder: Prisma.SortOrder = options.sortOrder === 'asc' ? 'asc' : 'desc';
+      const orderBy: Prisma.InterviewProposalOrderByWithRelationInput[] = [
+        options.sortBy === 'createdAt'
+          ? { createdAt: sortOrder }
+          : options.sortBy === 'status'
+            ? { status: sortOrder }
+            : { startAt: sortOrder },
+        { id: 'asc' },
+      ];
+
+      const proposals = await database.interviewProposal.findMany({
+        where: baseWhere,
+        include: {
+          submission: {
+            select: {
+              id: true,
+              candidateId: true,
+              clientId: true,
+              status: true,
+              candidate: { select: { candidateCode: true } },
+              client: { select: { name: true } },
+            },
+          },
+          requisition: {
+            select: {
+              id: true,
+              title: true,
+            },
+          },
+        },
+        orderBy,
+      });
+
+      let upcomingCount = 0;
+      let pendingActionCount = 0;
+      let completedCount = 0;
+      let rejectedCount = 0;
+
+      const now = new Date();
+
+      for (const p of proposals) {
+        if (p.status === 'ACCEPTED') upcomingCount++;
+        else if (p.status === 'COMPLETED') completedCount++;
+        else if (p.status === 'REJECTED') rejectedCount++;
+
+        if (p.status === 'PROPOSED') {
+          const isExpired =
+            (p.expiresAt && p.expiresAt.getTime() <= now.getTime()) ||
+            p.startAt.getTime() <= now.getTime();
+          if (!isExpired) {
+            if (principal.role === 'RECRUITER' && p.proposerRole === 'CLIENT_HIRING_MANAGER') {
+              pendingActionCount++;
+            } else if (
+              principal.role === 'CLIENT_HIRING_MANAGER' &&
+              p.proposerRole === 'RECRUITER'
+            ) {
+              pendingActionCount++;
+            }
+          }
+        }
+      }
+
+      let filtered = proposals;
+
+      if (options.search && options.search.trim().length > 0) {
+        const query = options.search.trim().toLowerCase();
+        filtered = filtered.filter((p) => {
+          if (p.submission.candidate?.candidateCode.toLowerCase().includes(query)) return true;
+          if (p.requisition.title.toLowerCase().includes(query)) return true;
+          if (p.submission.client?.name.toLowerCase().includes(query)) return true;
+          return false;
+        });
+      }
+
+      if (options.status && options.status !== 'ALL') {
+        filtered = filtered.filter((p) => p.status === options.status);
+      } else if (options.statusCategory && options.statusCategory !== 'ALL') {
+        filtered = filtered.filter((p) => {
+          switch (options.statusCategory) {
+            case 'UPCOMING':
+              return p.status === 'ACCEPTED';
+            case 'PENDING_ACTION': {
+              if (p.status !== 'PROPOSED') return false;
+              const isExpired =
+                (p.expiresAt && p.expiresAt.getTime() <= now.getTime()) ||
+                p.startAt.getTime() <= now.getTime();
+              if (isExpired) return false;
+              return principal.role === 'RECRUITER'
+                ? p.proposerRole === 'CLIENT_HIRING_MANAGER'
+                : p.proposerRole === 'RECRUITER';
+            }
+            case 'COMPLETED':
+              return p.status === 'COMPLETED';
+            case 'PAST':
+              return (
+                p.status === 'COMPLETED' || p.status === 'REJECTED' || p.status === 'CANCELLED'
+              );
+            default:
+              return true;
+          }
+        });
+      }
+
+      const total = filtered.length;
+      const page = Math.max(1, options.page ?? 1);
+      const pageSize = Math.min(100, Math.max(1, options.pageSize ?? 20));
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const offset = (page - 1) * pageSize;
+      const pageItems = filtered.slice(offset, offset + pageSize);
+
+      const items: InterviewItemDto[] = pageItems.map((p) => {
+        const isPast =
+          p.startAt.getTime() <= now.getTime() ||
+          (p.expiresAt !== null && p.expiresAt.getTime() <= now.getTime());
+
+        const isActionable =
+          p.status === 'PROPOSED' &&
+          !isPast &&
+          (principal.role === 'RECRUITER'
+            ? p.proposerRole === 'CLIENT_HIRING_MANAGER'
+            : p.proposerRole === 'RECRUITER');
+
+        return {
+          id: p.id,
+          submissionId: p.submissionId,
+          requisitionId: p.requisitionId,
+          requisitionTitle: p.requisition.title,
+          clientId: p.submission.clientId,
+          clientName: p.submission.client?.name ?? 'Client',
+          candidateId: p.submission.candidateId,
+          candidateCode: p.submission.candidate?.candidateCode ?? 'Candidate',
+          proposerUserId: p.proposerUserId,
+          proposerRole: p.proposerRole,
+          startAt: p.startAt.toISOString(),
+          endAt: p.endAt.toISOString(),
+          timezone: p.timezone,
+          format: p.format,
+          status: p.status,
+          reason: p.reason,
+          expiresAt: p.expiresAt?.toISOString() ?? null,
+          createdAt: p.createdAt.toISOString(),
+          updatedAt: p.updatedAt.toISOString(),
+          canAccept: isActionable,
+          canReject: isActionable,
+          canReschedule: principal.role === 'RECRUITER' && p.status === 'PROPOSED',
+          canComplete: principal.role === 'RECRUITER' && p.status === 'ACCEPTED',
+        };
+      });
+
+      return {
+        items,
+        total,
+        page,
+        pageSize,
+        totalPages,
+        counts: {
+          total: proposals.length,
+          upcoming: upcomingCount,
+          pendingAction: pendingActionCount,
+          completed: completedCount,
+          rejected: rejectedCount,
+        },
+      };
+    },
+
+    async getRecruiterDashboardSummary(
+      organizationId: string,
+    ): Promise<RecruiterDashboardSummaryDto> {
+      const now = new Date();
+
+      const [
+        totalActiveRequisitions,
+        activeRequisitionsRaw,
+        candidatesInPipeline,
+        candidatesAwaitingAssessment,
+        pendingClientDecisions,
+        intakeCount,
+        assessedCount,
+        reviewCount,
+        shortlistedCount,
+        withClientCount,
+        interviewCount,
+        reviewAssessmentsRaw,
+        upcomingProposalsRaw,
+        recentLogsRaw,
+      ] = await Promise.all([
+        database.requisition.count({
+          where: { organizationId, status: 'OPEN' },
+        }),
+        database.requisition.findMany({
+          where: { organizationId, status: { in: ['OPEN', 'PAUSED'] } },
+          orderBy: { updatedAt: 'desc' },
+          take: 10,
+          select: {
+            id: true,
+            title: true,
+            status: true,
+            updatedAt: true,
+            client: { select: { id: true, name: true } },
+            submissions: {
+              where: { status: { not: 'WITHDRAWN' } },
+              select: { id: true, status: true },
+            },
+            reviews: { select: { id: true, decision: true } },
+            assessments: { select: { id: true, status: true } },
+          },
+        }),
+        database.candidate.count({
+          where: { organizationId, recordStatus: 'ACTIVE' },
+        }),
+        database.resumeDocument.count({
+          where: {
+            organizationId,
+            parseStatus: { in: ['PENDING', 'PROCESSING'] },
+          },
+        }),
+        database.candidateSubmission.count({
+          where: { organizationId, status: 'SUBMITTED' },
+        }),
+        database.resumeDocument.count({
+          where: {
+            organizationId,
+            parseStatus: { in: ['PENDING', 'PROCESSING'] },
+          },
+        }),
+        database.candidateAssessment.count({
+          where: {
+            organizationId,
+            status: 'COMPLETE',
+          },
+        }),
+        database.candidateReview.count({
+          where: { organizationId },
+        }),
+        database.candidateShortlist.count({
+          where: { organizationId },
+        }),
+        database.candidateSubmission.count({
+          where: {
+            organizationId,
+            status: { notIn: ['WITHDRAWN', 'CLIENT_REJECTED'] },
+          },
+        }),
+        database.interviewProposal.count({
+          where: {
+            organizationId,
+            status: { in: ['PROPOSED', 'ACCEPTED'] },
+            submission: { status: { not: 'WITHDRAWN' } },
+          },
+        }),
+        database.candidateAssessment.findMany({
+          where: {
+            organizationId,
+            requisition: { status: 'OPEN' },
+            candidate: { recordStatus: 'ACTIVE' },
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: 20,
+          select: {
+            candidateId: true,
+            requisitionId: true,
+            status: true,
+            score: true,
+            coverage: true,
+            updatedAt: true,
+            candidate: {
+              select: {
+                id: true,
+                candidateCode: true,
+                consents: {
+                  select: { requisitionId: true, status: true },
+                },
+              },
+            },
+            requisition: {
+              select: { id: true, title: true },
+            },
+          },
+        }),
+        database.interviewProposal.findMany({
+          where: {
+            organizationId,
+            status: 'ACCEPTED',
+            startAt: { gte: now },
+            submission: { status: { not: 'WITHDRAWN' } },
+          },
+          orderBy: { startAt: 'asc' },
+          take: 5,
+          include: {
+            submission: {
+              include: {
+                candidate: { select: { candidateCode: true } },
+                requisition: {
+                  include: {
+                    client: { select: { id: true, name: true } },
+                  },
+                },
+              },
+            },
+          },
+        }),
+        database.auditLog.findMany({
+          where: { organizationId },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          include: {
+            actor: { select: { email: true, role: true } },
+            candidate: { select: { candidateCode: true } },
+            requisition: { select: { title: true } },
+            client: { select: { name: true } },
+          },
+        }),
+      ]);
+
+      let requisitionsRequiringAttention = 0;
+      for (const req of activeRequisitionsRaw) {
+        if (req.status === 'OPEN') {
+          const hasPendingSubmissions = req.submissions.some((s) => s.status === 'SUBMITTED');
+          const hasAssessments = req.assessments.length > 0;
+          if (hasPendingSubmissions || hasAssessments) {
+            requisitionsRequiringAttention += 1;
+          }
+        }
+      }
+
+      const reviewQueue: ReviewQueueSummaryItemDto[] = reviewAssessmentsRaw.map((a) => {
+        let assessmentStatus: ReviewQueueSummaryItemDto['assessmentStatus'] = 'NOT_ASSESSED';
+        if (a.status === 'COMPLETE') {
+          assessmentStatus = 'COMPLETE';
+        } else if (a.status === 'NEEDS_REVIEW') {
+          assessmentStatus = 'NEEDS_REVIEW';
+        } else if (a.status === 'FAILED') {
+          assessmentStatus = 'FAILED';
+        }
+
+        const consentRecord = a.candidate.consents.find((c) => c.requisitionId === a.requisitionId);
+        let consent: ReviewQueueSummaryItemDto['consent'] = 'PENDING';
+        if (consentRecord?.status === 'WITHDRAWN') {
+          consent = 'WITHDRAWN';
+        } else if (consentRecord?.status === 'ACTIVE') {
+          consent = 'ACTIVE';
+        }
+
+        return {
+          candidateId: a.candidateId,
+          requisitionId: a.requisitionId,
+          candidateCode: a.candidate.candidateCode,
+          requisitionTitle: a.requisition.title,
+          assessmentStatus,
+          score: a.score !== null ? Math.round(Number(a.score)) : null,
+          coverage: a.coverage !== null ? Math.round(Number(a.coverage)) : null,
+          consent,
+          lastActivityAt: a.updatedAt.toISOString(),
+        };
+      });
+
+      const candidatesAwaitingReview = reviewQueue.filter(
+        (item) => item.assessmentStatus === 'COMPLETE' && item.consent === 'ACTIVE',
+      ).length;
+
+      const recentRequisitions: RecentRequisitionDto[] = activeRequisitionsRaw
+        .slice(0, 5)
+        .map((r) => ({
+          id: r.id,
+          title: r.title,
+          clientName: r.client.name,
+          status: r.status === 'OPEN' ? 'OPEN' : 'PAUSED',
+          candidatesCount: r.assessments.length,
+          awaitingReviewCount: r.assessments.filter((a) => a.status === 'COMPLETE').length,
+          withClientCount: r.submissions.length,
+          updatedAt: r.updatedAt.toISOString(),
+        }));
+
+      const upcomingInterviews: InterviewItemDto[] = upcomingProposalsRaw.map((p) => ({
+        id: p.id,
+        submissionId: p.submissionId,
+        requisitionId: p.requisitionId,
+        requisitionTitle: p.submission.requisition?.title ?? 'Requisition',
+        clientId: p.submission.requisition?.client?.id ?? '',
+        clientName: p.submission.requisition?.client?.name ?? 'Client',
+        candidateId: p.submission.candidateId,
+        candidateCode: p.submission.candidate?.candidateCode ?? 'Candidate',
+        proposerUserId: p.proposerUserId,
+        proposerRole: p.proposerRole,
+        startAt: p.startAt.toISOString(),
+        endAt: p.endAt.toISOString(),
+        timezone: p.timezone,
+        format: p.format,
+        status: p.status,
+        reason: p.reason,
+        expiresAt: p.expiresAt?.toISOString() ?? null,
+        createdAt: p.createdAt.toISOString(),
+        updatedAt: p.updatedAt.toISOString(),
+        canAccept: false,
+        canReject: false,
+        canReschedule: false,
+        canComplete: true,
+      }));
+
+      const recentActivity: DashboardActivityItemDto[] = recentLogsRaw.map(
+        formatAuditLogToActivityItem,
+      );
+
+      return {
+        role: 'RECRUITER',
+        generatedAt: now.toISOString(),
+        metrics: {
+          totalActiveRequisitions,
+          requisitionsRequiringAttention,
+          candidatesInPipeline,
+          candidatesAwaitingAssessment,
+          candidatesAwaitingReview,
+          pendingClientDecisions,
+          upcomingConfirmedInterviews: upcomingInterviews.length,
+        },
+        pipelineStages: [
+          {
+            key: 'intake',
+            label: 'Intake & parsing',
+            count: intakeCount,
+            hint: 'Awaiting text extraction',
+          },
+          {
+            key: 'assessed',
+            label: 'Assessed',
+            count: assessedCount,
+            hint: 'Scored against scorecard',
+          },
+          {
+            key: 'review',
+            label: 'Recruiter review',
+            count: reviewCount,
+            hint: 'Reviewed, pending shortlist',
+          },
+          {
+            key: 'shortlisted',
+            label: 'Shortlisted',
+            count: shortlistedCount,
+            hint: 'Approved for submission',
+          },
+          {
+            key: 'client',
+            label: 'With client',
+            count: withClientCount,
+            hint: 'Submitted for client review',
+          },
+          {
+            key: 'interview',
+            label: 'Interviewing',
+            count: interviewCount,
+            hint: 'Proposed or confirmed',
+          },
+        ],
+        recentRequisitions,
+        reviewQueue,
+        upcomingInterviews,
+        recentActivity,
+      };
+    },
+
+    async getClientDashboardSummary(
+      authenticatedUser: AuthenticatedPrincipal,
+    ): Promise<ClientDashboardSummaryDto> {
+      const now = new Date();
+
+      const memberships = await database.clientMembership.findMany({
+        where: {
+          userId: authenticatedUser.userId,
+          organizationId: authenticatedUser.organizationId,
+          role: 'CLIENT_HIRING_MANAGER',
+          status: 'ACTIVE',
+          client: { status: 'ACTIVE' },
+        },
+        select: {
+          clientId: true,
+          client: { select: { id: true, name: true } },
+        },
+      });
+
+      const authorizedClientIds = memberships.map((m) => m.clientId);
+
+      if (authorizedClientIds.length === 0) {
+        return {
+          role: 'CLIENT_HIRING_MANAGER',
+          generatedAt: now.toISOString(),
+          metrics: {
+            pendingCandidateReviews: 0,
+            submittedAwaitingDecisions: 0,
+            upcomingConfirmedInterviews: 0,
+            recentDecisionsCount: 0,
+            activeRequisitionsCount: 0,
+          },
+          pendingReviews: [],
+          upcomingInterviews: [],
+          recentDecisions: [],
+          activeRequisitions: [],
+          recentActivity: [],
+        };
+      }
+
+      const [
+        pendingSubmissionsRaw,
+        upcomingProposalsRaw,
+        recentDecisionsRaw,
+        activeRequisitionsRaw,
+        recentLogsRaw,
+      ] = await Promise.all([
+        database.candidateSubmission.findMany({
+          where: {
+            clientId: { in: authorizedClientIds },
+            status: 'SUBMITTED',
+          },
+          orderBy: { submittedAt: 'desc' },
+          take: 10,
+          include: {
+            candidate: { select: { candidateCode: true } },
+            requisition: { select: { id: true, title: true } },
+            client: { select: { id: true, name: true } },
+            assessment: {
+              select: {
+                score: true,
+                criterionAssessments: { select: { id: true } },
+              },
+            },
+          },
+        }),
+        database.interviewProposal.findMany({
+          where: {
+            submission: {
+              clientId: { in: authorizedClientIds },
+              status: { not: 'WITHDRAWN' },
+            },
+            status: 'ACCEPTED',
+            startAt: { gte: now },
+          },
+          orderBy: { startAt: 'asc' },
+          take: 5,
+          include: {
+            submission: {
+              include: {
+                candidate: { select: { candidateCode: true } },
+                requisition: {
+                  include: {
+                    client: { select: { id: true, name: true } },
+                  },
+                },
+              },
+            },
+          },
+        }),
+        database.clientDecision.findMany({
+          where: {
+            clientId: { in: authorizedClientIds },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+          include: {
+            submission: {
+              include: {
+                candidate: { select: { candidateCode: true } },
+                requisition: { select: { title: true } },
+              },
+            },
+          },
+        }),
+        database.requisition.findMany({
+          where: {
+            clientId: { in: authorizedClientIds },
+            status: 'OPEN',
+          },
+          select: {
+            id: true,
+            title: true,
+            clientId: true,
+            client: { select: { name: true } },
+            status: true,
+            submissions: {
+              where: { status: { not: 'WITHDRAWN' } },
+              select: { id: true },
+            },
+            interviewProposals: {
+              where: { status: { in: ['PROPOSED', 'ACCEPTED'] } },
+              select: { id: true },
+            },
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: 10,
+        }),
+        database.auditLog.findMany({
+          where: {
+            clientId: { in: authorizedClientIds },
+            action: {
+              in: [
+                'CANDIDATE_SUBMITTED_TO_CLIENT',
+                'CLIENT_DECISION_RECORDED',
+                'INTERVIEW_PROPOSED',
+                'INTERVIEW_ACCEPTED',
+                'INTERVIEW_REJECTED',
+                'INTERVIEW_COMPLETED',
+              ],
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          include: {
+            candidate: { select: { candidateCode: true } },
+            requisition: { select: { title: true } },
+            actor: { select: { email: true, role: true } },
+            client: { select: { name: true } },
+          },
+        }),
+      ]);
+
+      const pendingReviews: ClientCandidateReviewItemDto[] = pendingSubmissionsRaw.map((s) => ({
+        submissionId: s.id,
+        candidateCode: s.candidate.candidateCode,
+        requisitionId: s.requisitionId,
+        requisitionTitle: s.requisition.title,
+        clientId: s.clientId,
+        clientName: s.client.name,
+        submittedAt: s.submittedAt.toISOString(),
+        advisoryScore:
+          s.assessment?.score !== null && s.assessment?.score !== undefined
+            ? Math.round(Number(s.assessment.score))
+            : null,
+        criteriaCount: s.assessment?.criterionAssessments?.length ?? null,
+        status: s.status as ClientCandidateReviewItemDto['status'],
+      }));
+
+      const upcomingInterviews: InterviewItemDto[] = upcomingProposalsRaw.map((p) => ({
+        id: p.id,
+        submissionId: p.submissionId,
+        requisitionId: p.requisitionId,
+        requisitionTitle: p.submission.requisition?.title ?? 'Requisition',
+        clientId: p.submission.requisition?.client?.id ?? '',
+        clientName: p.submission.requisition?.client?.name ?? 'Client',
+        candidateId: p.submission.candidateId,
+        candidateCode: p.submission.candidate?.candidateCode ?? 'Candidate',
+        proposerUserId: p.proposerUserId,
+        proposerRole: p.proposerRole,
+        startAt: p.startAt.toISOString(),
+        endAt: p.endAt.toISOString(),
+        timezone: p.timezone,
+        format: p.format,
+        status: p.status,
+        reason: p.reason,
+        expiresAt: p.expiresAt?.toISOString() ?? null,
+        createdAt: p.createdAt.toISOString(),
+        updatedAt: p.updatedAt.toISOString(),
+        canAccept: false,
+        canReject: false,
+        canReschedule: false,
+        canComplete: false,
+      }));
+
+      const recentDecisions: ClientRecentDecisionItemDto[] = recentDecisionsRaw.map((d) => ({
+        id: d.id,
+        decision: d.decision as ClientRecentDecisionItemDto['decision'],
+        reason: d.reason,
+        candidateCode: d.submission.candidate?.candidateCode ?? 'Candidate',
+        requisitionTitle: d.submission.requisition?.title ?? 'Requisition',
+        createdAt: d.createdAt.toISOString(),
+      }));
+
+      const activeRequisitions: ClientRequisitionSummaryDto[] = activeRequisitionsRaw.map((r) => ({
+        id: r.id,
+        title: r.title,
+        clientId: r.clientId,
+        clientName: r.client.name,
+        status: 'OPEN',
+        activeSubmissionsCount: r.submissions.length,
+        interviewsCount: r.interviewProposals.length,
+      }));
+
+      const recentActivity: DashboardActivityItemDto[] = recentLogsRaw.map(
+        formatAuditLogToActivityItem,
+      );
+
+      return {
+        role: 'CLIENT_HIRING_MANAGER',
+        generatedAt: now.toISOString(),
+        metrics: {
+          pendingCandidateReviews: pendingReviews.length,
+          submittedAwaitingDecisions: pendingReviews.length,
+          upcomingConfirmedInterviews: upcomingInterviews.length,
+          recentDecisionsCount: recentDecisions.length,
+          activeRequisitionsCount: activeRequisitions.length,
+        },
+        pendingReviews,
+        upcomingInterviews,
+        recentDecisions,
+        activeRequisitions,
+        recentActivity,
       };
     },
   };

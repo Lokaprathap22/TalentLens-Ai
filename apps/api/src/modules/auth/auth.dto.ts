@@ -6,6 +6,7 @@ export interface AuthenticatedUserDto {
   organizationName: string;
   email: string;
   role: UserRole;
+  name?: string | null;
 }
 
 export interface AuthenticatedSession {

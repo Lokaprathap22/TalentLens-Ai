@@ -143,9 +143,46 @@ describe('consent policy notice generation', () => {
       expect(
         isPolicyVersionApproved(
           CURRENT_CONSENT_POLICY_VERSION,
-          new Set([CURRENT_CONSENT_POLICY_VERSION, '2026-12-v2']),
+          new Set([CURRENT_CONSENT_POLICY_VERSION]),
         ),
       ).toBe(true);
+    });
+  });
+
+  describe('verifyNoticeIntegrity', () => {
+    it('returns true when text matches SHA-256 hash', async () => {
+      const { computeNoticeHash, verifyNoticeIntegrity } = await import('./consent.policy.js');
+      const text = 'Sample legal consent notice text.';
+      const hash = computeNoticeHash(text);
+      expect(verifyNoticeIntegrity(text, hash)).toBe(true);
+      expect(verifyNoticeIntegrity(text, hash.toUpperCase())).toBe(true);
+    });
+
+    it('returns false when text has been altered', async () => {
+      const { computeNoticeHash, verifyNoticeIntegrity } = await import('./consent.policy.js');
+      const text = 'Sample legal consent notice text.';
+      const hash = computeNoticeHash(text);
+      expect(verifyNoticeIntegrity('Tampered notice text', hash)).toBe(false);
+      expect(verifyNoticeIntegrity('', hash)).toBe(false);
+      expect(verifyNoticeIntegrity(text, '')).toBe(false);
+    });
+  });
+
+  describe('isPolicyApproved with approvedPolicyVersions', () => {
+    const validHash = 'c'.repeat(64);
+
+    it('approves dynamically rendered notice hash when version is approved in approvedPolicyVersions', () => {
+      expect(
+        isPolicyApproved(CURRENT_CONSENT_POLICY_VERSION, validHash, undefined, [
+          CURRENT_CONSENT_POLICY_VERSION,
+        ]),
+      ).toBe(true);
+    });
+
+    it('fails closed when version is not in approvedPolicyVersions', () => {
+      expect(
+        isPolicyApproved('2025-01-v0', validHash, undefined, [CURRENT_CONSENT_POLICY_VERSION]),
+      ).toBe(false);
     });
   });
 });

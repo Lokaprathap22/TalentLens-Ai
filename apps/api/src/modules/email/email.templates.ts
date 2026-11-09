@@ -111,6 +111,58 @@ If you did not request this, please disregard this message.`;
   return { subject, html, text };
 }
 
+export interface CandidateDeletionVerificationTemplateData {
+  organizationName: string;
+  deletionUrl: string;
+  expiresAt: Date;
+}
+
+export function renderCandidateDeletionVerification(
+  data: CandidateDeletionVerificationTemplateData,
+): {
+  subject: string;
+  html: string;
+  text: string;
+} {
+  const org = escapeHtml(data.organizationName);
+  const url = data.deletionUrl;
+  const expiry = data.expiresAt.toUTCString();
+
+  const subject = `Confirm Permanent Data Deletion — ${data.organizationName}`;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>${subject}</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937; line-height: 1.5; padding: 24px;">
+  <div style="max-width: 560px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; background: #ffffff;">
+    <h2 style="margin-top: 0; color: #dc2626; font-size: 20px;">Confirm Permanent Candidate Data Deletion</h2>
+    <p>A request was received to permanently erase your candidate data associated with <strong>${org}</strong> under your right to erasure.</p>
+    <p>Confirming this request will permanently delete your uploaded CV files, profile records, AI assessments, and consent history, and will irreversibly redact your contact identity.</p>
+    <div style="margin: 28px 0;">
+      <a href="${url}" style="background-color: #dc2626; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600; display: inline-block;">Confirm Permanent Deletion</a>
+    </div>
+    <p style="font-size: 13px; color: #6b7280;">This single-use verification link expires on <strong>${expiry}</strong>.</p>
+    <p style="font-size: 13px; color: #6b7280; border-top: 1px solid #e5e7eb; padding-top: 16px; margin-top: 24px;">If you did not request permanent data erasure, please disregard this email. No records will be deleted without confirmation.</p>
+  </div>
+</body>
+</html>`;
+
+  const text = `Confirm Permanent Data Deletion — ${data.organizationName}
+
+A request was received to permanently erase your candidate data associated with ${data.organizationName}.
+
+Confirming this request will permanently delete your uploaded CV files, profile records, AI assessments, and consent history, and irreversibly redact your contact identity.
+
+To confirm permanent deletion:
+${data.deletionUrl}
+
+This single-use verification link expires on ${data.expiresAt.toUTCString()}.
+
+If you did not request this, please disregard this message.`;
+
+  return { subject, html, text };
+}
+
 export interface ClientSubmissionTemplateData {
   clientName: string;
   requisitionTitle: string;
@@ -259,6 +311,106 @@ export function renderInterviewNotification(data: InterviewNotificationTemplateD
   const text = `Interview Update: ${data.candidateCode} — ${data.requisitionTitle}
 Format: ${data.format}
 Scheduled: ${data.scheduledAt} (${data.timezone})`;
+
+  return { subject, html, text };
+}
+
+export interface AccountActivationTemplateData {
+  userName?: string | undefined;
+  organizationName: string;
+  activationUrl: string;
+  expiresAt: Date;
+}
+
+export function renderAccountActivation(data: AccountActivationTemplateData): {
+  subject: string;
+  html: string;
+  text: string;
+} {
+  const org = escapeHtml(data.organizationName);
+  const name = data.userName ? escapeHtml(data.userName) : 'Team Member';
+  const url = data.activationUrl;
+  const expiry = data.expiresAt.toUTCString();
+
+  const subject = `Activate Your TalentLens AI Account — ${data.organizationName}`;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>${subject}</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937; line-height: 1.5; padding: 24px;">
+  <div style="max-width: 560px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; background: #ffffff;">
+    <h2 style="margin-top: 0; color: #111827; font-size: 20px;">Welcome to TalentLens AI</h2>
+    <p>Hello ${name},</p>
+    <p>You have been invited to join <strong>${org}</strong> on TalentLens AI. To activate your account and choose your secure password, please click the link below:</p>
+    <div style="margin: 28px 0;">
+      <a href="${url}" style="background-color: #0f766e; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600; display: inline-block;">Activate Account</a>
+    </div>
+    <p style="font-size: 13px; color: #6b7280;">This secure activation link expires on <strong>${expiry}</strong>.</p>
+    <p style="font-size: 13px; color: #6b7280; border-top: 1px solid #e5e7eb; padding-top: 16px; margin-top: 24px;">If you did not expect this invitation, you may safely ignore this email.</p>
+  </div>
+</body>
+</html>`;
+
+  const text = `Hello ${data.userName ?? 'Team Member'},
+
+You have been invited to join ${data.organizationName} on TalentLens AI.
+
+Activate your account and set your password here:
+${data.activationUrl}
+
+This link expires on ${data.expiresAt.toUTCString()}.
+
+If you did not expect this invitation, you may safely ignore this email.`;
+
+  return { subject, html, text };
+}
+
+export interface PasswordResetTemplateData {
+  userName?: string | undefined;
+  organizationName: string;
+  resetUrl: string;
+  expiresAt: Date;
+}
+
+export function renderPasswordReset(data: PasswordResetTemplateData): {
+  subject: string;
+  html: string;
+  text: string;
+} {
+  const org = escapeHtml(data.organizationName);
+  const name = data.userName ? escapeHtml(data.userName) : 'User';
+  const url = data.resetUrl;
+  const expiry = data.expiresAt.toUTCString();
+
+  const subject = `Reset Your TalentLens AI Password — ${data.organizationName}`;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>${subject}</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937; line-height: 1.5; padding: 24px;">
+  <div style="max-width: 560px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; background: #ffffff;">
+    <h2 style="margin-top: 0; color: #111827; font-size: 20px;">Password Reset Request</h2>
+    <p>Hello ${name},</p>
+    <p>We received a request to reset the password for your <strong>${org}</strong> account on TalentLens AI. Click the link below to choose a new password:</p>
+    <div style="margin: 28px 0;">
+      <a href="${url}" style="background-color: #0f766e; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600; display: inline-block;">Reset Password</a>
+    </div>
+    <p style="font-size: 13px; color: #6b7280;">This secure reset link expires on <strong>${expiry}</strong>.</p>
+    <p style="font-size: 13px; color: #6b7280; border-top: 1px solid #e5e7eb; padding-top: 16px; margin-top: 24px;">If you did not request a password reset, you can safely ignore this email. Your account remains secure.</p>
+  </div>
+</body>
+</html>`;
+
+  const text = `Hello ${data.userName ?? 'User'},
+
+We received a request to reset your password for ${data.organizationName} on TalentLens AI.
+
+Reset your password using this secure link:
+${data.resetUrl}
+
+This link expires on ${data.expiresAt.toUTCString()}.
+
+If you did not request a password reset, please ignore this email.`;
 
   return { subject, html, text };
 }

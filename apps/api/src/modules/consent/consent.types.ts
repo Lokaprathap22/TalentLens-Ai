@@ -25,15 +25,16 @@ export interface ConsentInvitationDto {
   status: ConsentInvitationStatus;
   policyVersion: string;
   noticeTextHash: string;
+  noticeText?: string | null;
   deliveryStatus: InvitationDeliveryStatus;
   deliveryError?: string | null;
   expiresAt: string;
   createdAt: string;
-  invitationUrl?: string;
-  rawToken?: string;
+  outboxId?: string | undefined;
 }
 
 export interface ConsentNoticeData {
+  organizationId: string;
   organizationName: string;
   requisitionTitle: string;
   clientName?: string;
@@ -41,6 +42,7 @@ export interface ConsentNoticeData {
   purpose: ConsentPurpose;
   policyVersion: string;
   noticeTextHash: string;
+  noticeText?: string | null;
   expiresAt: string;
 }
 
@@ -75,4 +77,23 @@ export interface ConsentWithdrawalConfirmResult {
   candidateId: string;
   withdrawnAt: string;
   heldJobCount: number;
+}
+
+export interface DeletionRequestDto {
+  id: string;
+  candidateId: string;
+  organizationId: string;
+  status: 'REQUESTED' | 'PROCESSING' | 'COMPLETED' | 'PARTIALLY_BLOCKED' | 'REJECTED';
+  requestedAt: string;
+  processedAt?: string | null;
+  resultSummary?: string | null;
+}
+
+export interface ProcessDeletionResult {
+  deletionRequestId: string;
+  candidateId: string;
+  status: 'COMPLETED';
+  deletedResumeCount: number;
+  anonymizedRecords: string[];
+  processedAt: string;
 }

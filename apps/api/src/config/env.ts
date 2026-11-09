@@ -5,11 +5,14 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import { parseApprovedPolicies } from '../modules/consent/consent.policy.js';
 
+const emptyStringToUndefined = (value: unknown): unknown =>
+  typeof value === 'string' && value.trim() === '' ? undefined : value;
+
 const environmentSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'staging', 'production']).default('development'),
     API_PORT: z.preprocess(
-      (value) => value ?? '4000',
+      (value) => value ?? '3000',
       z
         .string()
         .regex(/^\d+$/, 'API_PORT must be an integer')
@@ -25,23 +28,43 @@ const environmentSchema = z
       .refine((value) => value.startsWith('postgresql://') || value.startsWith('postgres://'), {
         message: 'DATABASE_URL must use the PostgreSQL protocol',
       }),
-    APP_ORIGIN: z
-      .string()
-      .url('APP_ORIGIN must be a valid URL')
-      .refine((value) => {
-        try {
-          return new URL(value).origin === value;
-        } catch {
-          return false;
-        }
-      }, 'APP_ORIGIN must not include a path, query, or fragment')
+    APP_ORIGIN: z.preprocess(
+      emptyStringToUndefined,
+      z
+        .string()
+        .url('APP_ORIGIN must be a valid URL')
+        .refine((value) => {
+          try {
+            return new URL(value).origin === value;
+          } catch {
+            return false;
+          }
+        }, 'APP_ORIGIN must not include a path, query, or fragment')
+        .optional(),
+    ),
+    GEMINI_API_KEY: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GEMINI_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GEMINI_TIMEOUT_MS: z
+      .preprocess(
+        (value) => {
+          const cleaned = emptyStringToUndefined(value);
+          return cleaned ?? '30000';
+        },
+        z
+          .string()
+          .regex(/^\d+$/)
+          .transform(Number)
+          .refine((value) => value >= 1_000 && value <= 120_000),
+      )
       .optional(),
-    AI_API_KEY: z.string().min(1).optional(),
-    AI_BASE_URL: z.string().url().optional(),
-    AI_MODEL: z.string().min(1).optional(),
+    AI_API_KEY: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    AI_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
     AI_TIMEOUT_MS: z
       .preprocess(
-        (value) => value ?? '30000',
+        (value) => {
+          const cleaned = emptyStringToUndefined(value);
+          return cleaned ?? '30000';
+        },
         z
           .string()
           .regex(/^\d+$/)
@@ -49,45 +72,36 @@ const environmentSchema = z
           .refine((value) => value >= 1_000 && value <= 120_000),
       )
       .optional(),
-    ASSESSMENT_PROVIDER: z.enum(['openai', 'fake']).optional(),
-    ASSESSMENT_OPENAI_API_KEY: z.string().min(1).optional(),
-    ASSESSMENT_OPENAI_BASE_URL: z.string().url().optional(),
-    ASSESSMENT_OPENAI_MODEL: z.string().min(1).optional(),
-    ASSESSMENT_TIMEOUT_MS: z
-      .preprocess(
-        (value) => value ?? '30000',
-        z
-          .string()
-          .regex(/^\d+$/)
-          .transform(Number)
-          .refine((value) => value >= 1_000 && value <= 120_000),
-      )
-      .optional(),
+    ASSESSMENT_PROVIDER: z.preprocess(
+      emptyStringToUndefined,
+      z.enum(['gemini', 'fake']).optional(),
+    ),
+    TRUSTED_PROXY_IPS: z.preprocess(emptyStringToUndefined, z.string().optional()),
     RESUME_STORAGE_ROOT: z.string().min(1).default('./storage/resumes'),
-    CONSENT_APPROVED_POLICIES: z.string().optional(),
-    CONSENT_APPROVED_POLICY_VERSIONS: z.string().optional(),
-    SMTP_HOST: z.string().optional(),
+    CONSENT_APPROVED_POLICIES: z.preprocess(emptyStringToUndefined, z.string().optional()),
+    CONSENT_APPROVED_POLICY_VERSIONS: z.preprocess(emptyStringToUndefined, z.string().optional()),
+    SMTP_HOST: z.preprocess(emptyStringToUndefined, z.string().optional()),
     SMTP_PORT: z.preprocess(
-      (value) => (value ? Number(value) : undefined),
+      (value) => (value && String(value).trim() !== '' ? Number(value) : undefined),
       z.number().int().min(1).max(65535).optional(),
     ),
-    SMTP_USER: z.string().optional(),
-    SMTP_PASS: z.string().optional(),
-    EMAIL_FROM: z.string().email().optional(),
-    EMAIL_OUTBOX_ENCRYPTION_KEY: z.string().optional(),
-    EMAIL_OUTBOX_IDEMPOTENCY_SECRET: z.string().optional(),
+    SMTP_USER: z.preprocess(emptyStringToUndefined, z.string().optional()),
+    SMTP_PASS: z.preprocess(emptyStringToUndefined, z.string().optional()),
+    EMAIL_FROM: z.preprocess(emptyStringToUndefined, z.string().email().optional()),
+    EMAIL_OUTBOX_ENCRYPTION_KEY: z.preprocess(emptyStringToUndefined, z.string().optional()),
+    EMAIL_OUTBOX_IDEMPOTENCY_SECRET: z.preprocess(emptyStringToUndefined, z.string().optional()),
     STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
-    S3_BUCKET: z.string().optional(),
+    S3_BUCKET: z.preprocess(emptyStringToUndefined, z.string().optional()),
     S3_REGION: z.string().default('us-east-1'),
-    S3_ENDPOINT: z.string().optional(),
-    S3_ACCESS_KEY_ID: z.string().optional(),
-    S3_SECRET_ACCESS_KEY: z.string().optional(),
+    S3_ENDPOINT: z.preprocess(emptyStringToUndefined, z.string().url().optional()),
+    S3_ACCESS_KEY_ID: z.preprocess(emptyStringToUndefined, z.string().optional()),
+    S3_SECRET_ACCESS_KEY: z.preprocess(emptyStringToUndefined, z.string().optional()),
     ALLOW_LOCAL_STORAGE_IN_PRODUCTION: z.preprocess(
       (v) => v === 'true' || v === true,
       z.boolean().default(false),
     ),
     SCANNER_DRIVER: z.enum(['mock', 'clamav']).default('mock'),
-    CLAMAV_HOST: z.string().optional(),
+    CLAMAV_HOST: z.preprocess(emptyStringToUndefined, z.string().optional()),
     CLAMAV_PORT: z.preprocess(
       (v) => (v ? Number(v) : undefined),
       z.number().int().min(1).max(65535).optional(),
@@ -115,11 +129,26 @@ const environmentSchema = z
           message: 'CLAMAV_HOST is required when SCANNER_DRIVER=clamav',
         });
       }
+      if (value.NODE_ENV === 'production') {
+        if (!value.TRUSTED_PROXY_IPS || value.TRUSTED_PROXY_IPS.trim() === '') {
+          context.addIssue({
+            code: 'custom',
+            path: ['TRUSTED_PROXY_IPS'],
+            message: 'TRUSTED_PROXY_IPS is strictly required and cannot be empty in production',
+          });
+        }
+      }
       if (!value.APP_ORIGIN) {
         context.addIssue({
           code: 'custom',
           path: ['APP_ORIGIN'],
           message: 'APP_ORIGIN is required in production and staging',
+        });
+      } else if (value.NODE_ENV === 'production' && !value.APP_ORIGIN.startsWith('https://')) {
+        context.addIssue({
+          code: 'custom',
+          path: ['APP_ORIGIN'],
+          message: 'APP_ORIGIN must use HTTPS in production',
         });
       }
       if (value.STORAGE_DRIVER === 's3') {
@@ -144,6 +173,13 @@ const environmentSchema = z
             message: 'S3_SECRET_ACCESS_KEY is required when STORAGE_DRIVER=s3',
           });
         }
+      } else if (value.NODE_ENV === 'production') {
+        context.addIssue({
+          code: 'custom',
+          path: ['STORAGE_DRIVER'],
+          message:
+            'STORAGE_DRIVER=s3 is strictly required in production; local storage is not permitted',
+        });
       } else if (!value.ALLOW_LOCAL_STORAGE_IN_PRODUCTION) {
         context.addIssue({
           code: 'custom',
@@ -160,6 +196,17 @@ const environmentSchema = z
         message: 'ASSESSMENT_PROVIDER=fake is strictly forbidden outside NODE_ENV=test',
       });
     }
+    if (
+      value.NODE_ENV === 'production' &&
+      value.ASSESSMENT_PROVIDER &&
+      value.ASSESSMENT_PROVIDER !== 'gemini'
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['ASSESSMENT_PROVIDER'],
+        message: 'ASSESSMENT_PROVIDER must be "gemini" in production',
+      });
+    }
   })
   .transform(
     ({
@@ -167,18 +214,17 @@ const environmentSchema = z
       API_PORT,
       DATABASE_URL,
       APP_ORIGIN,
+      GEMINI_API_KEY,
+      GEMINI_MODEL,
+      GEMINI_TIMEOUT_MS,
       AI_API_KEY,
-      AI_BASE_URL,
       AI_MODEL,
       AI_TIMEOUT_MS,
       ASSESSMENT_PROVIDER,
-      ASSESSMENT_OPENAI_API_KEY,
-      ASSESSMENT_OPENAI_BASE_URL,
-      ASSESSMENT_OPENAI_MODEL,
-      ASSESSMENT_TIMEOUT_MS,
       RESUME_STORAGE_ROOT,
       CONSENT_APPROVED_POLICIES,
       CONSENT_APPROVED_POLICY_VERSIONS,
+      TRUSTED_PROXY_IPS,
       SMTP_HOST,
       SMTP_PORT,
       SMTP_USER,
@@ -186,37 +232,49 @@ const environmentSchema = z
       EMAIL_FROM,
       EMAIL_OUTBOX_ENCRYPTION_KEY,
       EMAIL_OUTBOX_IDEMPOTENCY_SECRET,
-    }) => ({
-      nodeEnv: NODE_ENV,
-      apiPort: API_PORT,
-      databaseUrl: DATABASE_URL,
-      appOrigin: APP_ORIGIN ?? 'http://localhost:5173',
-      aiApiKey: AI_API_KEY,
-      aiBaseUrl: AI_BASE_URL,
-      aiModel: AI_MODEL,
-      aiTimeoutMs: AI_TIMEOUT_MS ?? 30_000,
-      assessmentProvider: ASSESSMENT_PROVIDER ?? (NODE_ENV === 'test' ? 'fake' : 'openai'),
-      assessmentOpenAiApiKey: ASSESSMENT_OPENAI_API_KEY,
-      assessmentOpenAiBaseUrl: ASSESSMENT_OPENAI_BASE_URL,
-      assessmentOpenAiModel: ASSESSMENT_OPENAI_MODEL,
-      assessmentTimeoutMs: ASSESSMENT_TIMEOUT_MS ?? 30_000,
-      resumeStorageRoot: path.isAbsolute(RESUME_STORAGE_ROOT)
-        ? path.normalize(RESUME_STORAGE_ROOT)
-        : path.resolve(repositoryRoot(), RESUME_STORAGE_ROOT),
-      smtpHost: SMTP_HOST,
-      smtpPort: SMTP_PORT,
-      smtpUser: SMTP_USER,
-      smtpPass: SMTP_PASS,
-      emailFrom: EMAIL_FROM,
-      emailOutboxEncryptionKey: EMAIL_OUTBOX_ENCRYPTION_KEY,
-      emailOutboxIdempotencySecret: EMAIL_OUTBOX_IDEMPOTENCY_SECRET,
-      approvedPolicies: parseApprovedPolicies(CONSENT_APPROVED_POLICIES),
-      approvedPolicyVersions: CONSENT_APPROVED_POLICY_VERSIONS
-        ? CONSENT_APPROVED_POLICY_VERSIONS.split(',')
-            .map((v) => v.trim())
-            .filter(Boolean)
-        : [],
-    }),
+    }) => {
+      const canonicalGeminiKey = GEMINI_API_KEY ?? AI_API_KEY;
+      const canonicalGeminiModel = GEMINI_MODEL ?? AI_MODEL ?? 'gemini-3.8-flash';
+      const canonicalGeminiTimeout = GEMINI_TIMEOUT_MS ?? AI_TIMEOUT_MS ?? 30_000;
+      return {
+        nodeEnv: NODE_ENV,
+        apiPort: API_PORT,
+        databaseUrl: DATABASE_URL,
+        appOrigin: APP_ORIGIN ?? 'http://localhost:5173',
+        geminiApiKey: canonicalGeminiKey,
+        geminiModel: canonicalGeminiModel,
+        geminiTimeoutMs: canonicalGeminiTimeout,
+        // Canonical AI settings
+        aiApiKey: canonicalGeminiKey,
+        aiModel: canonicalGeminiModel,
+        aiTimeoutMs: canonicalGeminiTimeout,
+        assessmentProvider: ASSESSMENT_PROVIDER ?? (NODE_ENV === 'test' ? 'fake' : 'gemini'),
+        assessmentOpenAiApiKey: canonicalGeminiKey,
+        assessmentOpenAiModel: canonicalGeminiModel,
+        assessmentTimeoutMs: canonicalGeminiTimeout,
+        trustedProxyIps: TRUSTED_PROXY_IPS
+          ? TRUSTED_PROXY_IPS.split(',')
+              .map((ip) => ip.trim())
+              .filter(Boolean)
+          : undefined,
+        resumeStorageRoot: path.isAbsolute(RESUME_STORAGE_ROOT)
+          ? path.normalize(RESUME_STORAGE_ROOT)
+          : path.resolve(repositoryRoot(), RESUME_STORAGE_ROOT),
+        smtpHost: SMTP_HOST,
+        smtpPort: SMTP_PORT,
+        smtpUser: SMTP_USER,
+        smtpPass: SMTP_PASS,
+        emailFrom: EMAIL_FROM,
+        emailOutboxEncryptionKey: EMAIL_OUTBOX_ENCRYPTION_KEY,
+        emailOutboxIdempotencySecret: EMAIL_OUTBOX_IDEMPOTENCY_SECRET,
+        approvedPolicies: parseApprovedPolicies(CONSENT_APPROVED_POLICIES),
+        approvedPolicyVersions: CONSENT_APPROVED_POLICY_VERSIONS
+          ? CONSENT_APPROVED_POLICY_VERSIONS.split(',')
+              .map((v) => v.trim())
+              .filter(Boolean)
+          : [],
+      };
+    },
   );
 
 export type Environment = z.infer<typeof environmentSchema>;

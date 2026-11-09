@@ -5,6 +5,7 @@ import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
 import type { SessionService } from '../auth/session.service.js';
 import {
+  BatchNotFoundError,
   ExtractionNotFoundError,
   RequisitionNotFoundError,
   ResumeNotFoundError,
@@ -132,6 +133,16 @@ function createTestApp(
         fileName: 'resume.pdf',
       };
     }),
+    finalizeBatch: vi.fn(async (_p, _r, batchId) => ({
+      id: batchId,
+      status: 'COMPLETED' as const,
+      isOpen: false,
+    })),
+    getBatchStatus: vi.fn(async (_p, _r, batchId) => ({
+      id: batchId,
+      status: 'PROCESSING' as const,
+      isOpen: true,
+    })),
   };
 
   return {
@@ -297,5 +308,128 @@ describe('Resume Ingestion Routes', () => {
     expect(res.headers['content-disposition']).toContain('inline; filename="resume.pdf"');
     expect(res.headers['content-disposition']).toContain("filename*=UTF-8''resume.pdf");
     expect(res.body.toString('latin1')).toContain('%PDF-1.4 file');
+  });
+
+  it('accepts ?isFinal=true and finalizes batch after upload', async () => {
+    const { app, service } = createTestApp();
+    const csrfToken = deriveCsrfToken(rawToken);
+
+    const res = await request(app)
+      .post(`/api/v1/requisitions/${requisitionId}/resumes?isFinal=true`)
+      .set('Cookie', `talentlens_session=${rawToken}`)
+      .set('Origin', 'http://localhost:5173')
+      .set('x-csrf-token', csrfToken)
+      .attach('files', Buffer.from('%PDF-1.4 test'), 'resume.pdf');
+
+    expect(res.status).toBe(201);
+    expect(service.uploadResumes).toHaveBeenCalled();
+    expect(service.finalizeBatch).toHaveBeenCalledWith(
+      recruiterPrincipal,
+      requisitionId,
+      'batch-1',
+    );
+  });
+
+  it('finalizes a batch via POST /batches/:batchId/finalize', async () => {
+    const { app, service } = createTestApp();
+    const csrfToken = deriveCsrfToken(rawToken);
+    const batchId = '323e4567-e89b-42d3-a456-426614174000';
+
+    const res = await request(app)
+      .post(`/api/v1/requisitions/${requisitionId}/resumes/batches/${batchId}/finalize`)
+      .set('Cookie', `talentlens_session=${rawToken}`)
+      .set('Origin', 'http://localhost:5173')
+      .set('x-csrf-token', csrfToken);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(batchId);
+    expect(res.body.isOpen).toBe(false);
+    expect(service.finalizeBatch).toHaveBeenCalledWith(recruiterPrincipal, requisitionId, batchId);
+  });
+
+  it('rejects malformed batchId on finalize endpoint', async () => {
+    const { app, service } = createTestApp();
+    const csrfToken = deriveCsrfToken(rawToken);
+
+    const res = await request(app)
+      .post(`/api/v1/requisitions/${requisitionId}/resumes/batches/not-a-uuid/finalize`)
+      .set('Cookie', `talentlens_session=${rawToken}`)
+      .set('Origin', 'http://localhost:5173')
+      .set('x-csrf-token', csrfToken);
+
+    expect(res.status).toBe(400);
+    expect(service.finalizeBatch).not.toHaveBeenCalled();
+  });
+
+  it('finalizes an existing batch on ?batchId=...&isFinal=true even when acceptedCount is 0', async () => {
+    const existingBatchId = '423e4567-e89b-42d3-a456-426614174000';
+    const { app, service } = createTestApp();
+    vi.mocked(service.uploadResumes).mockResolvedValueOnce({
+      batchId: existingBatchId,
+      totalFiles: 1,
+      acceptedCount: 0,
+      duplicateCount: 1,
+      rejectedCount: 0,
+      accepted: [],
+      duplicates: [
+        {
+          fileName: 'dup.pdf',
+          sha256: 'hash-dup',
+          resumeDocumentId: 'doc-dup',
+          status: 'DUPLICATE',
+          message: 'Already exists',
+        },
+      ],
+      rejected: [],
+    });
+    const csrfToken = deriveCsrfToken(rawToken);
+
+    const res = await request(app)
+      .post(`/api/v1/requisitions/${requisitionId}/resumes?batchId=${existingBatchId}&isFinal=true`)
+      .set('Cookie', `talentlens_session=${rawToken}`)
+      .set('Origin', 'http://localhost:5173')
+      .set('x-csrf-token', csrfToken)
+      .attach('files', Buffer.from('%PDF-1.4 test'), 'dup.pdf');
+
+    expect(res.status).toBe(200);
+    expect(res.body.batchId).toBe(existingBatchId);
+    expect(service.finalizeBatch).toHaveBeenCalledWith(
+      recruiterPrincipal,
+      requisitionId,
+      existingBatchId,
+    );
+  });
+
+  it('retrieves batch status via GET /batches/:batchId', async () => {
+    const { app, service } = createTestApp();
+    const batchId = '523e4567-e89b-42d3-a456-426614174000';
+
+    const res = await request(app)
+      .get(`/api/v1/requisitions/${requisitionId}/resumes/batches/${batchId}`)
+      .set('Cookie', `talentlens_session=${rawToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      id: batchId,
+      status: 'PROCESSING',
+      isOpen: true,
+    });
+    expect(service.getBatchStatus).toHaveBeenCalledWith(recruiterPrincipal, requisitionId, batchId);
+  });
+
+  it('returns 404 when batch status is not found and 400 on malformed batchId', async () => {
+    const { app, service } = createTestApp();
+    vi.mocked(service.getBatchStatus).mockRejectedValueOnce(new BatchNotFoundError());
+    const batchId = '623e4567-e89b-42d3-a456-426614174000';
+
+    const notFoundRes = await request(app)
+      .get(`/api/v1/requisitions/${requisitionId}/resumes/batches/${batchId}`)
+      .set('Cookie', `talentlens_session=${rawToken}`);
+    expect(notFoundRes.status).toBe(404);
+
+    const badRes = await request(app)
+      .get(`/api/v1/requisitions/${requisitionId}/resumes/batches/not-a-uuid`)
+      .set('Cookie', `talentlens_session=${rawToken}`);
+    expect(badRes.status).toBe(400);
   });
 });

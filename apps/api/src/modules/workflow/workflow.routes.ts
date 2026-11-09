@@ -12,8 +12,11 @@ import type { AuthorizationService } from '../authorization/authorization.servic
 import {
   candidateTimelineQuerySchema,
   createClientSchema,
+  inviteClientMemberSchema,
   listCandidatesQuerySchema,
   listClientsQuerySchema,
+  listGlobalCandidatesQuerySchema,
+  listInterviewsQuerySchema,
   proposeAlternativeInterviewSchema,
   proposeInterviewSchema,
   recordReviewSchema,
@@ -26,6 +29,7 @@ import {
 import {
   WorkflowCandidateNotFoundError,
   WorkflowClientConflictError,
+  WorkflowClientMemberConflictError,
   WorkflowClientNotFoundError,
   WorkflowClientUnauthorizedError,
   WorkflowConsentMissingClientSharingError,
@@ -68,6 +72,8 @@ function handleWorkflowError(error: unknown, response: Response): void {
     response.status(404).json({ error: 'not_found', message: error.message });
   } else if (error instanceof WorkflowClientConflictError) {
     response.status(409).json({ error: 'conflict', message: error.message });
+  } else if (error instanceof WorkflowClientMemberConflictError) {
+    response.status(409).json({ error: 'conflict', code: error.code, message: error.message });
   } else if (
     error instanceof WorkflowRequisitionAccessDeniedError ||
     error instanceof WorkflowClientUnauthorizedError
@@ -196,9 +202,159 @@ export function createWorkflowRouter(dependencies: WorkflowRouterDependencies): 
     },
   );
 
+  // 0d. Get single client details (Recruiter or authorized Client Hiring Manager)
+  router.get(
+    '/clients/:clientId',
+    requireSession,
+    requireRecruiterOrClientHiringManager,
+    async (request, response) => {
+      const clientId = parseUuid(request.params['clientId']);
+      if (!clientId) {
+        response.status(400).json({ error: 'invalid_request', message: 'Invalid client ID' });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const client = await dependencies.service.getClient(principal, clientId);
+        response.status(200).json({ client });
+      } catch (error) {
+        handleWorkflowError(error, response);
+      }
+    },
+  );
+
+  // 0e. List client members (Recruiter only)
+  router.get(
+    '/clients/:clientId/members',
+    requireSession,
+    requireRecruiter,
+    async (request, response) => {
+      const clientId = parseUuid(request.params['clientId']);
+      if (!clientId) {
+        response.status(400).json({ error: 'invalid_request', message: 'Invalid client ID' });
+        return;
+      }
+
+      try {
+        const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+        const members = await dependencies.service.listClientMembers(principal, clientId);
+        response.status(200).json({ members });
+      } catch (error) {
+        handleWorkflowError(error, response);
+      }
+    },
+  );
+
+  // 0f. Invite a client hiring manager (Recruiter only)
+  const handleInviteMember = async (request: express.Request, response: express.Response) => {
+    const clientId = parseUuid(request.params['clientId']);
+    if (!clientId) {
+      response.status(400).json({ error: 'invalid_request', message: 'Invalid client ID' });
+      return;
+    }
+
+    const bodyParsed = inviteClientMemberSchema.safeParse(request.body);
+    if (!bodyParsed.success) {
+      response.status(400).json({ error: 'invalid_request', details: bodyParsed.error.issues });
+      return;
+    }
+
+    try {
+      const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+      const member = await dependencies.service.inviteClientMember(
+        principal,
+        clientId,
+        bodyParsed.data,
+      );
+      response.status(201).json({ member });
+    } catch (error) {
+      handleWorkflowError(error, response);
+    }
+  };
+
+  router.post(
+    '/clients/:clientId/members',
+    requireSession,
+    requireRecruiter,
+    sameOrigin,
+    requireCsrf,
+    handleInviteMember,
+  );
+
+  router.post(
+    '/clients/:clientId/members/invite',
+    requireSession,
+    requireRecruiter,
+    sameOrigin,
+    requireCsrf,
+    handleInviteMember,
+  );
+
   // ==========================================
   // RECRUITER ROUTES
   // ==========================================
+
+  // 0. Global candidate directory (organization-scoped)
+  router.get('/candidates', requireSession, requireRecruiter, async (request, response) => {
+    const queryParsed = listGlobalCandidatesQuerySchema.safeParse(request.query);
+    if (!queryParsed.success) {
+      response.status(400).json({ error: 'invalid_request', details: queryParsed.error.issues });
+      return;
+    }
+
+    try {
+      const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+      const result = await dependencies.service.listGlobalCandidates(principal, queryParsed.data);
+      response.status(200).json(result);
+    } catch (error) {
+      handleWorkflowError(error, response);
+    }
+  });
+
+  // 0b. List interviews across requisitions (role-aware: RECRUITER or CLIENT_HIRING_MANAGER)
+  router.get('/interviews', requireSession, async (request, response) => {
+    const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+    if (principal.role !== 'RECRUITER' && principal.role !== 'CLIENT_HIRING_MANAGER') {
+      response.status(403).json({
+        error: 'forbidden',
+        message: 'Only recruiters and client hiring managers may view interviews.',
+      });
+      return;
+    }
+
+    const queryParsed = listInterviewsQuerySchema.safeParse(request.query);
+    if (!queryParsed.success) {
+      response.status(400).json({ error: 'invalid_request', details: queryParsed.error.issues });
+      return;
+    }
+
+    try {
+      const result = await dependencies.service.listInterviews(principal, queryParsed.data);
+      response.status(200).json(result);
+    } catch (error) {
+      handleWorkflowError(error, response);
+    }
+  });
+
+  // 0c. Aggregated dashboard summary (role-aware: RECRUITER or CLIENT_HIRING_MANAGER)
+  router.get('/dashboard/summary', requireSession, async (_request, response) => {
+    const principal = response.locals['authPrincipal'] as AuthenticatedPrincipal;
+    if (principal.role !== 'RECRUITER' && principal.role !== 'CLIENT_HIRING_MANAGER') {
+      response.status(403).json({
+        error: 'forbidden',
+        message: 'Only recruiters and client hiring managers may view the dashboard summary.',
+      });
+      return;
+    }
+
+    try {
+      const result = await dependencies.service.getDashboardSummary(principal);
+      response.status(200).json(result);
+    } catch (error) {
+      handleWorkflowError(error, response);
+    }
+  });
 
   // 1. List candidates for review under a requisition
   router.get(

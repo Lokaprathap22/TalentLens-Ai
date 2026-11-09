@@ -4,6 +4,7 @@ import { randomUUID, createHmac, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import type { DocumentStorageService, StoredFileDescriptor } from './resume.types.js';
+export type { DocumentStorageService, StoredFileDescriptor };
 
 export class StoragePathTraversalError extends Error {
   constructor(message = 'Invalid storage path: traversal detected') {
@@ -176,7 +177,7 @@ export class S3DocumentStorageService implements DocumentStorageService {
     }
 
     this.bucket = config.bucket.trim();
-    this.region = config.region ?? 'us-east-1';
+    this.region = config.region ?? 'ap-hyderabad-1';
     const customEndpoint = config.endpoint ? config.endpoint.replace(/\/+$/, '') : undefined;
     this.endpoint = customEndpoint ?? `https://s3.${this.region}.amazonaws.com`;
     this.accessKeyId = config.accessKeyId;
@@ -375,7 +376,7 @@ export function createDocumentStorageService(storageRoot?: string): DocumentStor
     const accessKeyId = process.env['S3_ACCESS_KEY_ID'] || process.env['AWS_ACCESS_KEY_ID'];
     const secretAccessKey =
       process.env['S3_SECRET_ACCESS_KEY'] || process.env['AWS_SECRET_ACCESS_KEY'];
-    const region = process.env['S3_REGION'] || process.env['AWS_REGION'] || 'us-east-1';
+    const region = process.env['S3_REGION'] || process.env['AWS_REGION'] || 'ap-hyderabad-1';
     const endpoint = process.env['S3_ENDPOINT'];
     const forcePathStyle = process.env['S3_FORCE_PATH_STYLE'] === 'true';
 
@@ -393,6 +394,12 @@ export function createDocumentStorageService(storageRoot?: string): DocumentStor
       secretAccessKey,
       forcePathStyle,
     });
+  }
+
+  if (nodeEnv === 'production') {
+    throw new Error(
+      'Production and staging deployments require STORAGE_DRIVER=s3 with shared private S3 object storage. Local filesystem storage is not permitted in production.',
+    );
   }
 
   if (isProductionOrStaging && process.env['ALLOW_LOCAL_STORAGE_IN_PRODUCTION'] !== 'true') {

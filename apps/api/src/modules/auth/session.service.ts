@@ -84,6 +84,7 @@ export function createSessionService(dependencies: SessionServiceDependencies = 
         organizationName: session.user.organization.name,
         email: session.user.email,
         role: session.user.role,
+        name: session.user.name ?? null,
       };
     },
 
@@ -93,6 +94,18 @@ export function createSessionService(dependencies: SessionServiceDependencies = 
       }
 
       await repository.revokeByTokenHash(hashToken(rawToken), new Date(now()));
+    },
+
+    async revokeUserSessions(userId: string): Promise<void> {
+      await repository.revokeAllForUser(userId, new Date(now()));
+    },
+
+    async revokeOtherUserSessions(userId: string, rawCurrentToken: string): Promise<void> {
+      if (!isSessionToken(rawCurrentToken)) {
+        await repository.revokeAllForUser(userId, new Date(now()));
+        return;
+      }
+      await repository.revokeOthersForUser(userId, hashToken(rawCurrentToken), new Date(now()));
     },
   };
 }
