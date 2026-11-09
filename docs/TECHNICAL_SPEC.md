@@ -1,6 +1,6 @@
 # TalentLens AI — Product & Technical Specification
 
-- **Document status:** Phase 1 baseline — ready for implementation planning
+- **Document status:** Historical Phase 1 baseline specification (November 2026) — superseded for current architecture, schema, and deployment truth by [TECHNICAL_DESIGN_DOCUMENT.md](./TECHNICAL_DESIGN_DOCUMENT.md), [deployment.md](../deployment.md), and [OPERATOR_RUNBOOK.md](./OPERATOR_RUNBOOK.md) (verified **November 10, 2026**).
 - **Product:** TalentLens AI
 - **Selected client brief:** Problem 5 — Staffing firm's AI resume screening tool and client shortlist portal
 - **Target delivery window:** 7 days (candidate assessment task)

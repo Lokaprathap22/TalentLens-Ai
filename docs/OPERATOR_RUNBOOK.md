@@ -1,6 +1,12 @@
 # TalentLens AI — Production Operations & Deployment Runbook
 
-This document is the operational guide for deploying, provisioning, and maintaining the TalentLens AI recruitment SaaS platform in production and staging environments.
+- **Last verified:** November 10, 2026
+- **Related documentation:**
+  - [README.md](../README.md) — project overview, journeys, and quick start
+  - [deployment.md](../deployment.md) — reproducible local setup, OCI staging/production release runbook, and backup/restore syntax
+  - [TECHNICAL_DESIGN_DOCUMENT.md](./TECHNICAL_DESIGN_DOCUMENT.md) — full architecture, data model, security, and processing design
+
+This document is the operational guide for provisioning, securing, and maintaining the TalentLens AI recruitment platform in staging and production environments.
 
 ---
 
@@ -10,26 +16,28 @@ TalentLens AI enforces strict multi-tenancy and does not allow unauthenticated p
 
 ### Secure CLI Bootstrap Procedure
 
-To provision the first tenant organization and the initial active recruiter account:
+To provision the first tenant organization and the initial invited recruiter account (`status: INVITED`, `passwordHash: null`):
 
 **In Production (Docker Environment):**
 
 ```bash
-docker compose -f docker-compose.prod.yml exec api node apps/api/dist/scripts/bootstrap.js "Enterprise Client Name" "recruiter.admin@client.com"
+docker compose -p talentlens --env-file .env -f docker-compose.prod.yml exec api \
+  node apps/api/dist/scripts/bootstrap.js "Enterprise Client Name" "recruiter.admin@client.com" --print-activation-link
 ```
 
 **In Local Development:**
 
 ```bash
-npm run bootstrap --workspace @talentlens/api -- "Enterprise Client Name" "recruiter.admin@client.com"
+npm run bootstrap --workspace @talentlens/api -- "Enterprise Client Name" "recruiter.admin@client.com" --print-activation-link
 ```
 
 ### Operational Characteristics:
 
-- **Random Entropy**: Generates an 18-byte URL-safe base64 string (~144 bits of cryptographic entropy) for one-time initial login.
-- **Argon2id Hashing**: Hashes password using argon2id (`memoryCost: 19456`, `timeCost: 2`, `parallelism: 1`, `hashLength: 32`).
-- **Normalized Multi-Tenant Collision Check**: Normalizes organization name (`normalized_name`) and email (`normalized_email`), preventing duplicate collision.
-- **Mandatory First-Login Rotation**: The operator must record the generated password and deliver it via an encrypted channel (e.g. 1Password/Bitwarden). The recruiter must change their password upon first sign-in.
+- **One-Time Activation Link (No Temporary Passwords)**: Generates a 32-byte (`randomBytes(32)`) URL-safe base64url activation token, stores only its SHA-256 hex digest in `user_security_tokens` (`type = ACTIVATION`, 48-hour TTL), and leaves `passwordHash` as `NULL` until activation.
+- **Concealed Output by Default**: The script conceals the bearer activation URL (`<APP_ORIGIN>/activate#token=<token>`) unless `--print-activation-link` (or `--print-token`) is explicitly passed.
+- **Argon2id Password Setup**: On `/activate`, the recruiter sets their own password, which is hashed with Argon2id (`memoryCost: 19456`, `timeCost: 2`, `parallelism: 1`, `hashLength: 32`), activates the user (`status: ACTIVE`), and establishes an authenticated session.
+- **Normalized Multi-Tenant Collision Check**: Normalizes organization name (`normalized_name`) before creation and rejects duplicate organization names cleanly.
+- **Secure Delivery**: When printing the offline activation link, transmit it only over an encrypted channel and never paste it into shared logs or chat history.
 
 ---
 
@@ -145,7 +153,7 @@ Transactional emails (recruiter consent invitations, withdrawal confirmations, c
 To defend against malicious documents, zip bombs, and weaponized macros:
 
 1. **Daemon Deployment**:
-   - Run ClamAV daemon (`clamav/clamav:latest`) listening on port 3310.
+   - Run the pinned ClamAV daemon image (`clamav/clamav:1.4` in `docker-compose.prod.yml`) listening internally on port `3310`.
    - Ensure virus signatures are automatically updated via `freshclam`.
 2. **Streaming Protocol**:
    - Resumes are streamed to `clamd` using the chunked `zINSTREAM\0` TCP protocol (up to 64KB per chunk).
@@ -177,7 +185,7 @@ All candidate resume PDFs and DOCX files must reside in a private S3 bucket.
    - Path traversal validation rejects any key containing `..`, null bytes, or leading slashes.
 4. **No Direct Public URLs**:
    - The application does not issue public object URLs or long-lived presigned URLs.
-   - Resume downloads occur strictly through authenticated recruiter routes (`GET /api/resumes/:id/original`) with role verification and audit logging.
+   - Resume downloads occur strictly through authenticated recruiter routes (`GET /api/v1/requisitions/:requisitionId/resumes/:resumeId/file`) with tenant/role verification and audit logging.
 
 ---
 
@@ -211,12 +219,10 @@ Database schema changes must NEVER run automatically on every API or Worker repl
 ## 8. Backup and Disaster Recovery Expectations
 
 1. **PostgreSQL Database Storage & External Destination**:
-   - **Local Stage**: Encrypted `.sql.gz` backups generated by `scripts/backup.sh` in `./backups/` with strict file permissions (`chmod 0600`).
-   - **Repository Protection**: `./backups/` and all `*.sql`/`*.sql.gz` files are strictly excluded from Git tracking via `.gitignore` and from Docker container build context via `.dockerignore`. Database dumps must NEVER be committed to source control or baked into image layers.
-   - **Documented External Backup Location**: Automated off-host replication pushes encrypted dumps to a dedicated private OCI Object Storage bucket:
-     `https://<tenancy-namespace>.compat.objectstorage.ap-hyderabad-1.oci.customer-oci.com/talentlens-backups/database/`
-     (Retention policy: 90-day retention lock, cross-region replication).
-   - Test restoration procedure quarterly into an isolated test instance using `scripts/restore.sh`.
+   - **Local Stage**: Compressed `.sql.gz` (or `--format custom` `.dump`) PostgreSQL archives generated by `scripts/backup.sh` / `scripts/backup.ps1` (Bash default output directory: `/var/backups/talentlens`; PowerShell default: `backups`) with SHA-256 verification sidecars (`.sha256`) and restrictive host permissions (`chmod 700` directory / `chmod 600` files on POSIX; restricted `icacls` ACLs on Windows). These dump files are compressed SQL/binary archives rather than natively encrypted by `backup.sh`; encrypt dumps out-of-band (for example with KMS-backed SSE or client-side age/GPG encryption) before off-host replication.
+   - **Repository Protection**: `./backups/` and all `*.sql`, `*.sql.gz`, `*.sql.gz.sha256`, `*.dump`, and `*.dump.sha256` files are excluded from Git tracking via `.gitignore` and from Docker build contexts via `.dockerignore`. Database dumps must NEVER be committed to source control or baked into image layers.
+   - **Recommended External Backup Target**: Replicate checksum-verified dumps off-host to a private OCI Object Storage bucket (for example with 90-day retention rules, server-side encryption, and cross-region replication) outside the VM filesystem.
+   - Test restoration regularly into an isolated target database using `scripts/restore.sh --create-target` (or `scripts/restore.ps1 -CreateTarget`). See [deployment.md](../deployment.md) Section F for exact flags.
 2. **S3 Object Bucket**:
    - Enable S3 Object Versioning to protect against accidental object deletion.
    - Configure lifecycle rules to transition older objects to S3 Glacier Flexible Retrieval if retention policies require long-term archival.
