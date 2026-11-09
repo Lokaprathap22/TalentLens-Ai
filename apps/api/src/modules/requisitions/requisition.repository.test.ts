@@ -116,4 +116,153 @@ describe('requisition repository', () => {
       }),
     );
   });
+
+  describe('transitionStatus', () => {
+    function makeRecord(status: 'DRAFT' | 'OPEN' | 'PAUSED' | 'CLOSED' | 'FILLED') {
+      return {
+        id: 'requisition-a',
+        organizationId: 'organization-a',
+        clientId: 'client-a',
+        title: 'Role',
+        jdText: 'Description',
+        status,
+        createdById: 'recruiter-a',
+        assignedRecruiterId: 'recruiter-a',
+        createdAt: new Date('2026-11-05T00:00:00.000Z'),
+        updatedAt: new Date('2026-11-05T00:00:00.000Z'),
+        client: { id: 'client-a', name: 'Client A' },
+      };
+    }
+
+    it('enforces row lock, approved scorecard check, conditional update, and audit write for DRAFT -> OPEN', async () => {
+      const $queryRaw = vi.fn(async () => []);
+      const requisition = {
+        findFirst: vi
+          .fn()
+          .mockResolvedValueOnce(makeRecord('DRAFT'))
+          .mockResolvedValueOnce(makeRecord('OPEN')),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+      };
+      const scorecardVersion = {
+        findFirst: vi.fn(async () => ({ id: 'scorecard-approved-1' })),
+      };
+      const auditLog = {
+        create: vi.fn(async () => undefined),
+      };
+      const tx = {
+        $queryRaw,
+        requisition,
+        scorecardVersion,
+        auditLog,
+      };
+      const database = {
+        $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
+      } as unknown as Parameters<typeof createRequisitionRepository>[0];
+
+      const repository = createRequisitionRepository(database);
+      const result = await repository.transitionStatus(principal, 'requisition-a', 'OPEN');
+
+      expect(result.status).toBe('ok');
+      expect($queryRaw).toHaveBeenCalled();
+      expect(scorecardVersion.findFirst).toHaveBeenCalledWith({
+        where: {
+          requisitionId: 'requisition-a',
+          organizationId: 'organization-a',
+          status: 'APPROVED',
+        },
+        select: { id: true },
+      });
+      expect(requisition.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'requisition-a',
+          organizationId: 'organization-a',
+          assignedRecruiterId: 'recruiter-a',
+          status: 'DRAFT',
+        },
+        data: { status: 'OPEN' },
+      });
+      expect(auditLog.create).toHaveBeenCalledWith({
+        data: {
+          organizationId: 'organization-a',
+          actorId: 'recruiter-a',
+          action: 'REQUISITION_STATUS_TRANSITIONED',
+          resourceType: 'Requisition',
+          resourceId: 'requisition-a',
+          requisitionId: 'requisition-a',
+          clientId: 'client-a',
+          metadataJson: {
+            fromStatus: 'DRAFT',
+            toStatus: 'OPEN',
+          },
+        },
+      });
+    });
+
+    it('rejects DRAFT -> OPEN when no approved scorecard exists and does not mutate or audit', async () => {
+      const requisition = {
+        findFirst: vi.fn().mockResolvedValueOnce(makeRecord('DRAFT')),
+        updateMany: vi.fn(),
+      };
+      const scorecardVersion = {
+        findFirst: vi.fn(async () => null),
+      };
+      const auditLog = {
+        create: vi.fn(),
+      };
+      const tx = {
+        $queryRaw: vi.fn(async () => []),
+        requisition,
+        scorecardVersion,
+        auditLog,
+      };
+      const database = {
+        $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
+      } as unknown as Parameters<typeof createRequisitionRepository>[0];
+
+      const repository = createRequisitionRepository(database);
+      const result = await repository.transitionStatus(principal, 'requisition-a', 'OPEN');
+
+      expect(result).toEqual({ status: 'scorecard_not_approved' });
+      expect(requisition.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid transitions and stale concurrent state without writing audit logs', async () => {
+      const requisition = {
+        findFirst: vi
+          .fn()
+          .mockResolvedValueOnce(makeRecord('CLOSED'))
+          .mockResolvedValueOnce(makeRecord('OPEN')),
+        updateMany: vi.fn(async () => ({ count: 0 })), // simulates concurrent state change
+      };
+      const auditLog = {
+        create: vi.fn(),
+      };
+      const tx = {
+        $queryRaw: vi.fn(async () => []),
+        requisition,
+        auditLog,
+      };
+      const database = {
+        $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
+      } as unknown as Parameters<typeof createRequisitionRepository>[0];
+
+      const repository = createRequisitionRepository(database);
+
+      // Prohibited transition from CLOSED
+      const closedResult = await repository.transitionStatus(principal, 'requisition-a', 'OPEN');
+      expect(closedResult).toEqual({
+        status: 'invalid_transition',
+        currentStatus: 'CLOSED',
+      });
+
+      // Stale concurrent updateMany (count: 0)
+      const staleResult = await repository.transitionStatus(principal, 'requisition-a', 'PAUSED');
+      expect(staleResult).toEqual({
+        status: 'invalid_transition',
+        currentStatus: 'OPEN',
+      });
+      expect(auditLog.create).not.toHaveBeenCalled();
+    });
+  });
 });

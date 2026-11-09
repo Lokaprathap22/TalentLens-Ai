@@ -1,10 +1,16 @@
 export interface ConsentInvitationEmailOptions {
   to: string;
   candidateName?: string;
+  candidateId?: string | undefined;
   organizationName: string;
   requisitionTitle: string;
   invitationUrl: string;
   expiresAt: Date;
+  tx?: unknown;
+  organizationId?: string;
+  skipImmediateDispatch?: boolean;
+  idempotencyKey?: string | undefined;
+  outboxRecordId?: string | undefined;
 }
 
 export interface WithdrawalVerificationEmailOptions {
@@ -12,6 +18,25 @@ export interface WithdrawalVerificationEmailOptions {
   organizationName: string;
   withdrawalUrl: string;
   expiresAt: Date;
+  tx?: unknown;
+  organizationId?: string;
+  candidateId?: string;
+  skipImmediateDispatch?: boolean;
+  idempotencyKey?: string | undefined;
+  outboxRecordId?: string | undefined;
+}
+
+export interface DeletionVerificationEmailOptions {
+  to: string;
+  organizationName: string;
+  deletionUrl: string;
+  expiresAt: Date;
+  tx?: unknown;
+  organizationId?: string;
+  candidateId?: string;
+  skipImmediateDispatch?: boolean;
+  idempotencyKey?: string | undefined;
+  outboxRecordId?: string | undefined;
 }
 
 export interface DeliveryResult {
@@ -22,6 +47,7 @@ export interface DeliveryResult {
 export interface EmailDeliveryService {
   sendConsentInvitation(options: ConsentInvitationEmailOptions): Promise<DeliveryResult>;
   sendWithdrawalVerification(options: WithdrawalVerificationEmailOptions): Promise<DeliveryResult>;
+  sendDeletionVerification(options: DeletionVerificationEmailOptions): Promise<DeliveryResult>;
 }
 
 export interface EmailConfig {
@@ -80,6 +106,22 @@ export class DefaultEmailDeliveryService implements EmailDeliveryService {
     };
   }
 
+  public async sendDeletionVerification(
+    _options: DeletionVerificationEmailOptions,
+  ): Promise<DeliveryResult> {
+    if (!this.isConfigured()) {
+      return {
+        delivered: false,
+        error:
+          'EMAIL_DELIVERY_NOT_CONFIGURED: Configure SMTP_HOST/SMTP_USER or an external transport to enable candidate delivery.',
+      };
+    }
+
+    return {
+      delivered: true,
+    };
+  }
+
   private isConfigured(): boolean {
     return Boolean(this.config.smtpHost && this.config.smtpHost.trim().length > 0);
   }
@@ -91,6 +133,7 @@ export class DefaultEmailDeliveryService implements EmailDeliveryService {
 export class InMemoryEmailDeliveryService implements EmailDeliveryService {
   public sentInvitations: ConsentInvitationEmailOptions[] = [];
   public sentWithdrawals: WithdrawalVerificationEmailOptions[] = [];
+  public sentDeletions: DeletionVerificationEmailOptions[] = [];
   public shouldFail = false;
   public failureMessage = 'Simulated SMTP connection error';
 
@@ -114,9 +157,20 @@ export class InMemoryEmailDeliveryService implements EmailDeliveryService {
     return { delivered: true };
   }
 
+  public async sendDeletionVerification(
+    options: DeletionVerificationEmailOptions,
+  ): Promise<DeliveryResult> {
+    if (this.shouldFail) {
+      return { delivered: false, error: this.failureMessage };
+    }
+    this.sentDeletions.push(options);
+    return { delivered: true };
+  }
+
   public clear(): void {
     this.sentInvitations = [];
     this.sentWithdrawals = [];
+    this.sentDeletions = [];
     this.shouldFail = false;
   }
 }

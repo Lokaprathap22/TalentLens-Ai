@@ -1859,4 +1859,642 @@ describe.skipIf(!RUN_INTEGRATION)('resume repository — PostgreSQL 17 integrati
       expect(retrySeq?.batchId).toBe(resA!.batchId);
     });
   });
+
+  describe('Test 9: Bulk Upload Accounting, Same-Name Correlation & Intake Finalization', () => {
+    let fixture: TestFixture;
+
+    beforeAll(async () => {
+      fixture = await createTestFixture(pgClient);
+    });
+
+    afterAll(async () => {
+      if (fixture) {
+        await fixture.cleanup(pgClient);
+      }
+    });
+
+    it('counts unique ResumeDocument bytes once even with multiple downstream stage jobs per document', async () => {
+      const sha1 = `sha-accounting-1-${randomUUID()}`;
+      const sha2 = `sha-accounting-2-${randomUUID()}`;
+
+      // Chunk 1: 2 files (50,000 + 70,000 = 120,000 bytes)
+      const batch1 = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'slot-1',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'resume.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 50_000,
+            sha256: sha1,
+          },
+          {
+            clientFileId: 'slot-2',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'resume.pdf', // Same filename, different content
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 70_000,
+            sha256: sha2,
+          },
+        ],
+        { totalUploaded: 2, duplicates: 0, rejected: 0 },
+      );
+
+      expect(batch1.accepted).toHaveLength(2);
+      expect(batch1.accepted[0]?.clientFileId).toBe('slot-1');
+      expect(batch1.accepted[1]?.clientFileId).toBe('slot-2');
+
+      // Add multiple downstream processing jobs for each resumeDocument to simulate pipeline stages
+      for (const acc of batch1.accepted) {
+        await pgClient.processingJob.createMany({
+          data: [
+            {
+              batchId: batch1.batchId,
+              organizationId: fixture.organizationId,
+              resumeDocumentId: acc.resumeDocumentId,
+              jobType: 'EXTRACT_PROFILE',
+              status: 'SUCCEEDED',
+              attempts: 1,
+            },
+            {
+              batchId: batch1.batchId,
+              organizationId: fixture.organizationId,
+              resumeDocumentId: acc.resumeDocumentId,
+              jobType: 'ASSESS_CANDIDATE',
+              status: 'SUCCEEDED',
+              attempts: 1,
+            },
+          ],
+        });
+      }
+
+      // Now append Chunk 2 (30,000 bytes) to the same batch
+      const sha3 = `sha-accounting-3-${randomUUID()}`;
+      const batch2 = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'slot-3',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'resume3.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 30_000,
+            sha256: sha3,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+        batch1.batchId,
+      );
+
+      expect(batch2.batchId).toBe(batch1.batchId);
+
+      // Verify batch accounting reflects exact unique document bytes (50,000 + 70,000 + 30,000 = 150,000)
+      const batchRecord = await pgClient.processingBatch.findUnique({
+        where: { id: batch1.batchId },
+      });
+      expect(batchRecord?.totalFiles).toBe(3);
+      expect(Number(batchRecord?.cumulativeBytes)).toBe(150_000);
+      expect(batchRecord?.isOpen).toBe(true);
+    });
+
+    it('keeps batch OPEN until finalized and rejects late appends after finalizeBatch', async () => {
+      const shaA = `sha-open-1-${randomUUID()}`;
+      const shaB = `sha-open-2-${randomUUID()}`;
+
+      const created = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'c-1',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'c1.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1000,
+            sha256: shaA,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      // Mark jobs in batch as SUCCEEDED while batch is still OPEN
+      await pgClient.processingJob.updateMany({
+        where: { batchId: created.batchId },
+        data: { status: 'SUCCEEDED', finishedAt: new Date() },
+      });
+
+      // Even if jobs finish, appending chunk 2 works while open
+      const appended = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'c-2',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'c2.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 2000,
+            sha256: shaB,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+        created.batchId,
+      );
+      expect(appended.batchId).toBe(created.batchId);
+
+      // Mark second job succeeded
+      await pgClient.processingJob.updateMany({
+        where: { batchId: created.batchId },
+        data: { status: 'SUCCEEDED', finishedAt: new Date() },
+      });
+
+      // Finalize batch
+      const finalized = await repository.finalizeBatch!(
+        fixture.principal,
+        fixture.requisitionId,
+        created.batchId,
+      );
+      expect(finalized.isOpen).toBe(false);
+      expect(finalized.status).toBe('COMPLETED');
+
+      // Attempting to append to finalized batch must reject (409)
+      const shaC = `sha-open-3-${randomUUID()}`;
+      await expect(
+        repository.createResumeBatch(
+          fixture.principal,
+          fixture.requisitionId,
+          [
+            {
+              clientFileId: 'c-3',
+              storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+              fileName: 'c3.pdf',
+              fileType: 'PDF',
+              mimeType: 'application/pdf',
+              sizeBytes: 1000,
+              sha256: shaC,
+            },
+          ],
+          { totalUploaded: 1, duplicates: 0, rejected: 0 },
+          created.batchId,
+        ),
+      ).rejects.toThrow(/closed or finalized/i);
+    });
+  });
+
+  describe('Test 10: Worker Lifecycle Fencing & Closed-Batch Accounting', () => {
+    let fixture: TestFixture;
+
+    beforeAll(async () => {
+      fixture = await createTestFixture(pgClient);
+    });
+
+    afterAll(async () => {
+      if (fixture) {
+        await fixture.cleanup(pgClient);
+      }
+    });
+
+    it('fails closed in completeProcessingJob when candidate becomes DELETION_PENDING mid-flight', async () => {
+      const sha = `sha-fencing-${randomUUID()}`;
+      const batch = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'fence-1',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'fence.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: sha,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candId = batch.accepted[0]!.candidateId;
+      const docId = batch.accepted[0]!.resumeDocumentId;
+
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId: candId,
+          requisitionId: fixture.requisitionId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: '2026-11-v1',
+          noticeTextHash: 'a'.repeat(64),
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedById: fixture.recruiterId,
+          capturedAt: new Date(),
+        },
+      });
+
+      await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candId,
+        fixture.recruiterId,
+        fixture.requisitionId,
+      );
+
+      const claimed = await repository.claimNextProcessingJob('worker-fence-test', 5);
+      expect(claimed).not.toBeNull();
+
+      // Simulate candidate erasure starting while worker is processing outside DB transaction
+      await pgClient.candidate.update({
+        where: { id: candId },
+        data: { recordStatus: 'DELETION_PENDING' },
+      });
+
+      const completionOk = await repository.completeProcessingJob(
+        claimed!.id,
+        docId,
+        fixture.organizationId,
+        {
+          extractedText: 'Late extraction result that must not persist',
+          pageMapJson: { pageCount: 1, pages: [{ pageNumber: 1, startOffset: 0, endOffset: 44 }] },
+          parser: 'talentlens-pdf-v1',
+          ocrUsed: false,
+          qualityStatus: 'COMPLETE',
+        },
+        claimed!.leaseToken ?? undefined,
+      );
+
+      expect(completionOk).toBe(false);
+
+      const extractions = await pgClient.documentExtraction.findMany({
+        where: { resumeDocumentId: docId },
+      });
+      expect(extractions).toHaveLength(0);
+
+      const failedJob = await pgClient.processingJob.findUnique({ where: { id: claimed!.id } });
+      expect(failedJob?.status).toBe('FAILED');
+      expect(failedJob?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+    });
+
+    it('marks closed batch COMPLETED only when isOpen=false and all jobs finish under lock', async () => {
+      const sha1 = `sha-closed-1-${randomUUID()}`;
+      const sha2 = `sha-closed-2-${randomUUID()}`;
+
+      const batch = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'b-1',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'b1.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: sha1,
+          },
+          {
+            clientFileId: 'b-2',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'b2.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: sha2,
+          },
+        ],
+        { totalUploaded: 2, duplicates: 0, rejected: 0 },
+      );
+
+      // Grant consent to both
+      for (const acc of batch.accepted) {
+        await pgClient.candidateConsent.create({
+          data: {
+            organizationId: fixture.organizationId,
+            candidateId: acc.candidateId,
+            requisitionId: fixture.requisitionId,
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            policyVersion: '2026-11-v1',
+            noticeTextHash: 'a'.repeat(64),
+            captureMethod: 'RECRUITER_RECORDED',
+            capturedById: fixture.recruiterId,
+            capturedAt: new Date(),
+          },
+        });
+        await repository.releaseHeldProcessingJobs(
+          fixture.organizationId,
+          acc.candidateId,
+          fixture.recruiterId,
+          fixture.requisitionId,
+        );
+      }
+
+      // Worker completes job 1 while batch is still OPEN -> batch must NOT be COMPLETED
+      const job1 = await repository.claimNextProcessingJob('worker-batch-1', 5);
+      expect(job1).not.toBeNull();
+      expect(job1?.batchId).toBe(batch.batchId);
+      const job1Ok = await repository.completeProcessingJob(
+        job1!.id,
+        job1!.resumeDocumentId!,
+        fixture.organizationId,
+        {
+          extractedText: 'Extracted text 1',
+          pageMapJson: { pageCount: 1, pages: [{ pageNumber: 1, startOffset: 0, endOffset: 16 }] },
+          parser: 'talentlens-pdf-v1',
+          ocrUsed: false,
+          qualityStatus: 'COMPLETE',
+        },
+        job1!.leaseToken ?? undefined,
+      );
+      expect(job1Ok).toBe(true);
+
+      // Finalize intake while job 2 is still QUEUED
+      const finalizedWhileRunning = await repository.finalizeBatch!(
+        fixture.principal,
+        fixture.requisitionId,
+        batch.batchId,
+      );
+      expect(finalizedWhileRunning.isOpen).toBe(false);
+      expect(finalizedWhileRunning.status).not.toBe('COMPLETED');
+
+      // Worker completes job 2 -> batch now sees is_open=false + remaining=0 -> COMPLETED
+      const job2 = await repository.claimNextProcessingJob('worker-batch-2', 5);
+      expect(job2).not.toBeNull();
+      const job2Ok = await repository.completeProcessingJob(
+        job2!.id,
+        job2!.resumeDocumentId!,
+        fixture.organizationId,
+        {
+          extractedText: 'Extracted text 2',
+          pageMapJson: { pageCount: 1, pages: [{ pageNumber: 1, startOffset: 0, endOffset: 16 }] },
+          parser: 'talentlens-pdf-v1',
+          ocrUsed: false,
+          qualityStatus: 'COMPLETE',
+        },
+        job2!.leaseToken ?? undefined,
+      );
+      expect(job2Ok).toBe(true);
+
+      const finalBatch = await pgClient.processingBatch.findUnique({
+        where: { id: batch.batchId },
+      });
+      expect(finalBatch?.isOpen).toBe(false);
+      expect(finalBatch?.status).toBe('COMPLETED');
+    });
+
+    it('serializes concurrent createResumeBatch append and finalizeBatch without losing jobs or prematurely completing', async () => {
+      const shaInitial = `sha-conc-1-${randomUUID()}`;
+      const shaConcurrent = `sha-conc-2-${randomUUID()}`;
+
+      const initialBatch = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'conc-1',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'conc1.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: shaInitial,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      // Mark first job SUCCEEDED so finalizeBatch sees remaining=0 unless append commits first
+      await pgClient.processingJob.updateMany({
+        where: { batchId: initialBatch.batchId },
+        data: { status: 'SUCCEEDED', finishedAt: new Date() },
+      });
+
+      const [appendOutcome, finalizeOutcome] = await Promise.allSettled([
+        repository.createResumeBatch(
+          fixture.principal,
+          fixture.requisitionId,
+          [
+            {
+              clientFileId: 'conc-2',
+              storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+              fileName: 'conc2.pdf',
+              fileType: 'PDF',
+              mimeType: 'application/pdf',
+              sizeBytes: 1024,
+              sha256: shaConcurrent,
+            },
+          ],
+          { totalUploaded: 1, duplicates: 0, rejected: 0 },
+          initialBatch.batchId,
+        ),
+        repository.finalizeBatch!(fixture.principal, fixture.requisitionId, initialBatch.batchId),
+      ]);
+
+      expect(finalizeOutcome.status).toBe('fulfilled');
+
+      const storedBatch = await pgClient.processingBatch.findUnique({
+        where: { id: initialBatch.batchId },
+      });
+      const batchJobs = await pgClient.processingJob.findMany({
+        where: { batchId: initialBatch.batchId },
+      });
+
+      expect(storedBatch?.isOpen).toBe(false);
+      if (appendOutcome.status === 'fulfilled') {
+        // Append won lock first: both jobs exist, and finalizeBatch must NOT mark batch COMPLETED prematurely
+        expect(batchJobs).toHaveLength(2);
+        expect(storedBatch?.status).not.toBe('COMPLETED');
+      } else {
+        // Finalize won lock first: append rejected with 409 and batch finalized cleanly with 1 job
+        expect(appendOutcome.reason).toMatchObject({ statusCode: 409 });
+        expect(batchJobs).toHaveLength(1);
+        expect(storedBatch?.status).toBe('COMPLETED');
+      }
+    });
+
+    it('keeps open batch from premature completion on releaseHeldProcessingJobs while closing reused single-file batch cleanly', async () => {
+      const shaDoc = `sha-open-rel-${randomUUID()}`;
+
+      // 1. Create pre-parsed resume document on Requisition A
+      const parsedBatch = await repository.createResumeBatch(
+        fixture.principal,
+        fixture.requisitionId,
+        [
+          {
+            clientFileId: 'rel-open-1',
+            storageKey: `${fixture.organizationId}/${randomUUID()}.pdf`,
+            fileName: 'parsed.pdf',
+            fileType: 'PDF',
+            mimeType: 'application/pdf',
+            sizeBytes: 1024,
+            sha256: shaDoc,
+          },
+        ],
+        { totalUploaded: 1, duplicates: 0, rejected: 0 },
+      );
+
+      const candId = parsedBatch.accepted[0]!.candidateId;
+      const docId = parsedBatch.accepted[0]!.resumeDocumentId;
+
+      await pgClient.candidateConsent.create({
+        data: {
+          organizationId: fixture.organizationId,
+          candidateId: candId,
+          requisitionId: fixture.requisitionId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: '2026-11-v1',
+          noticeTextHash: 'a'.repeat(64),
+          captureMethod: 'RECRUITER_RECORDED',
+          capturedById: fixture.recruiterId,
+          capturedAt: new Date(),
+        },
+      });
+      await repository.releaseHeldProcessingJobs(
+        fixture.organizationId,
+        candId,
+        fixture.recruiterId,
+        fixture.requisitionId,
+      );
+      const claimed = await repository.claimNextProcessingJob('worker-open-rel', 5);
+      await repository.completeProcessingJob(
+        claimed!.id,
+        docId,
+        fixture.organizationId,
+        {
+          extractedText: 'Valid extracted text',
+          pageMapJson: { pageCount: 1, pages: [{ pageNumber: 1, startOffset: 0, endOffset: 19 }] },
+          parser: 'talentlens-pdf-v1',
+          ocrUsed: false,
+          qualityStatus: 'COMPLETE',
+        },
+        claimed!.leaseToken ?? undefined,
+      );
+
+      // 2. Reuse for second requisition -> single-file batch must be closed (isOpen=false) and held until consent
+      const reqB = await pgClient.requisition.create({
+        data: {
+          organizationId: fixture.organizationId,
+          clientId: fixture.clientId,
+          assignedRecruiterId: fixture.recruiterId,
+          createdById: fixture.recruiterId,
+          title: 'Second Req For Reuse Lock Check',
+          jdText: 'Backend TypeScript role',
+          status: 'OPEN',
+        },
+      });
+
+      try {
+        const reused = await repository.reuseCandidateResumeForRequisition!(
+          fixture.principal,
+          reqB.id,
+          candId,
+          docId,
+        );
+        const reusedBatchBefore = await pgClient.processingBatch.findUnique({
+          where: { id: reused!.batchId },
+        });
+        expect(reusedBatchBefore?.isOpen).toBe(false);
+
+        // Also attach a HELD_FOR_AUTHORIZATION job referencing the same parsed document inside an OPEN batch (reqB)
+        const openMultiBatch = await pgClient.processingBatch.create({
+          data: {
+            organizationId: fixture.organizationId,
+            requisitionId: reqB.id,
+            createdById: fixture.recruiterId,
+            totalFiles: 1,
+            isOpen: true,
+            status: 'PROCESSING',
+          },
+        });
+        await pgClient.processingJob.create({
+          data: {
+            batchId: openMultiBatch.id,
+            organizationId: fixture.organizationId,
+            resumeDocumentId: docId,
+            jobType: 'EXTRACT_TEXT',
+            status: 'HELD_FOR_AUTHORIZATION',
+            attempts: 0,
+          },
+        });
+
+        // Grant consent for reqB and release held jobs
+        await pgClient.candidateConsent.create({
+          data: {
+            organizationId: fixture.organizationId,
+            candidateId: candId,
+            requisitionId: reqB.id,
+            purpose: 'HIRING_USE',
+            status: 'ACTIVE',
+            policyVersion: '2026-11-v1',
+            noticeTextHash: 'a'.repeat(64),
+            captureMethod: 'RECRUITER_RECORDED',
+            capturedById: fixture.recruiterId,
+            capturedAt: new Date(),
+          },
+        });
+        await repository.releaseHeldProcessingJobs(
+          fixture.organizationId,
+          candId,
+          fixture.recruiterId,
+          reqB.id,
+        );
+
+        // Closed reuse batch transitions to COMPLETED, whereas open batch stays PROCESSING (isOpen=true)
+        const reusedBatchAfter = await pgClient.processingBatch.findUnique({
+          where: { id: reused!.batchId },
+        });
+        const openBatchAfter = await pgClient.processingBatch.findUnique({
+          where: { id: openMultiBatch.id },
+        });
+        expect(reusedBatchAfter?.status).toBe('COMPLETED');
+        expect(openBatchAfter?.isOpen).toBe(true);
+        expect(openBatchAfter?.status).toBe('PROCESSING');
+        // Open batch reports isOpen=true before finalization and isOpen=false after finalizeBatch; cross-tenant stays isolated
+        const statusOpen = await repository.getBatchStatus!(
+          fixture.principal,
+          reqB.id,
+          openMultiBatch.id,
+        );
+        expect(statusOpen).toEqual({
+          id: openMultiBatch.id,
+          status: 'PROCESSING',
+          isOpen: true,
+        });
+
+        const statusWrongOrg = await repository.getBatchStatus!(
+          {
+            ...fixture.principal,
+            organizationId: '00000000-0000-4000-8000-000000000009',
+          },
+          reqB.id,
+          openMultiBatch.id,
+        );
+        expect(statusWrongOrg).toBeNull();
+
+        const statusClosed = await repository.getBatchStatus!(
+          fixture.principal,
+          reqB.id,
+          reused!.batchId,
+        );
+        expect(statusClosed).toEqual({
+          id: reused!.batchId,
+          status: 'COMPLETED',
+          isOpen: false,
+        });
+      } finally {
+        await pgClient.auditLog.deleteMany({ where: { requisitionId: reqB.id } });
+        await pgClient.processingJob.deleteMany({ where: { batch: { requisitionId: reqB.id } } });
+        await pgClient.processingBatch.deleteMany({ where: { requisitionId: reqB.id } });
+        await pgClient.candidateConsent.deleteMany({ where: { requisitionId: reqB.id } });
+        await pgClient.requisition.deleteMany({ where: { id: reqB.id } });
+      }
+    });
+  });
 });

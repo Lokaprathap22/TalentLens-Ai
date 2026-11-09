@@ -1,0 +1,191 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-talentlens}-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-talentlens}
+      POSTGRES_USER: ${POSTGRES_USER:-talentlens}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-talentlens} -d ${POSTGRES_DB:-talentlens}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: ${COMPOSE_PROJECT_NAME:-talentlens}-clamav
+    restart: unless-stopped
+    expose:
+      - '3310'
+    volumes:
+      - clamav_db:/var/lib/clamav
+    healthcheck:
+      test: ['CMD-SHELL', 'nc -z 127.0.0.1 3310 || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    networks:
+      - internal
+
+  # One-shot database migration container executed before API/Worker launch
+  migration:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-talentlens}-migration
+    restart: 'no'
+    command: ['node', './node_modules/prisma/build/index.js', 'migrate', 'deploy']
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-talentlens}-api
+    restart: unless-stopped
+    # CRITICAL: API is constrained to single instance due to process-local rate limiters
+    deploy:
+      replicas: 1
+    # Accessible ONLY inside the internal Docker network; NOT published to the host
+    expose:
+      - '3000'
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      API_PORT: 3000
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      APP_ORIGIN: ${APP_ORIGIN:?APP_ORIGIN required}
+      EMAIL_OUTBOX_ENCRYPTION_KEY: ${EMAIL_OUTBOX_ENCRYPTION_KEY:?EMAIL_OUTBOX_ENCRYPTION_KEY required}
+      EMAIL_OUTBOX_IDEMPOTENCY_SECRET: ${EMAIL_OUTBOX_IDEMPOTENCY_SECRET:?EMAIL_OUTBOX_IDEMPOTENCY_SECRET required}
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-s3}
+      ALLOW_LOCAL_STORAGE_IN_PRODUCTION: 'false'
+      S3_BUCKET: ${S3_BUCKET:-talentlens-resumes}
+      S3_REGION: ${S3_REGION:-ap-hyderabad-1}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID required}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY required}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      SCANNER_DRIVER: clamav
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+      SCANNER_FAIL_CLOSED: 'true'
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST required}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      EMAIL_FROM: ${EMAIL_FROM:-no-reply@talentlens.ai}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY required}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      GEMINI_TIMEOUT_MS: ${GEMINI_TIMEOUT_MS:-30000}
+      ASSESSMENT_PROVIDER: ${ASSESSMENT_PROVIDER:-gemini}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-172.28.0.10,172.28.0.1,127.0.0.1}
+      CONSENT_APPROVED_POLICIES: ${CONSENT_APPROVED_POLICIES:-}
+      CONSENT_APPROVED_POLICY_VERSIONS: ${CONSENT_APPROVED_POLICY_VERSIONS:-2026-11-v1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3000/api/v1/health/ready').then(async r => { if (!r.ok) process.exit(1); const j = await r.json(); process.exit(j.status === 'ready' && j.database === 'connected' ? 0 : 1); }).catch(() => process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      internal:
+        ipv4_address: 172.28.0.20
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-talentlens}-worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      EMAIL_OUTBOX_ENCRYPTION_KEY: ${EMAIL_OUTBOX_ENCRYPTION_KEY:?EMAIL_OUTBOX_ENCRYPTION_KEY required}
+      EMAIL_OUTBOX_IDEMPOTENCY_SECRET: ${EMAIL_OUTBOX_IDEMPOTENCY_SECRET:?EMAIL_OUTBOX_IDEMPOTENCY_SECRET required}
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-s3}
+      ALLOW_LOCAL_STORAGE_IN_PRODUCTION: 'false'
+      S3_BUCKET: ${S3_BUCKET:-talentlens-resumes}
+      S3_REGION: ${S3_REGION:-ap-hyderabad-1}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID required}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY required}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST required}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      EMAIL_FROM: ${EMAIL_FROM:-no-reply@talentlens.ai}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY required}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      GEMINI_TIMEOUT_MS: ${GEMINI_TIMEOUT_MS:-30000}
+      ASSESSMENT_PROVIDER: ${ASSESSMENT_PROVIDER:-gemini}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', 'apps/worker/dist/healthcheck.js']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - internal
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-talentlens}-web
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:${WEB_PORT:-8080}:8080'
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      internal:
+        ipv4_address: 172.28.0.10
+
+networks:
+  internal:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
+volumes:
+  pgdata:
+    driver: local
+  clamav_db:
+    driver: local

@@ -12,19 +12,20 @@ describe('parseEnvironment', () => {
         API_PORT: '4000',
         DATABASE_URL: validDatabaseUrl,
       }),
-    ).toEqual({
+    ).toMatchObject({
       nodeEnv: 'development',
       apiPort: 4000,
       databaseUrl: validDatabaseUrl,
       appOrigin: 'http://localhost:5173',
+      geminiApiKey: undefined,
+      geminiModel: 'gemini-3.8-flash',
+      geminiTimeoutMs: 30_000,
       aiApiKey: undefined,
-      aiBaseUrl: undefined,
-      aiModel: undefined,
+      aiModel: 'gemini-3.8-flash',
       aiTimeoutMs: 30_000,
-      assessmentProvider: 'openai',
+      assessmentProvider: 'gemini',
       assessmentOpenAiApiKey: undefined,
-      assessmentOpenAiBaseUrl: undefined,
-      assessmentOpenAiModel: undefined,
+      assessmentOpenAiModel: 'gemini-3.8-flash',
       assessmentTimeoutMs: 30_000,
       resumeStorageRoot: expect.stringContaining('storage'),
       approvedPolicies: [],
@@ -58,12 +59,75 @@ describe('parseEnvironment', () => {
         API_PORT: '443',
         APP_ORIGIN: 'https://app.example.com',
         DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
       }),
     ).toMatchObject({
       nodeEnv: 'production',
       apiPort: 443,
       appOrigin: 'https://app.example.com',
+      trustedProxyIps: ['172.28.0.10', '172.28.0.1', '127.0.0.1'],
     });
+  });
+
+  it('requires TRUSTED_PROXY_IPS in production', () => {
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+      }),
+    ).toThrow('TRUSTED_PROXY_IPS is strictly required and cannot be empty in production');
+  });
+
+  it('parses valid staging configuration and requires APP_ORIGIN', () => {
+    expect(
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        APP_ORIGIN: 'https://staging.example.com',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-staging-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_STAGING_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_staging_test_key_123',
+      }),
+    ).toMatchObject({
+      nodeEnv: 'staging',
+      apiPort: 4000,
+      appOrigin: 'https://staging.example.com',
+    });
+
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-staging-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_STAGING_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_staging_test_key_123',
+      }),
+    ).toThrow('APP_ORIGIN');
+
+    // Fails closed if STORAGE_DRIVER=local in staging without explicit override
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        APP_ORIGIN: 'https://staging.example.com',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 'local',
+      }),
+    ).toThrow('STORAGE_DRIVER=s3 is required');
   });
 
   it('resolves relative RESUME_STORAGE_ROOT against the repository root', () => {
@@ -114,6 +178,14 @@ describe('parseEnvironment', () => {
     );
   });
 
+  it('resolves port consistently with PORT fallback and defaults to 3000', () => {
+    expect(parseEnvironment({ DATABASE_URL: validDatabaseUrl }).apiPort).toBe(3000);
+    expect(parseEnvironment({ PORT: '3000', DATABASE_URL: validDatabaseUrl }).apiPort).toBe(3000);
+    expect(
+      parseEnvironment({ API_PORT: '8080', PORT: '3000', DATABASE_URL: validDatabaseUrl }).apiPort,
+    ).toBe(8080);
+  });
+
   it('does not expose secret values in validation errors', () => {
     const secret = 'super-secret-password';
 
@@ -148,17 +220,154 @@ describe('parseEnvironment', () => {
     });
     expect(testEnv.assessmentProvider).toBe('fake');
 
-    const openAiEnv = parseEnvironment({
+    const geminiEnv = parseEnvironment({
       NODE_ENV: 'development',
       DATABASE_URL: validDatabaseUrl,
-      ASSESSMENT_PROVIDER: 'openai',
-      ASSESSMENT_OPENAI_API_KEY: 'sk-placeholder',
-      ASSESSMENT_OPENAI_MODEL: 'gpt-4o-mini',
-      ASSESSMENT_OPENAI_BASE_URL: 'https://api.openai.com/v1',
-      ASSESSMENT_TIMEOUT_MS: '45000',
+      ASSESSMENT_PROVIDER: 'gemini',
+      GEMINI_API_KEY: 'test-gemini-key',
+      GEMINI_MODEL: 'gemini-2.5-pro',
+      GEMINI_TIMEOUT_MS: '45000',
     });
-    expect(openAiEnv.assessmentProvider).toBe('openai');
-    expect(openAiEnv.assessmentOpenAiModel).toBe('gpt-4o-mini');
-    expect(openAiEnv.assessmentTimeoutMs).toBe(45_000);
+    expect(geminiEnv.assessmentProvider).toBe('gemini');
+    expect(geminiEnv.geminiModel).toBe('gemini-2.5-pro');
+    expect(geminiEnv.geminiTimeoutMs).toBe(45_000);
+  });
+
+  it('enforces SCANNER_FAIL_CLOSED and ClamAV configuration in production and staging', () => {
+    // Rejects fail-open in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        SCANNER_FAIL_CLOSED: 'false',
+      }),
+    ).toThrow('SCANNER_FAIL_CLOSED cannot be false in production and staging');
+
+    // Rejects fail-open in staging
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'staging',
+        API_PORT: '4000',
+        APP_ORIGIN: 'https://staging.example.com',
+        DATABASE_URL: validDatabaseUrl,
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-staging-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_STAGING_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_staging_test_key_123',
+        SCANNER_FAIL_CLOSED: 'false',
+      }),
+    ).toThrow('SCANNER_FAIL_CLOSED cannot be false in production and staging');
+
+    // Requires CLAMAV_HOST when SCANNER_DRIVER=clamav in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        SCANNER_DRIVER: 'clamav',
+        TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+      }),
+    ).toThrow('CLAMAV_HOST is required when SCANNER_DRIVER=clamav');
+
+    // Accepts valid ClamAV configuration in production
+    const validProd = parseEnvironment({
+      NODE_ENV: 'production',
+      API_PORT: '443',
+      APP_ORIGIN: 'https://app.example.com',
+      DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+      STORAGE_DRIVER: 's3',
+      S3_BUCKET: 'talentlens-prod-resumes',
+      S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+      S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+      SCANNER_DRIVER: 'clamav',
+      CLAMAV_HOST: 'clamav.internal',
+      CLAMAV_PORT: '3310',
+      SCANNER_FAIL_CLOSED: 'true',
+      TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+    });
+    expect(validProd.nodeEnv).toBe('production');
+  });
+
+  it('normalizes empty string configuration values to undefined without failing validation', () => {
+    const env = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      GEMINI_API_KEY: '',
+      GEMINI_MODEL: '',
+      GEMINI_TIMEOUT_MS: '',
+      AI_API_KEY: '',
+      AI_MODEL: '',
+      AI_TIMEOUT_MS: '',
+      CONSENT_APPROVED_POLICIES: '',
+      CONSENT_APPROVED_POLICY_VERSIONS: '',
+      SMTP_HOST: '',
+      SMTP_PORT: '',
+      TRUSTED_PROXY_IPS: '127.0.0.1, 10.0.0.5',
+    });
+
+    expect(env.geminiApiKey).toBeUndefined();
+    expect(env.geminiModel).toBe('gemini-3.8-flash');
+    expect(env.geminiTimeoutMs).toBe(30_000);
+    expect(env.aiApiKey).toBeUndefined();
+    expect(env.aiModel).toBe('gemini-3.8-flash');
+    expect(env.aiTimeoutMs).toBe(30_000);
+    expect(env.trustedProxyIps).toEqual(['127.0.0.1', '10.0.0.5']);
+  });
+
+  it('enforces production security rules: HTTPS APP_ORIGIN, s3 storage, gemini provider', () => {
+    // Rejects HTTP APP_ORIGIN in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'http://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+      }),
+    ).toThrow('APP_ORIGIN must use HTTPS in production');
+
+    // Rejects local storage in production even if ALLOW_LOCAL_STORAGE_IN_PRODUCTION is true
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 'local',
+        ALLOW_LOCAL_STORAGE_IN_PRODUCTION: 'true',
+        TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+      }),
+    ).toThrow('STORAGE_DRIVER=s3 is strictly required in production');
+
+    // Rejects non-gemini provider in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        ASSESSMENT_PROVIDER: 'fake',
+        TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+      }),
+    ).toThrow('strictly forbidden outside NODE_ENV=test');
   });
 });

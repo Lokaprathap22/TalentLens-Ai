@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import type {
   DocumentExtractionDto,
@@ -11,11 +12,15 @@ import {
   type FileToIngest,
   type ResumeRepository,
 } from './resume.repository.js';
-import { createDocumentStorageService, LocalDocumentStorageService } from './resume.storage.js';
+import { createDocumentStorageService } from './resume.storage.js';
+import { createResumeScanner, type ResumeScanner } from './resume.scanner.js';
 import { parseMultipartUpload, type ParsedUploadedFile } from './resume.multipart.js';
 import {
+  DocumentProcessingTimeoutError,
   DocxTextExtractor,
+  EncryptedDocumentError,
   InvalidDocumentFormatError,
+  PdfTextExtractor,
   SecurityLimitExceededError,
 } from './resume.parser.js';
 import type { IncomingMessage } from 'node:http';
@@ -66,15 +71,25 @@ export class ExtractionNotFoundError extends Error {
   }
 }
 
+export class BatchNotFoundError extends Error {
+  constructor() {
+    super('Processing batch not found for requisition');
+    this.name = 'BatchNotFoundError';
+  }
+}
+
 export interface ResumeServiceDependencies {
   repository?: ResumeRepository;
   storageService?: DocumentStorageService;
+  scanner?: ResumeScanner;
 }
 
 export function createResumeService(dependencies: ResumeServiceDependencies = {}) {
   const repository = dependencies.repository ?? createResumeRepository();
   const storageService = dependencies.storageService ?? createDocumentStorageService();
+  const scanner = dependencies.scanner ?? createResumeScanner();
   const docxExtractor = new DocxTextExtractor();
+  const pdfPreValidator = new PdfTextExtractor();
 
   function requireRecruiter(principal: AuthenticatedPrincipal): void {
     if (principal.role !== 'RECRUITER') {
@@ -93,6 +108,7 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
       principal: AuthenticatedPrincipal,
       requisitionId: string,
       req: IncomingMessage,
+      existingBatchId?: string,
     ): Promise<ResumeBatchUploadResult> {
       requireRecruiter(principal);
 
@@ -106,19 +122,37 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
         throw new RequisitionNotFoundError();
       }
 
-      // Stream incoming multipart files to temporary directory
-      const uploadedFiles: ParsedUploadedFile[] = await parseMultipartUpload(req);
+      // Stream incoming multipart files to temporary directory (supports up to 100 files per chunk, 15MB each)
+      const uploadedFiles: ParsedUploadedFile[] = await parseMultipartUpload(req, {
+        maxFiles: 100,
+        maxFileSize: 15 * 1024 * 1024,
+      });
 
       const acceptedFiles: FileToIngest[] = [];
       const duplicates: ResumeBatchUploadResult['duplicates'] = [];
       const rejected: ResumeBatchUploadResult['rejected'] = [];
       const savedStorageKeys: string[] = [];
+      const seenSha256InBatch = new Set<string>();
 
       try {
         for (const file of uploadedFiles) {
+          if (file.rejectionReason || !file.fileType || !file.tempPath) {
+            rejected.push({
+              clientFileId: file.clientFileId,
+              fileName: file.sanitizedFileName,
+              reason:
+                file.rejectionReason ??
+                'Unsupported or corrupted file signature (expected PDF or DOCX)',
+              status: 'REJECTED',
+            });
+            continue;
+          }
+
+          let fileBuffer: Buffer;
+
           // 1. Structure & format pre-validation
           try {
-            const fileBuffer = await (async () => {
+            fileBuffer = await (async () => {
               const fs = await import('node:fs/promises');
               return fs.readFile(file.tempPath);
             })();
@@ -126,8 +160,29 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             if (file.fileType === 'PDF') {
               if (!fileBuffer.subarray(0, 5).toString('ascii').startsWith('%PDF')) {
                 rejected.push({
+                  clientFileId: file.clientFileId,
                   fileName: file.sanitizedFileName,
                   reason: 'Invalid PDF signature',
+                  status: 'REJECTED',
+                });
+                continue;
+              }
+
+              // Validate PDF decompression bounds, page limits, and image/geometry safety before ingestion
+              try {
+                await pdfPreValidator.parse(fileBuffer);
+              } catch (err: unknown) {
+                const message =
+                  err instanceof SecurityLimitExceededError ||
+                    err instanceof InvalidDocumentFormatError ||
+                    err instanceof EncryptedDocumentError ||
+                    err instanceof DocumentProcessingTimeoutError
+                    ? err.message
+                    : 'Corrupt or unsafe PDF structure';
+                rejected.push({
+                  clientFileId: file.clientFileId,
+                  fileName: file.sanitizedFileName,
+                  reason: message,
                   status: 'REJECTED',
                 });
                 continue;
@@ -135,6 +190,7 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             } else if (file.fileType === 'DOCX') {
               if (fileBuffer.length < 4 || fileBuffer.readUInt32LE(0) !== 0x04034b50) {
                 rejected.push({
+                  clientFileId: file.clientFileId,
                   fileName: file.sanitizedFileName,
                   reason: 'Invalid DOCX/ZIP signature',
                   status: 'REJECTED',
@@ -149,10 +205,13 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
               } catch (err: unknown) {
                 const message =
                   err instanceof SecurityLimitExceededError ||
-                  err instanceof InvalidDocumentFormatError
+                    err instanceof InvalidDocumentFormatError ||
+                    err instanceof EncryptedDocumentError ||
+                    err instanceof DocumentProcessingTimeoutError
                     ? err.message
                     : 'Corrupt or malformed DOCX archive structure';
                 rejected.push({
+                  clientFileId: file.clientFileId,
                   fileName: file.sanitizedFileName,
                   reason: message,
                   status: 'REJECTED',
@@ -162,6 +221,7 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             }
           } catch {
             rejected.push({
+              clientFileId: file.clientFileId,
               fileName: file.sanitizedFileName,
               reason: 'Failed to inspect file structure',
               status: 'REJECTED',
@@ -169,18 +229,64 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             continue;
           }
 
-          // 2. Duplicate detection within requisition (or organization when requisitionIds is omitted)
+          // 1b. Antivirus malware scan boundary
+          try {
+            const scanResult = await scanner.scan(fileBuffer, file.sanitizedFileName);
+            if (scanResult.status === 'INFECTED') {
+              rejected.push({
+                clientFileId: file.clientFileId,
+                fileName: file.sanitizedFileName,
+                reason: `Malware detected: ${scanResult.threatName ?? 'Malicious content'}`,
+                status: 'REJECTED',
+              });
+              continue;
+            }
+            if (scanResult.status === 'ERROR') {
+              const nodeEnv = process.env['NODE_ENV'];
+              const isProductionOrStaging = nodeEnv === 'production' || nodeEnv === 'staging';
+              const failClosed =
+                process.env['SCANNER_FAIL_CLOSED'] !== 'false' || isProductionOrStaging;
+
+              if (failClosed) {
+                rejected.push({
+                  clientFileId: file.clientFileId,
+                  fileName: file.sanitizedFileName,
+                  reason: `Antivirus scanner unavailable: ${scanResult.errorMessage ?? 'Scanner error'}; upload quarantined`,
+                  status: 'REJECTED',
+                });
+                continue;
+              }
+            }
+          } catch (scanErr: unknown) {
+            rejected.push({
+              clientFileId: file.clientFileId,
+              fileName: file.sanitizedFileName,
+              reason: `Antivirus scanning exception: ${(scanErr as Error)?.message ?? 'Scanner error'}; upload quarantined`,
+              status: 'REJECTED',
+            });
+            continue;
+          }
+
+          // 2. Intra-batch and Organization-wide duplicate detection by SHA-256
+          if (seenSha256InBatch.has(file.sha256)) {
+            duplicates.push({
+              clientFileId: file.clientFileId,
+              fileName: file.sanitizedFileName,
+              sha256: file.sha256,
+              status: 'DUPLICATE',
+              message: 'An identical resume document is already included in this batch',
+            });
+            continue;
+          }
+
           const existing = await repository.findExistingResumeBySha256(
             principal.organizationId,
             file.sha256,
           );
 
-          const isSameRequisitionDuplicate =
-            existing &&
-            (!existing.requisitionIds || existing.requisitionIds.includes(requisitionId));
-
-          if (isSameRequisitionDuplicate) {
+          if (existing) {
             duplicates.push({
+              clientFileId: file.clientFileId,
               fileName: file.sanitizedFileName,
               sha256: file.sha256,
               resumeDocumentId: existing.id,
@@ -190,17 +296,23 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
             continue;
           }
 
-          // 3. Move from temp into safe permanent storage
+          seenSha256InBatch.add(file.sha256);
+
+          // 3. Move from temp into safe permanent storage with unique, unshared object keys
           const ext = file.fileType === 'PDF' ? 'pdf' : 'docx';
+          const storageWithGenKey = storageService as DocumentStorageService & {
+            generateKey?: (ext: string) => string;
+          };
           const storageKey =
-            storageService instanceof LocalDocumentStorageService
-              ? storageService.generateKey(ext)
-              : `${principal.organizationId}/${file.sha256}.${ext}`;
+            typeof storageWithGenKey.generateKey === 'function'
+              ? storageWithGenKey.generateKey(ext)
+              : `${principal.organizationId}/${randomUUID()}.${ext}`;
 
           await storageService.saveFromPath(storageKey, file.tempPath);
           savedStorageKeys.push(storageKey);
 
           acceptedFiles.push({
+            clientFileId: file.clientFileId,
             storageKey,
             fileName: file.sanitizedFileName,
             fileType: file.fileType,
@@ -211,7 +323,7 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
         }
 
         // 4. Create database records in a transaction
-        let batchId: string | null = null;
+        let batchId: string | null = existingBatchId ?? null;
         let createdAccepted: ResumeBatchUploadResult['accepted'] = [];
 
         if (acceptedFiles.length > 0) {
@@ -225,10 +337,12 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
                 duplicates: duplicates.length,
                 rejected: rejected.length,
               },
+              existingBatchId,
             );
 
             batchId = createdBatch.batchId;
-            createdAccepted = createdBatch.accepted.map((item) => ({
+            createdAccepted = createdBatch.accepted.map((item, idx) => ({
+              clientFileId: item.clientFileId ?? acceptedFiles[idx]?.clientFileId,
               resumeDocumentId: item.resumeDocumentId,
               candidateId: item.candidateId,
               candidateCode: item.candidateCode,
@@ -250,6 +364,7 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
                 );
                 if (existing) {
                   duplicates.push({
+                    clientFileId: file.clientFileId,
                     fileName: file.fileName,
                     sha256: file.sha256,
                     resumeDocumentId: existing.id,
@@ -257,7 +372,7 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
                     message: 'An identical resume document already exists in this organization',
                   });
                   // Clean up storage file for the duplicate
-                  await storageService.delete(file.storageKey).catch(() => {});
+                  await storageService.delete(file.storageKey).catch(() => { });
                   const idx = savedStorageKeys.indexOf(file.storageKey);
                   if (idx !== -1) savedStorageKeys.splice(idx, 1);
                 } else {
@@ -275,9 +390,11 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
                     duplicates: duplicates.length,
                     rejected: rejected.length,
                   },
+                  existingBatchId,
                 );
                 batchId = retriedBatch.batchId;
-                createdAccepted = retriedBatch.accepted.map((item) => ({
+                createdAccepted = retriedBatch.accepted.map((item, idx) => ({
+                  clientFileId: item.clientFileId ?? remainingFilesToIngest[idx]?.clientFileId,
                   resumeDocumentId: item.resumeDocumentId,
                   candidateId: item.candidateId,
                   candidateCode: item.candidateCode,
@@ -307,13 +424,13 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
       } catch (err) {
         // Compensation on failure: clean up files written to permanent storage
         for (const key of savedStorageKeys) {
-          await storageService.delete(key).catch(() => {});
+          await storageService.delete(key).catch(() => { });
         }
         throw err;
       } finally {
         // Clean up all temporary upload files
         for (const file of uploadedFiles) {
-          await file.cleanup().catch(() => {});
+          await file.cleanup().catch(() => { });
         }
       }
     },
@@ -491,6 +608,53 @@ export function createResumeService(dependencies: ResumeServiceDependencies = {}
       }
 
       return reused;
+    },
+
+    async finalizeBatch(principal: AuthenticatedPrincipal, requisitionId: string, batchId: string) {
+      requireRecruiter(principal);
+
+      const requisition = await repository.findAuthorizedRequisition(
+        principal.organizationId,
+        principal.userId,
+        requisitionId,
+      );
+      if (!requisition) {
+        throw new RequisitionNotFoundError();
+      }
+
+      if (typeof repository.finalizeBatch !== 'function') {
+        return { id: batchId, status: 'COMPLETED', isOpen: false };
+      }
+
+      return repository.finalizeBatch(principal, requisitionId, batchId);
+    },
+
+    async getBatchStatus(
+      principal: AuthenticatedPrincipal,
+      requisitionId: string,
+      batchId: string,
+    ) {
+      requireRecruiter(principal);
+
+      const requisition = await repository.findAuthorizedRequisition(
+        principal.organizationId,
+        principal.userId,
+        requisitionId,
+      );
+      if (!requisition) {
+        throw new RequisitionNotFoundError();
+      }
+
+      if (typeof repository.getBatchStatus !== 'function') {
+        throw new BatchNotFoundError();
+      }
+
+      const batch = await repository.getBatchStatus(principal, requisitionId, batchId);
+      if (!batch) {
+        throw new BatchNotFoundError();
+      }
+
+      return batch;
     },
   };
 }

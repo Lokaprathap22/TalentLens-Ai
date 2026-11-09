@@ -13,14 +13,19 @@ import { loadEnvironment } from './config/env.js';
 import { createShutdownHandler } from './lifecycle.js';
 import { createRequisitionRepository } from './modules/requisitions/requisition.repository.js';
 import { createRequisitionService } from './modules/requisitions/requisition.service.js';
-import { createOpenAiCompatibleProvider } from './modules/scorecards/jd-extraction.provider.js';
+import { createGeminiJdExtractionProvider } from './modules/scorecards/jd-extraction.provider.js';
 import { createScorecardRepository } from './modules/scorecards/scorecard.repository.js';
 import { createScorecardService } from './modules/scorecards/scorecard.service.js';
 import { createResumeRepository } from './modules/resumes/resume.repository.js';
 import { createResumeService } from './modules/resumes/resume.service.js';
 import { createConsentRepository } from './modules/consent/consent.repository.js';
 import { createConsentService } from './modules/consent/consent.service.js';
-import { DefaultEmailDeliveryService } from './modules/consent/consent.email.js';
+import {
+  NullEmailProvider,
+  SmtpEmailProvider,
+  TransactionalEmailService,
+} from './modules/email/index.js';
+import { initializeIdempotencySecret, initializeKeyRing } from './modules/email/email.crypto.js';
 import { createAssessmentRepository } from './modules/assessments/assessment.repository.js';
 import { createAssessmentService } from './modules/assessments/assessment.service.js';
 import { createWorkflowRepository } from './modules/workflow/workflow.repository.js';
@@ -28,6 +33,10 @@ import { createWorkflowService } from './modules/workflow/workflow.service.js';
 import { createAuthorizationService } from './modules/authorization/authorization.service.js';
 
 const environment = loadEnvironment();
+
+// Validate fail-closed cryptographic configuration on API startup
+initializeIdempotencySecret();
+initializeKeyRing();
 let sessionService: SessionService | undefined;
 let sessionRepository: SessionRepository | undefined;
 let authRepository: AuthRepository | undefined;
@@ -44,12 +53,24 @@ let assessmentService: ReturnType<typeof createAssessmentService> | undefined;
 let workflowRepository: ReturnType<typeof createWorkflowRepository> | undefined;
 let workflowService: ReturnType<typeof createWorkflowService> | undefined;
 let authorizationService: ReturnType<typeof createAuthorizationService> | undefined;
-const emailDeliveryService = new DefaultEmailDeliveryService();
-const extractionProvider = createOpenAiCompatibleProvider({
-  apiKey: environment.aiApiKey,
-  baseUrl: environment.aiBaseUrl,
-  model: environment.aiModel,
-  timeoutMs: environment.aiTimeoutMs,
+const emailDeliveryService = environment.smtpHost
+  ? new TransactionalEmailService({
+      provider: new SmtpEmailProvider({
+        host: environment.smtpHost,
+        port: environment.smtpPort ?? 587,
+        user: environment.smtpUser,
+        pass: environment.smtpPass,
+        fromAddress: environment.emailFrom ?? 'no-reply@talentlens.ai',
+      }),
+      fromAddress: environment.emailFrom ?? 'no-reply@talentlens.ai',
+    })
+  : new TransactionalEmailService({
+      provider: new NullEmailProvider(),
+    });
+const extractionProvider = createGeminiJdExtractionProvider({
+  apiKey: environment.geminiApiKey,
+  model: environment.geminiModel,
+  timeoutMs: environment.geminiTimeoutMs,
 });
 const lazySessionService: SessionService = {
   createSession: (...args) => {
@@ -70,11 +91,47 @@ const lazySessionService: SessionService = {
     });
     return sessionService.revokeSession(...args);
   },
+  revokeUserSessions: (...args) => {
+    sessionService ??= createSessionService({
+      repository: getSessionRepository(),
+    });
+    return sessionService.revokeUserSessions(...args);
+  },
+  revokeOtherUserSessions: (...args) => {
+    sessionService ??= createSessionService({
+      repository: getSessionRepository(),
+    });
+    return sessionService.revokeOtherUserSessions(...args);
+  },
 };
 const lazyAuthRepository: AuthRepository = {
   findUserByOrganizationAndEmail: (...args) => {
     authRepository ??= createAuthRepository();
     return authRepository.findUserByOrganizationAndEmail(...args);
+  },
+  findUserById: (...args) => {
+    authRepository ??= createAuthRepository();
+    return authRepository.findUserById(...args);
+  },
+  updateUserPassword: (...args) => {
+    authRepository ??= createAuthRepository();
+    return authRepository.updateUserPassword(...args);
+  },
+  activateUser: (...args) => {
+    authRepository ??= createAuthRepository();
+    return authRepository.activateUser(...args);
+  },
+  updateUserName: (...args) => {
+    authRepository ??= createAuthRepository();
+    return authRepository.updateUserName(...args);
+  },
+  activateUserWithToken: (...args) => {
+    authRepository ??= createAuthRepository();
+    return authRepository.activateUserWithToken(...args);
+  },
+  resetPasswordWithToken: (...args) => {
+    authRepository ??= createAuthRepository();
+    return authRepository.resetPasswordWithToken(...args);
   },
 };
 
@@ -115,6 +172,7 @@ function getConsentService(): ReturnType<typeof createConsentService> {
     emailDeliveryService,
     applicationOrigin: environment.appOrigin,
     approvedPolicies: environment.approvedPolicies,
+    approvedPolicyVersions: environment.approvedPolicyVersions,
   });
   return consentService;
 }
@@ -127,7 +185,9 @@ function getAssessmentService(): ReturnType<typeof createAssessmentService> {
 
 function getWorkflowService(): ReturnType<typeof createWorkflowService> {
   workflowRepository ??= createWorkflowRepository();
-  workflowService ??= createWorkflowService(workflowRepository);
+  workflowService ??= createWorkflowService(workflowRepository, {
+    applicationOrigin: environment.appOrigin ?? 'http://localhost:5173',
+  });
   return workflowService;
 }
 
@@ -142,6 +202,8 @@ const server = createServer(
       authService: createAuthService({
         repository: lazyAuthRepository,
         sessionService: lazySessionService,
+        emailDeliveryService,
+        applicationOrigin: environment.appOrigin,
       }),
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
@@ -153,6 +215,7 @@ const server = createServer(
         list: (...args) => getRequisitionService().list(...args),
         get: (...args) => getRequisitionService().get(...args),
         update: (...args) => getRequisitionService().update(...args),
+        transitionStatus: (...args) => getRequisitionService().transitionStatus(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
@@ -181,6 +244,8 @@ const server = createServer(
           getResumeService().releaseHeldProcessingJobs(...args),
         reuseCandidateResumeForRequisition: (...args) =>
           getResumeService().reuseCandidateResumeForRequisition(...args),
+        finalizeBatch: (...args) => getResumeService().finalizeBatch(...args),
+        getBatchStatus: (...args) => getResumeService().getBatchStatus(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
@@ -194,6 +259,12 @@ const server = createServer(
         declineConsent: (...args) => getConsentService().declineConsent(...args),
         requestWithdrawal: (...args) => getConsentService().requestWithdrawal(...args),
         confirmWithdrawal: (...args) => getConsentService().confirmWithdrawal(...args),
+        requestCandidateDeletion: (...args) =>
+          getConsentService().requestCandidateDeletion(...args),
+        confirmCandidateDeletion: (...args) =>
+          getConsentService().confirmCandidateDeletion(...args),
+        createDeletionRequest: (...args) => getConsentService().createDeletionRequest(...args),
+        processDeletionRequest: (...args) => getConsentService().processDeletionRequest(...args),
       },
       sessionService: lazySessionService,
       applicationOrigin: environment.appOrigin,
@@ -231,7 +302,15 @@ const server = createServer(
         respondToInterviewAsClient: (...args) =>
           getWorkflowService().respondToInterviewAsClient(...args),
         listAuthorizedClients: (...args) => getWorkflowService().listAuthorizedClients(...args),
+        createClient: (...args) => getWorkflowService().createClient(...args),
+        updateClient: (...args) => getWorkflowService().updateClient(...args),
+        getClient: (...args) => getWorkflowService().getClient(...args),
+        listClientMembers: (...args) => getWorkflowService().listClientMembers(...args),
+        inviteClientMember: (...args) => getWorkflowService().inviteClientMember(...args),
         getCandidateTimeline: (...args) => getWorkflowService().getCandidateTimeline(...args),
+        listGlobalCandidates: (...args) => getWorkflowService().listGlobalCandidates(...args),
+        listInterviews: (...args) => getWorkflowService().listInterviews(...args),
+        getDashboardSummary: (...args) => getWorkflowService().getDashboardSummary(...args),
       },
       sessionService: lazySessionService,
       authorizationService: {
@@ -241,6 +320,7 @@ const server = createServer(
       applicationOrigin: environment.appOrigin,
       isProduction: environment.nodeEnv === 'production',
     },
+    trustedProxyIps: environment.trustedProxyIps,
   }),
 );
 

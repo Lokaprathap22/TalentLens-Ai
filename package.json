@@ -20,7 +20,7 @@
     "build": "npm run build --workspace @talentlens/shared && npm run build --workspace @talentlens/document-processing && npm run build --workspace @talentlens/database && npm run build --workspace @talentlens/assessment-engine && npm run build --workspace @talentlens/api && npm run build --workspace @talentlens/worker && npm run build --workspace @talentlens/web",
     "typecheck": "npm run typecheck --workspace @talentlens/shared && npm run typecheck:tests --workspace @talentlens/shared && npm run typecheck --workspace @talentlens/document-processing && npm run typecheck:tests --workspace @talentlens/document-processing && npm run typecheck --workspace @talentlens/database && npm run typecheck --workspace @talentlens/assessment-engine && npm run typecheck:tests --workspace @talentlens/assessment-engine && npm run typecheck --workspace @talentlens/api && npm run typecheck:tests --workspace @talentlens/api && npm run typecheck --workspace @talentlens/worker && npm run typecheck --workspace @talentlens/web",
     "lint": "eslint .",
-    "test": "npm run build --workspace @talentlens/shared && npm run build --workspace @talentlens/assessment-engine && npm run test --workspace @talentlens/shared && npm run test --workspace @talentlens/document-processing && npm run test --workspace @talentlens/assessment-engine && npm run test --workspace @talentlens/worker && npm run test --workspace @talentlens/api",
+    "test": "npm run build --workspace @talentlens/shared && npm run build --workspace @talentlens/assessment-engine && npm run test --workspace @talentlens/shared && npm run test --workspace @talentlens/document-processing && npm run test --workspace @talentlens/assessment-engine && npm run test --workspace @talentlens/worker && npm run test --workspace @talentlens/api && npm run test --workspace @talentlens/web",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "db:validate": "prisma validate",
@@ -28,10 +28,14 @@
     "db:generate": "prisma generate",
     "db:migrate:dev": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "preflight:env": "node scripts/preflight-env.mjs",
+    "generate:secrets": "node scripts/generate-secrets.mjs",
+    "test:gemini": "node scripts/test-gemini-live.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@playwright/test": "^1.65.0",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
@@ -46,5 +50,17 @@
     "typescript-eslint": "^8.46.3",
     "vite": "^8.0.0",
     "vitest": "^4.0.8"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.1"
+    }
+  },
+  "allowScripts": {
+    "@prisma/engines@7.10.1": true,
+    "argon2@0.45.2": true,
+    "esbuild@0.28.2": true,
+    "prisma@7.10.1": true,
+    "protobufjs@7.6.6": true
   }
 }

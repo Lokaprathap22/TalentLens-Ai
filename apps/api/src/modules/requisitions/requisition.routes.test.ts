@@ -3,15 +3,23 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
+import type { AuthenticatedUserDto } from '../auth/auth.dto.js';
 import type { SessionService } from '../auth/session.service.js';
-import { RequisitionNotFoundError, type RequisitionService } from './requisition.service.js';
+import {
+  RequisitionNotFoundError,
+  RequisitionScorecardNotApprovedError,
+  RequisitionStatusTransitionError,
+  type RequisitionService,
+} from './requisition.service.js';
 
 const rawToken = 'A'.repeat(43);
 const requisitionId = '123e4567-e89b-42d3-a456-426614174000';
-const principal = {
+const principal: AuthenticatedUserDto = {
   userId: 'recruiter-a',
   organizationId: 'organization-a',
-  role: 'RECRUITER' as const,
+  organizationName: 'Organization A',
+  email: 'recruiter-a@example.com',
+  role: 'RECRUITER',
 };
 const requisition = {
   id: 'requisition-a',
@@ -26,10 +34,10 @@ const requisition = {
 
 function createTestApp(
   options: {
-    principal?:
-      typeof principal | { userId: string; organizationId: string; role: 'CLIENT_HIRING_MANAGER' };
+    principal?: AuthenticatedUserDto;
     getError?: Error;
     updateError?: Error;
+    transitionError?: Error;
   } = {},
 ) {
   const authenticatedPrincipal = options.principal ?? principal;
@@ -48,6 +56,10 @@ function createTestApp(
     update: vi.fn(async () => {
       if (options.updateError) throw options.updateError;
       return requisition;
+    }),
+    transitionStatus: vi.fn(async (_principal, _id, input) => {
+      if (options.transitionError) throw options.transitionError;
+      return { ...requisition, status: input.status };
     }),
   };
   return {
@@ -141,6 +153,8 @@ describe('requisition routes', () => {
       principal: {
         userId: 'client-manager-a',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'client-manager-a@example.com',
         role: 'CLIENT_HIRING_MANAGER',
       },
     });
@@ -209,6 +223,8 @@ describe('requisition routes', () => {
       principal: {
         userId: 'recruiter-b',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'recruiter-b@example.com',
         role: 'RECRUITER',
       },
       getError: new RequisitionNotFoundError(),
@@ -224,6 +240,8 @@ describe('requisition routes', () => {
       {
         userId: 'recruiter-b',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'recruiter-b@example.com',
         role: 'RECRUITER',
       },
       requisitionId,
@@ -235,6 +253,8 @@ describe('requisition routes', () => {
       principal: {
         userId: 'recruiter-a',
         organizationId: 'organization-b',
+        organizationName: 'Organization B',
+        email: 'recruiter-a@org-b.example.com',
         role: 'RECRUITER',
       },
       getError: new RequisitionNotFoundError(),
@@ -250,6 +270,8 @@ describe('requisition routes', () => {
       {
         userId: 'recruiter-a',
         organizationId: 'organization-b',
+        organizationName: 'Organization B',
+        email: 'recruiter-a@org-b.example.com',
         role: 'RECRUITER',
       },
       requisitionId,
@@ -257,10 +279,12 @@ describe('requisition routes', () => {
   });
 
   it('returns 404 for cross-recruiter update access', async () => {
-    const crossRecruiter = {
+    const crossRecruiter: AuthenticatedUserDto = {
       userId: 'recruiter-b',
       organizationId: 'organization-a',
-      role: 'RECRUITER' as const,
+      organizationName: 'Organization A',
+      email: 'recruiter-b@example.com',
+      role: 'RECRUITER',
     };
     const { app, service } = createTestApp({
       principal: crossRecruiter,
@@ -319,5 +343,125 @@ describe('requisition routes', () => {
 
     expect(response.status).toBe(403);
     expect(service.create).not.toHaveBeenCalled();
+  });
+
+  describe('POST /api/v1/requisitions/:id/status (M9.3 Step 1 Part B)', () => {
+    it('transitions requisition status for the authenticated recruiter', async () => {
+      const { app, service } = createTestApp();
+
+      const response = await authorizedRequest(
+        app,
+        'post',
+        `/api/v1/requisitions/${requisitionId}/status`,
+      ).send({ status: 'OPEN' });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        requisition: { ...requisition, status: 'OPEN' },
+      });
+      expect(service.transitionStatus).toHaveBeenCalledWith(principal, requisitionId, {
+        status: 'OPEN',
+      });
+    });
+
+    it('rejects invalid status values and malformed UUIDs with 400', async () => {
+      const { app, service } = createTestApp();
+
+      const badUuidRes = await authorizedRequest(
+        app,
+        'post',
+        '/api/v1/requisitions/not-a-uuid/status',
+      ).send({ status: 'OPEN' });
+      expect(badUuidRes.status).toBe(400);
+
+      for (const badBody of [
+        { status: 'DRAFT' },
+        { status: 'INVALID' },
+        {},
+        { status: 'OPEN', extra: true },
+      ]) {
+        const res = await authorizedRequest(
+          app,
+          'post',
+          `/api/v1/requisitions/${requisitionId}/status`,
+        ).send(badBody);
+        expect(res.status).toBe(400);
+      }
+
+      expect(service.transitionStatus).not.toHaveBeenCalled();
+    });
+
+    it('enforces CSRF, Origin, and RECRUITER role on status transitions', async () => {
+      const { app, service } = createTestApp();
+
+      const noCsrfRes = await request(app)
+        .post(`/api/v1/requisitions/${requisitionId}/status`)
+        .set('Cookie', `talentlens_session=${rawToken}`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ status: 'OPEN' });
+      expect(noCsrfRes.status).toBe(403);
+
+      const badOriginRes = await request(app)
+        .post(`/api/v1/requisitions/${requisitionId}/status`)
+        .set('Cookie', `talentlens_session=${rawToken}`)
+        .set('Origin', 'http://evil.example.com')
+        .set('X-CSRF-Token', deriveCsrfToken(rawToken))
+        .send({ status: 'OPEN' });
+      expect(badOriginRes.status).toBe(403);
+
+      const { app: hmApp } = createTestApp({
+        principal: {
+          ...principal,
+          role: 'CLIENT_HIRING_MANAGER',
+        },
+      });
+      const hmRes = await authorizedRequest(
+        hmApp,
+        'post',
+        `/api/v1/requisitions/${requisitionId}/status`,
+      ).send({ status: 'OPEN' });
+      expect(hmRes.status).toBe(403);
+
+      expect(service.transitionStatus).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when requisition is missing or outside recruiter scope', async () => {
+      const { app } = createTestApp({
+        transitionError: new RequisitionNotFoundError(),
+      });
+
+      const response = await authorizedRequest(
+        app,
+        'post',
+        `/api/v1/requisitions/${requisitionId}/status`,
+      ).send({ status: 'OPEN' });
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'not_found' });
+    });
+
+    it('returns 400 when transition is invalid or DRAFT->OPEN lacks an approved scorecard', async () => {
+      const { app: invalidTransitionApp } = createTestApp({
+        transitionError: new RequisitionStatusTransitionError(),
+      });
+      const res1 = await authorizedRequest(
+        invalidTransitionApp,
+        'post',
+        `/api/v1/requisitions/${requisitionId}/status`,
+      ).send({ status: 'CLOSED' });
+      expect(res1.status).toBe(400);
+      expect(res1.body).toEqual({ error: 'invalid_request' });
+
+      const { app: noScorecardApp } = createTestApp({
+        transitionError: new RequisitionScorecardNotApprovedError(),
+      });
+      const res2 = await authorizedRequest(
+        noScorecardApp,
+        'post',
+        `/api/v1/requisitions/${requisitionId}/status`,
+      ).send({ status: 'OPEN' });
+      expect(res2.status).toBe(400);
+      expect(res2.body).toEqual({ error: 'invalid_request' });
+    });
   });
 });

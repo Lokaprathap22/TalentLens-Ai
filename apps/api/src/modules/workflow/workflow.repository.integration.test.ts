@@ -4,6 +4,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../../../../packages/database/dist/generated/prisma/client.js';
 import { createConsentRepository, type ConsentRepository } from '../consent/consent.repository.js';
 import {
+  WorkflowConsentRequiredError,
   WorkflowInterviewNotFoundError,
   WorkflowInterviewStateError,
   WorkflowProhibitedFeedbackError,
@@ -12,6 +13,7 @@ import {
   WorkflowSubmissionStateError,
 } from './workflow.errors.js';
 import { createWorkflowRepository, type WorkflowRepository } from './workflow.repository.js';
+import { createWorkflowService } from './workflow.service.js';
 
 const RUN_INTEGRATION = process.env['TALENTLENS_RUN_PG_INTEGRATION'] === '1';
 
@@ -619,6 +621,27 @@ maybeDescribe('workflow repository & service — live postgresql integration tes
       },
     });
     expect(withdrewEvent).not.toBeNull();
+
+    // 6. Verify recruiter candidate detail surfaces WITHDRAWN status while authorization gates still fail closed
+    const detailAfterWithdrawal = await repository.getCandidateDetail(
+      fx.orgId,
+      fx.recruiterUserId,
+      fx.requisitionId,
+      fx.candidateId,
+    );
+    expect(detailAfterWithdrawal?.consent?.status).toBe('WITHDRAWN');
+    expect(
+      await repository.findActiveConsentForRequisition(fx.orgId, fx.candidateId, fx.requisitionId),
+    ).toBeNull();
+
+    const workflowService = createWorkflowService(repository);
+    await expect(
+      workflowService.recordShortlist(
+        { userId: fx.recruiterUserId, organizationId: fx.orgId, role: 'RECRUITER' },
+        fx.requisitionId,
+        fx.candidateId,
+      ),
+    ).rejects.toThrow(WorkflowConsentRequiredError);
   });
 
   it('proves strict cross-client tenant isolation: Client B cannot view Client A submissions', async () => {
@@ -2053,5 +2076,102 @@ maybeDescribe('workflow repository & service — live postgresql integration tes
       { limit: 50, offset: 0 },
     );
     expect(deniedTimeline).toBeNull();
+  });
+
+  it('M9.3 Step 1 Part A: creates, updates, activates/deactivates, and lists clients with tenant isolation, uniqueness conflict handling, membership preservation, and transactional audit logs', async () => {
+    const fx = await createFixture();
+    const otherFx = await createFixture();
+
+    // 1. Create a new client in fx.orgId
+    const created = await repository.createClient!(fx.orgId, fx.recruiterUserId, {
+      name: '  Beta   Technologies  ',
+    });
+    expect(created.name).toBe('Beta Technologies');
+    expect(created.status).toBe('ACTIVE');
+    expect(created.createdAt).toBeInstanceOf(Date);
+    expect(created.updatedAt).toBeInstanceOf(Date);
+
+    // 2. Duplicate client name (case/whitespace insensitive) in same organization throws WorkflowClientConflictError
+    const auditCountBeforeConflict = await client.auditLog.count({
+      where: { organizationId: fx.orgId, action: 'CLIENT_CREATED' },
+    });
+    await expect(
+      repository.createClient!(fx.orgId, fx.recruiterUserId, {
+        name: 'beta technologies',
+      }),
+    ).rejects.toThrow('A client with this name already exists in the organization');
+    const auditCountAfterConflict = await client.auditLog.count({
+      where: { organizationId: fx.orgId, action: 'CLIENT_CREATED' },
+    });
+    expect(auditCountAfterConflict).toBe(auditCountBeforeConflict);
+
+    // 3. Deactivate the original fixture client (which has an active ClientMembership for fx.clientUserId)
+    const deactivated = await repository.updateClient!(fx.orgId, fx.recruiterUserId, fx.clientId, {
+      status: 'INACTIVE',
+    });
+    expect(deactivated?.status).toBe('INACTIVE');
+
+    // Verify ClientMembership record was NOT modified as a side effect
+    const membershipAfterDeactivate = await client.clientMembership.findUnique({
+      where: { id: fx.clientMembershipId },
+    });
+    expect(membershipAfterDeactivate?.status).toBe('ACTIVE');
+
+    // 4. Recruiter listing without includeInactive returns only ACTIVE clients (Beta Technologies)
+    const activeOnlyRecruiter = await repository.listAuthorizedClients!(
+      fx.orgId,
+      fx.recruiterUserId,
+      'RECRUITER',
+    );
+    expect(activeOnlyRecruiter.map((c) => c.id)).toEqual([created.id]);
+
+    // 5. Recruiter listing with includeInactive: true returns both ACTIVE and INACTIVE clients
+    const allRecruiterClients = await repository.listAuthorizedClients!(
+      fx.orgId,
+      fx.recruiterUserId,
+      'RECRUITER',
+      { includeInactive: true },
+    );
+    expect(allRecruiterClients.map((c) => c.id).sort()).toEqual([created.id, fx.clientId].sort());
+
+    // 6. Client hiring manager never sees INACTIVE client even if includeInactive: true is passed
+    const managerClientsWhileInactive = await repository.listAuthorizedClients!(
+      fx.orgId,
+      fx.clientUserId,
+      'CLIENT_HIRING_MANAGER',
+      { includeInactive: true },
+    );
+    expect(managerClientsWhileInactive).toEqual([]);
+
+    // 7. Reactivate fx.clientId and rename it
+    const reactivated = await repository.updateClient!(fx.orgId, fx.recruiterUserId, fx.clientId, {
+      name: 'Acme Corp Global',
+      status: 'ACTIVE',
+    });
+    expect(reactivated?.name).toBe('Acme Corp Global');
+    expect(reactivated?.status).toBe('ACTIVE');
+
+    // 8. Cross-tenant update returns null and does not mutate other organization's client
+    const crossTenantAttempt = await repository.updateClient!(
+      otherFx.orgId,
+      otherFx.recruiterUserId,
+      fx.clientId,
+      { name: 'Hacked Name' },
+    );
+    expect(crossTenantAttempt).toBeNull();
+
+    // 9. Verify CLIENT_CREATED and CLIENT_UPDATED audit logs
+    const clientAudits = await client.auditLog.findMany({
+      where: {
+        organizationId: fx.orgId,
+        resourceType: 'Client',
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(clientAudits.map((a) => a.action)).toEqual([
+      'CLIENT_CREATED',
+      'CLIENT_UPDATED',
+      'CLIENT_UPDATED',
+    ]);
   });
 });

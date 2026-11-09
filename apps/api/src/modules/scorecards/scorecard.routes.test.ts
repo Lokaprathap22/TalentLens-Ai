@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
+import type { AuthenticatedUserDto } from '../auth/auth.dto.js';
 import type { SessionService } from '../auth/session.service.js';
 import {
   ScorecardInvalidError,
@@ -13,10 +14,12 @@ import {
 const token = 'B'.repeat(43);
 const requisitionId = '123e4567-e89b-42d3-a456-426614174000';
 const scorecardId = '123e4567-e89b-42d3-a456-426614174001';
-const recruiter = {
+const recruiter: AuthenticatedUserDto = {
   userId: 'recruiter-a',
   organizationId: 'organization-a',
-  role: 'RECRUITER' as const,
+  organizationName: 'Organization A',
+  email: 'recruiter-a@example.com',
+  role: 'RECRUITER',
 };
 const scorecard = {
   id: scorecardId,
@@ -33,8 +36,7 @@ const scorecard = {
 
 function createTestApp(
   options: {
-    principal?:
-      typeof recruiter | { userId: string; organizationId: string; role: 'CLIENT_HIRING_MANAGER' };
+    principal?: AuthenticatedUserDto;
     getError?: Error;
     updateError?: Error;
     approveError?: Error;
@@ -106,6 +108,8 @@ describe('scorecard routes', () => {
       principal: {
         userId: 'client-manager-a',
         organizationId: 'organization-a',
+        organizationName: 'Organization A',
+        email: 'client-manager-a@example.com',
         role: 'CLIENT_HIRING_MANAGER',
       },
     });
@@ -148,6 +152,56 @@ describe('scorecard routes', () => {
 
     expect(response.status).toBe(201);
     expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId);
+  });
+
+  it('supports explicit AI, manual, and clone draft creation modes and rejects contradictory inputs', async () => {
+    const { app, service } = createTestApp();
+    const sourceVersionId = '223e4567-e89b-42d3-a456-426614174000';
+
+    // Explicit AI mode
+    const aiRes = await authorizedPost(
+      app,
+      `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+    ).send({ mode: 'ai' });
+    expect(aiRes.status).toBe(201);
+    expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId, { mode: 'ai' });
+
+    // Manual mode
+    const manualRes = await authorizedPost(
+      app,
+      `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+    ).send({ mode: 'manual' });
+    expect(manualRes.status).toBe(201);
+    expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId, { mode: 'manual' });
+
+    // Clone mode
+    const cloneRes = await authorizedPost(
+      app,
+      `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+    ).send({ cloneFromVersionId: sourceVersionId });
+    expect(cloneRes.status).toBe(201);
+    expect(service.generate).toHaveBeenCalledWith(recruiter, requisitionId, {
+      cloneFromVersionId: sourceVersionId,
+    });
+
+    vi.mocked(service.generate).mockClear();
+
+    // Contradictory inputs rejected with 400
+    for (const invalidBody of [
+      { mode: 'ai', cloneFromVersionId: sourceVersionId },
+      { mode: 'manual', cloneFromVersionId: sourceVersionId },
+      { cloneFromVersionId: 'not-a-uuid' },
+      { mode: 'invalid' },
+      { extra: 'field' },
+    ]) {
+      const badRes = await authorizedPost(
+        app,
+        `/api/v1/requisitions/${requisitionId}/scorecards/drafts`,
+      ).send(invalidBody);
+      expect(badRes.status).toBe(400);
+    }
+
+    expect(service.generate).not.toHaveBeenCalled();
   });
 
   it('rejects status and approver injection in edits', async () => {

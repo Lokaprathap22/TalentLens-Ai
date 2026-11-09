@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
-import type { AuthService } from './auth.service.js';
+import {
+  CurrentPasswordIncorrectError,
+  InvalidTokenError,
+  type AuthService,
+} from './auth.service.js';
 import { DEVELOPMENT_SESSION_COOKIE } from './session-cookie.js';
 import type { SessionService } from './session.service.js';
 
@@ -11,6 +15,8 @@ const rawToken = 'A'.repeat(43);
 const user = {
   userId: 'user-1',
   organizationId: 'organization-1',
+  organizationName: 'TalentLens',
+  name: 'Alex Recruiter',
   email: 'recruiter@example.com',
   role: 'RECRUITER' as const,
 };
@@ -26,6 +32,9 @@ function createAuthFakes() {
         ? {
             userId: user.userId,
             organizationId: user.organizationId,
+            organizationName: user.organizationName,
+            name: user.name,
+            email: user.email,
             role: user.role,
           }
         : null,
@@ -37,6 +46,25 @@ function createAuthFakes() {
       token: rawToken,
       expiresAt: new Date('2026-11-04T07:33:39.684Z'),
       user,
+    })),
+    activate: vi.fn(async (token: string, _password: string) => {
+      if (token.includes('bad-token')) throw new InvalidTokenError('Invalid or expired token');
+      return {
+        token: rawToken,
+        expiresAt: new Date('2026-11-04T07:33:39.684Z'),
+        user,
+      };
+    }),
+    changePassword: vi.fn(async (_userId: string, currentPassword: string) => {
+      if (currentPassword === 'wrong') throw new CurrentPasswordIncorrectError();
+    }),
+    requestPasswordReset: vi.fn(async () => {}),
+    confirmPasswordReset: vi.fn(async (token: string) => {
+      if (token.includes('bad-token')) throw new InvalidTokenError('Invalid or expired token');
+    }),
+    updateProfile: vi.fn(async (_userId: string, name: string) => ({
+      ...user,
+      name,
     })),
   };
 
@@ -140,15 +168,19 @@ describe('HTTP authentication layer', () => {
     expect(missing.status).toBe(401);
 
     const cookie = `${DEVELOPMENT_SESSION_COOKIE}=${rawToken}`;
+    const login = await request(app)
+      .post('/api/v1/auth/login')
+      .set('Origin', 'http://localhost:5173')
+      .send({
+        organization: 'TalentLens',
+        email: 'recruiter@example.com',
+        password: 'password',
+      });
+    expect(login.status).toBe(200);
+
     const me = await request(app).get('/api/v1/auth/me').set('Cookie', cookie);
     expect(me.status).toBe(200);
-    expect(me.body).toEqual({
-      user: {
-        userId: user.userId,
-        organizationId: user.organizationId,
-        role: user.role,
-      },
-    });
+    expect(me.body).toEqual({ user });
     expect(JSON.stringify(me.body)).not.toContain('passwordHash');
 
     const csrf = await request(app).get('/api/v1/auth/csrf').set('Cookie', cookie);
@@ -189,5 +221,147 @@ describe('HTTP authentication layer', () => {
       .set('Origin', 'http://localhost:5173');
     expect(repeated.status).toBe(200);
     expect(repeated.body).toEqual({ status: 'ok' });
+  });
+
+  it('handles account activation: rejects bad payload, rejects invalid token, sets session on success', async () => {
+    const { app, authService } = createTestApp();
+
+    const badPayload = await request(app)
+      .post('/api/v1/auth/activate')
+      .set('Origin', 'http://localhost:5173')
+      .send({ token: 'short', password: '123' });
+    expect(badPayload.status).toBe(400);
+
+    const invalidToken = await request(app)
+      .post('/api/v1/auth/activate')
+      .set('Origin', 'http://localhost:5173')
+      .send({ token: 'bad-token-value-1234', password: 'new-secure-password' });
+    expect(invalidToken.status).toBe(400);
+    expect(invalidToken.body.error).toBe('invalid_token');
+
+    const success = await request(app)
+      .post('/api/v1/auth/activate')
+      .set('Origin', 'http://localhost:5173')
+      .send({ token: 'valid-activation-token-123', password: 'new-secure-password' });
+    expect(success.status).toBe(200);
+    expect(success.body).toEqual({ user });
+    expect(success.headers['set-cookie']?.[0]).toContain(DEVELOPMENT_SESSION_COOKIE);
+    expect(authService.activate).toHaveBeenCalledWith(
+      'valid-activation-token-123',
+      'new-secure-password',
+    );
+  });
+
+  it('handles password change: requires session & CSRF, rejects wrong current password, updates on valid', async () => {
+    const { app, authService } = createTestApp();
+    const cookie = `${DEVELOPMENT_SESSION_COOKIE}=${rawToken}`;
+    const csrfToken = deriveCsrfToken(rawToken);
+
+    const unauth = await request(app)
+      .post('/api/v1/auth/password/change')
+      .set('Origin', 'http://localhost:5173')
+      .send({ currentPassword: 'pass', newPassword: 'new-secure-password' });
+    expect(unauth.status).toBe(401);
+
+    const noCsrf = await request(app)
+      .post('/api/v1/auth/password/change')
+      .set('Cookie', cookie)
+      .set('Origin', 'http://localhost:5173')
+      .send({ currentPassword: 'pass', newPassword: 'new-secure-password' });
+    expect(noCsrf.status).toBe(403);
+
+    const wrongPass = await request(app)
+      .post('/api/v1/auth/password/change')
+      .set('Cookie', cookie)
+      .set('Origin', 'http://localhost:5173')
+      .set('X-CSRF-Token', csrfToken)
+      .send({ currentPassword: 'wrong', newPassword: 'new-secure-password' });
+    expect(wrongPass.status).toBe(400);
+    expect(wrongPass.body.error).toBe('current_password_incorrect');
+
+    const success = await request(app)
+      .post('/api/v1/auth/password/change')
+      .set('Cookie', cookie)
+      .set('Origin', 'http://localhost:5173')
+      .set('X-CSRF-Token', csrfToken)
+      .send({ currentPassword: 'valid-pass', newPassword: 'brand-new-password-123' });
+    expect(success.status).toBe(200);
+    expect(success.body.status).toBe('ok');
+    expect(authService.changePassword).toHaveBeenCalledWith(
+      'user-1',
+      'valid-pass',
+      'brand-new-password-123',
+      rawToken,
+    );
+  });
+
+  it('handles password reset request: returns generic 200 to prevent account enumeration', async () => {
+    const { app, authService } = createTestApp();
+
+    const invalidEmail = await request(app)
+      .post('/api/v1/auth/password/reset/request')
+      .set('Origin', 'http://localhost:5173')
+      .send({ organization: 'TalentLens', email: 'not-an-email' });
+    expect(invalidEmail.status).toBe(400);
+
+    const response = await request(app)
+      .post('/api/v1/auth/password/reset/request')
+      .set('Origin', 'http://localhost:5173')
+      .send({ organization: 'TalentLens', email: 'user@example.com' });
+    expect(response.status).toBe(200);
+    expect(response.body.message).toContain('If an account matches');
+    expect(authService.requestPasswordReset).toHaveBeenCalledWith('TalentLens', 'user@example.com');
+  });
+
+  it('handles password reset confirmation: rejects invalid token, resets password on valid', async () => {
+    const { app, authService } = createTestApp();
+
+    const invalidToken = await request(app)
+      .post('/api/v1/auth/password/reset/confirm')
+      .set('Origin', 'http://localhost:5173')
+      .send({ token: 'bad-token-value-1234', newPassword: 'brand-new-password-123' });
+    expect(invalidToken.status).toBe(400);
+    expect(invalidToken.body.error).toBe('invalid_token');
+
+    const success = await request(app)
+      .post('/api/v1/auth/password/reset/confirm')
+      .set('Origin', 'http://localhost:5173')
+      .send({ token: 'valid-reset-token-1234', newPassword: 'brand-new-password-123' });
+    expect(success.status).toBe(200);
+    expect(success.body.status).toBe('ok');
+    expect(authService.confirmPasswordReset).toHaveBeenCalledWith(
+      'valid-reset-token-1234',
+      'brand-new-password-123',
+    );
+  });
+
+  it('handles profile update: requires session & CSRF, validates input, returns updated user', async () => {
+    const { app, authService } = createTestApp();
+    const cookie = `${DEVELOPMENT_SESSION_COOKIE}=${rawToken}`;
+    const csrfToken = deriveCsrfToken(rawToken);
+
+    const unauth = await request(app)
+      .patch('/api/v1/auth/profile')
+      .set('Origin', 'http://localhost:5173')
+      .send({ name: 'Alex' });
+    expect(unauth.status).toBe(401);
+
+    const emptyName = await request(app)
+      .patch('/api/v1/auth/profile')
+      .set('Cookie', cookie)
+      .set('Origin', 'http://localhost:5173')
+      .set('X-CSRF-Token', csrfToken)
+      .send({ name: '   ' });
+    expect(emptyName.status).toBe(400);
+
+    const success = await request(app)
+      .patch('/api/v1/auth/profile')
+      .set('Cookie', cookie)
+      .set('Origin', 'http://localhost:5173')
+      .set('X-CSRF-Token', csrfToken)
+      .send({ name: 'Alexandria Recruiter' });
+    expect(success.status).toBe(200);
+    expect(success.body.user.name).toBe('Alexandria Recruiter');
+    expect(authService.updateProfile).toHaveBeenCalledWith('user-1', 'Alexandria Recruiter');
   });
 });

@@ -6,9 +6,21 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Prisma } from '@talentlens/database';
 import { PrismaClient } from '../../../../../packages/database/dist/generated/prisma/client.js';
 
-import { createConsentRepository, type ConsentRepository } from './consent.repository.js';
+import {
+  computeContactFingerprint,
+  createConsentRepository,
+  type ConsentRepository,
+} from './consent.repository.js';
 import { createResumeRepository, type ResumeRepository } from '../resumes/resume.repository.js';
 import { hashToken } from './consent.service.js';
+import { encryptEmailPayload } from '../email/email.crypto.js';
+import { PostgresEmailOutboxStore } from '../email/email.outbox.js';
+import { InMemoryEmailProvider } from '../email/email.provider.js';
+import { TransactionalEmailService } from '../email/email.service.js';
+import {
+  WorkerEmailDispatcher,
+  type EmailDispatcherProvider,
+} from '../../../../worker/src/email-dispatcher.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyPrismaClient = InstanceType<typeof PrismaClient> & Record<string, any>;
@@ -144,16 +156,36 @@ maybeDescribe('consent repository — live postgresql integration tests', () => 
     });
 
     async function cleanup() {
+      await client.clientDecision.deleteMany({ where: { organizationId: orgId } });
+      await client.interviewProposal.deleteMany({ where: { organizationId: orgId } });
+      await client.pipelineEvent.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateSubmission.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateShortlist.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateReview.deleteMany({ where: { organizationId: orgId } });
+      await client.evidenceSnippet.deleteMany({ where: { organizationId: orgId } });
+      await client.criterionAssessment.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateAssessment.deleteMany({ where: { organizationId: orgId } });
+      await client.scorecardCriterion.deleteMany({
+        where: { scorecardVersion: { organizationId: orgId } },
+      });
+      await client.scorecardVersion.deleteMany({ where: { organizationId: orgId } });
+      await client.assessmentText.deleteMany({ where: { organizationId: orgId } });
       await client.documentExtraction.deleteMany({ where: { organizationId: orgId } });
       await client.processingJob.deleteMany({ where: { organizationId: orgId } });
       await client.resumeDocument.deleteMany({ where: { organizationId: orgId } });
       await client.processingBatch.deleteMany({ where: { organizationId: orgId } });
-      await client.consentWithdrawalRequest.deleteMany({ where: { candidateId } });
-      await client.consentInvitation.deleteMany({ where: { candidateId } });
-      await client.candidateConsent.deleteMany({ where: { candidateId } });
+      await client.candidateSkill.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateProfile.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateDeletionVerification.deleteMany({ where: { organizationId: orgId } });
+      await client.consentWithdrawalRequest.deleteMany({ where: { organizationId: orgId } });
+      await client.consentInvitation.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateConsent.deleteMany({ where: { organizationId: orgId } });
+      await client.candidateIdentity.deleteMany({ where: { organizationId: orgId } });
+      await client.deletionRequest.deleteMany({ where: { organizationId: orgId } });
+      await client.emailOutbox.deleteMany({ where: { organizationId: orgId } });
       await client.auditLog.deleteMany({ where: { organizationId: orgId } });
       await client.requisition.deleteMany({ where: { organizationId: orgId } });
-      await client.candidate.deleteMany({ where: { id: candidateId } });
+      await client.candidate.deleteMany({ where: { organizationId: orgId } });
       await client.client.deleteMany({ where: { organizationId: orgId } });
       await client.user.deleteMany({ where: { organizationId: orgId } });
       await client.organization.deleteMany({ where: { id: orgId } });
@@ -989,5 +1021,1138 @@ maybeDescribe('consent repository — live postgresql integration tests', () => 
     } finally {
       await fixture.cleanup();
     }
+  });
+
+  it('deletion verification: locates candidates across non-active consents and CandidateIdentity, deduplicates per org/candidate, stores zero plaintext email, and coalesces concurrent requests', async () => {
+    const fixture = await createFixture();
+    try {
+      const targetEmail = `erase-${randomUUID().slice(0, 8)}@example.com`;
+      const secondCandId = randomUUID();
+
+      await client.candidate.create({
+        data: {
+          id: secondCandId,
+          organizationId: fixture.orgId,
+          candidateCode: `CAN-${randomUUID().slice(0, 8).toUpperCase()}`,
+          recordStatus: 'ACTIVE',
+        },
+      });
+
+      // Candidate 1 has DECLINED invitation on Req A and EXPIRED invitation on Req B (0 active consents)
+      await client.consentInvitation.createMany({
+        data: [
+          {
+            organizationId: fixture.orgId,
+            candidateId: fixture.candidateId,
+            requisitionId: fixture.reqAId,
+            createdById: fixture.userId,
+            tokenHash: hashToken(randomBytes(32).toString('hex')),
+            email: targetEmail,
+            purpose: 'HIRING_USE',
+            status: 'DECLINED',
+            policyVersion: '2026-11-v1',
+            noticeTextHash: 'hash-a',
+            deliveryStatus: 'SENT',
+            expiresAt: new Date(Date.now() + 86400000),
+          },
+          {
+            organizationId: fixture.orgId,
+            candidateId: fixture.candidateId,
+            requisitionId: fixture.reqBId,
+            createdById: fixture.userId,
+            tokenHash: hashToken(randomBytes(32).toString('hex')),
+            email: targetEmail,
+            purpose: 'HIRING_USE',
+            status: 'EXPIRED',
+            policyVersion: '2026-11-v1',
+            noticeTextHash: 'hash-b',
+            deliveryStatus: 'SENT',
+            expiresAt: new Date(Date.now() - 86400000),
+          },
+        ],
+      });
+
+      // Candidate 2 has NO invitations at all, ONLY CandidateIdentity with HMAC fingerprint
+      await client.candidateIdentity.create({
+        data: {
+          candidateId: secondCandId,
+          organizationId: fixture.orgId,
+          contactFingerprint: computeContactFingerprint(targetEmail),
+          identityStatus: 'ACTIVE',
+        },
+      });
+
+      const matches = await repository.findCandidatesForDeletionByEmail(targetEmail.toUpperCase());
+      expect(matches).toHaveLength(2);
+      expect(matches.map((m) => m.candidateId).sort()).toEqual(
+        [fixture.candidateId, secondCandId].sort(),
+      );
+
+      // Verify schema guarantees zero plaintext email column on candidate_deletion_verifications
+      const columns = await client.$queryRaw<Array<{ column_name: string }>>(Prisma.sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'candidate_deletion_verifications'
+      `);
+      expect(columns.map((c: { column_name: string }) => c.column_name)).not.toContain('email');
+
+      // Concurrent duplicate requests for Candidate 1 coalesce to a single PENDING verification & single outbox row
+      const tokenHash1 = hashToken(randomBytes(32).toString('hex'));
+      const tokenHash2 = hashToken(randomBytes(32).toString('hex'));
+      const [ver1, ver2] = await Promise.all([
+        repository.createDeletionVerification({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          tokenHash: tokenHash1,
+          email: targetEmail,
+          expiresAt: new Date(Date.now() + 86400000),
+          emailPayload: {
+            subject: 'Confirm deletion 1',
+            html: '<p>Delete 1</p>',
+            text: 'Delete 1',
+            idempotencyKey: `del-ver-${fixture.candidateId}-1`,
+          },
+        }),
+        repository.createDeletionVerification({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          tokenHash: tokenHash2,
+          email: targetEmail,
+          expiresAt: new Date(Date.now() + 86400000),
+          emailPayload: {
+            subject: 'Confirm deletion 2',
+            html: '<p>Delete 2</p>',
+            text: 'Delete 2',
+            idempotencyKey: `del-ver-${fixture.candidateId}-2`,
+          },
+        }),
+      ]);
+
+      expect(ver1).not.toBeNull();
+      expect(ver2).not.toBeNull();
+      const coalescedCount = [ver1!.coalesced, ver2!.coalesced].filter(Boolean).length;
+      expect(coalescedCount).toBe(1);
+
+      const pendingVerifications = await client.candidateDeletionVerification.findMany({
+        where: {
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          status: 'PENDING',
+        },
+      });
+      expect(pendingVerifications).toHaveLength(1);
+
+      const outboxRows = await client.emailOutbox.findMany({
+        where: { organizationId: fixture.orgId, messageType: 'candidate_deletion_verification' },
+      });
+      expect(outboxRows).toHaveLength(1);
+      expect(outboxRows[0]?.recipientEmail).toBeNull();
+      expect(outboxRows[0]?.payloadJson).toEqual({ candidateId: fixture.candidateId });
+
+      // Outside coalesce window, issuing a new verification supersedes prior PENDING row without violating partial unique index
+      const tokenHash3 = hashToken(randomBytes(32).toString('hex'));
+      const ver3 = await repository.createDeletionVerification({
+        organizationId: fixture.orgId,
+        candidateId: fixture.candidateId,
+        tokenHash: tokenHash3,
+        email: targetEmail,
+        expiresAt: new Date(Date.now() + 86400000),
+        coalesceWindowMs: 0,
+      });
+      expect(ver3?.coalesced).toBe(false);
+
+      const cancelledRows = await client.candidateDeletionVerification.findMany({
+        where: {
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          status: 'CANCELLED',
+        },
+      });
+      expect(cancelledRows).toHaveLength(1);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('confirmCandidateDeletion enforces single-use token consumption, rejects replays, detaches processing jobs, and cascades full PostgreSQL erasure', async () => {
+    const fixture = await createFixture();
+    try {
+      const targetEmail = `cascade-${randomUUID().slice(0, 8)}@example.com`;
+      const objectKey = `private/${fixture.orgId}/cascade-cv.pdf`;
+
+      await client.candidateIdentity.create({
+        data: {
+          candidateId: fixture.candidateId,
+          organizationId: fixture.orgId,
+          fullNameEncrypted: 'enc-name',
+          emailEncrypted: 'enc-email',
+          phoneEncrypted: 'enc-phone',
+          contactFingerprint: computeContactFingerprint(targetEmail),
+          identityStatus: 'ACTIVE',
+        },
+      });
+
+      const consent = await client.candidateConsent.create({
+        data: {
+          candidateId: fixture.candidateId,
+          organizationId: fixture.orgId,
+          requisitionId: fixture.reqAId,
+          purpose: 'HIRING_USE',
+          status: 'ACTIVE',
+          policyVersion: '2026-11-v1',
+          captureMethod: 'CANDIDATE_PORTAL',
+          capturedAt: new Date(),
+        },
+      });
+
+      await client.consentInvitation.create({
+        data: {
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          requisitionId: fixture.reqAId,
+          createdById: fixture.userId,
+          tokenHash: hashToken(randomBytes(32).toString('hex')),
+          email: targetEmail,
+          purpose: 'HIRING_USE',
+          status: 'ACCEPTED',
+          policyVersion: '2026-11-v1',
+          noticeTextHash: 'hash-cascade',
+          deliveryStatus: 'SENT',
+          expiresAt: new Date(Date.now() + 86400000),
+        },
+      });
+
+      const batch = await client.processingBatch.create({
+        data: {
+          organizationId: fixture.orgId,
+          requisitionId: fixture.reqAId,
+          createdById: fixture.userId,
+          totalFiles: 1,
+          status: 'PROCESSING',
+        },
+      });
+
+      const resume = await client.resumeDocument.create({
+        data: {
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          objectKey,
+          fileType: 'PDF',
+          mimeType: 'application/pdf',
+          sha256: randomBytes(32).toString('hex'),
+          sizeBytes: BigInt(2048),
+          version: 1,
+          parseStatus: 'PARSED',
+          uploadedById: fixture.userId,
+        },
+      });
+
+      const job = await client.processingJob.create({
+        data: {
+          batchId: batch.id,
+          organizationId: fixture.orgId,
+          resumeDocumentId: resume.id,
+          jobType: 'ASSESS_CANDIDATE',
+          status: 'QUEUED',
+          attempts: 0,
+        },
+      });
+
+      const extraction = await client.documentExtraction.create({
+        data: {
+          organizationId: fixture.orgId,
+          resumeDocumentId: resume.id,
+          version: 1,
+          extractedText: 'Senior Engineer with 10 years TypeScript',
+          pageMapJson: { page1: { startOffset: 0, endOffset: 40 } },
+          parser: 'pdf-parser',
+          ocrUsed: false,
+          qualityStatus: 'COMPLETE',
+        },
+      });
+
+      const assessmentText = await client.assessmentText.create({
+        data: {
+          organizationId: fixture.orgId,
+          documentExtractionId: extraction.id,
+          resumeDocumentId: resume.id,
+          version: 1,
+          redactedText: '[CANDIDATE] Senior Engineer with 10 years TypeScript',
+          pageMapJson: { page1: { startOffset: 0, endOffset: 52 } },
+          redactionMapJson: {},
+          redactorVersion: 'v1',
+        },
+      });
+
+      const scorecardVersion = await client.scorecardVersion.create({
+        data: {
+          organizationId: fixture.orgId,
+          requisitionId: fixture.reqAId,
+          version: 1,
+          status: 'APPROVED',
+          weightsJson: { ts: 1 },
+          approvedById: fixture.userId,
+          approvedAt: new Date(),
+        },
+      });
+
+      const criterion = await client.scorecardCriterion.create({
+        data: {
+          scorecardVersionId: scorecardVersion.id,
+          key: 'ts',
+          label: 'TypeScript',
+          category: 'SKILL',
+          requirementType: 'MUST_HAVE',
+          weight: '1.0000',
+          ruleJson: {},
+          active: true,
+          displayOrder: 1,
+        },
+      });
+
+      const assessment = await client.candidateAssessment.create({
+        data: {
+          organizationId: fixture.orgId,
+          requisitionId: fixture.reqAId,
+          candidateId: fixture.candidateId,
+          resumeDocumentId: resume.id,
+          documentExtractionId: extraction.id,
+          scorecardVersionId: scorecardVersion.id,
+          assessmentTextId: assessmentText.id,
+          score: '88.00',
+          coverage: '100.00',
+          status: 'COMPLETE',
+          formulaVersion: 'v1',
+          modelMetadataJson: {},
+        },
+      });
+
+      const critAssessment = await client.criterionAssessment.create({
+        data: {
+          organizationId: fixture.orgId,
+          assessmentId: assessment.id,
+          criterionId: criterion.id,
+          scorecardVersionId: scorecardVersion.id,
+          resumeDocumentId: resume.id,
+          assessmentTextId: assessmentText.id,
+          documentExtractionId: extraction.id,
+          status: 'MATCH',
+          normalizedValue: '1.0000',
+          explanation: 'Meets requirement',
+        },
+      });
+
+      await client.evidenceSnippet.create({
+        data: {
+          organizationId: fixture.orgId,
+          criterionAssessmentId: critAssessment.id,
+          assessmentId: assessment.id,
+          scorecardVersionId: scorecardVersion.id,
+          assessmentTextId: assessmentText.id,
+          resumeDocumentId: resume.id,
+          documentExtractionId: extraction.id,
+          quote: '10 years TypeScript',
+          pageNumber: 1,
+          startOffset: 24,
+          endOffset: 43,
+          verified: true,
+        },
+      });
+
+      const profile = await client.candidateProfile.create({
+        data: {
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          currentRole: 'Engineer',
+          profileVersion: 1,
+        },
+      });
+
+      await client.candidateSkill.create({
+        data: {
+          organizationId: fixture.orgId,
+          candidateProfileId: profile.id,
+          skillNameNormalized: 'typescript',
+        },
+      });
+
+      // Seed a pending candidate-linked EmailOutbox row to prove cancellation + redaction
+      const pendingEmail = await client.emailOutbox.create({
+        data: {
+          organizationId: fixture.orgId,
+          idempotencyKey: `cand-email-${fixture.candidateId}`,
+          messageType: 'consent_invitation',
+          recipientEmail: null,
+          recipientRole: 'CANDIDATE',
+          payloadJson: { candidateId: fixture.candidateId },
+          encryptedPayload: 'v1:v1:iv:tag:cipher',
+          keyId: 'v1',
+          status: 'PENDING',
+          attempts: 0,
+          maxAttempts: 3,
+        },
+      });
+
+      const rawToken = randomBytes(32).toString('hex');
+      const tokenHash = hashToken(rawToken);
+      await repository.createDeletionVerification({
+        organizationId: fixture.orgId,
+        candidateId: fixture.candidateId,
+        tokenHash,
+        email: targetEmail,
+        expiresAt: new Date(Date.now() + 86400000),
+      });
+
+      const deletedObjectKeys: string[] = [];
+      const confirmResult = await repository.confirmCandidateDeletion(tokenHash, async (key) => {
+        deletedObjectKeys.push(key);
+      });
+
+      expect(confirmResult?.status).toBe('COMPLETED');
+      expect(confirmResult?.candidateId).toBe(fixture.candidateId);
+      expect(deletedObjectKeys).toEqual([objectKey]);
+
+      // Replay must be rejected cleanly (single-use)
+      const replayResult = await repository.confirmCandidateDeletion(tokenHash, async () => {});
+      expect(replayResult).toBeNull();
+
+      // Verify full cascading deletion & redaction in PostgreSQL
+      const candRow = await client.candidate.findUnique({ where: { id: fixture.candidateId } });
+      expect(candRow?.recordStatus).toBe('DELETED');
+
+      const identRow = await client.candidateIdentity.findUnique({
+        where: { candidateId: fixture.candidateId },
+      });
+      expect(identRow?.identityStatus).toBe('REDACTED');
+      expect(identRow?.fullNameEncrypted).toBeNull();
+      expect(identRow?.emailEncrypted).toBeNull();
+      expect(identRow?.phoneEncrypted).toBeNull();
+      expect(identRow?.contactFingerprint).toBeNull();
+
+      const updatedJob = await client.processingJob.findUnique({ where: { id: job.id } });
+      expect(updatedJob?.status).toBe('FAILED');
+      expect(updatedJob?.lastErrorCode).toBe('CANDIDATE_DATA_DELETED');
+      expect(updatedJob?.resumeDocumentId).toBeNull();
+
+      const updatedEmail = await client.emailOutbox.findUnique({ where: { id: pendingEmail.id } });
+      expect(updatedEmail?.status).toBe('FAILED');
+      expect(updatedEmail?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+      expect(updatedEmail?.encryptedPayload).toBeNull();
+
+      expect(
+        await client.resumeDocument.count({ where: { candidateId: fixture.candidateId } }),
+      ).toBe(0);
+      expect(
+        await client.documentExtraction.count({ where: { organizationId: fixture.orgId } }),
+      ).toBe(0);
+      expect(
+        await client.candidateAssessment.count({ where: { candidateId: fixture.candidateId } }),
+      ).toBe(0);
+      expect(await client.evidenceSnippet.count({ where: { organizationId: fixture.orgId } })).toBe(
+        0,
+      );
+      expect(
+        await client.candidateDeletionVerification.count({
+          where: { candidateId: fixture.candidateId },
+        }),
+      ).toBe(0);
+      expect(await client.candidateConsent.count({ where: { id: consent.id } })).toBe(0);
+      expect(
+        await client.consentInvitation.count({ where: { candidateId: fixture.candidateId } }),
+      ).toBe(0);
+      expect(
+        await client.candidateProfile.count({ where: { candidateId: fixture.candidateId } }),
+      ).toBe(0);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  describe('P1-02: Complete candidate email-outbox erasure across all states & races', () => {
+    async function seedEncryptedOutboxRow(params: {
+      organizationId: string | null;
+      candidateId?: string | undefined;
+      idempotencyKey?: string | undefined;
+      messageType?: string | undefined;
+      recipientRole?: string | undefined;
+      email: string;
+      subject: string;
+      status: 'PENDING' | 'SENDING' | 'SENT' | 'FAILED' | 'PERMANENTLY_REJECTED';
+      lastError?: string | null | undefined;
+      lastErrorCode?: string | null | undefined;
+      payloadJson?: Record<string, unknown> | null | undefined;
+      attempts?: number | undefined;
+      leaseToken?: string | null | undefined;
+      leaseExpiresAt?: Date | null | undefined;
+      lockedBy?: string | null | undefined;
+      sentAt?: Date | null | undefined;
+      withEncryptedPayload?: boolean | undefined;
+      plaintextColumns?: boolean | undefined;
+    }): Promise<string> {
+      const id = randomUUID();
+      const idemKey =
+        params.idempotencyKey ??
+        `p1-02-${params.messageType ?? 'consent_invitation'}-${randomUUID()}`;
+      const withEnc = params.withEncryptedPayload ?? params.status !== 'SENT';
+      const encrypted = withEnc
+        ? encryptEmailPayload(
+            {
+              recipientEmail: params.email,
+              subject: params.subject,
+              html: `<p>${params.subject} for ${params.email}</p>`,
+              text: `${params.subject} for ${params.email}`,
+              metadata:
+                params.payloadJson ??
+                (params.candidateId ? { candidateId: params.candidateId } : undefined),
+            },
+            { recordId: id, idempotencyKey: idemKey },
+          )
+        : { encryptedPayload: null, keyId: null };
+
+      await client.emailOutbox.create({
+        data: {
+          id,
+          organizationId: params.organizationId,
+          idempotencyKey: idemKey,
+          messageType: params.messageType ?? 'consent_invitation',
+          recipientEmail: params.plaintextColumns ? params.email : null,
+          recipientRole: params.recipientRole ?? 'CANDIDATE',
+          subject: params.plaintextColumns ? params.subject : null,
+          html: params.plaintextColumns ? `<p>${params.email}</p>` : null,
+          text: params.plaintextColumns ? params.email : null,
+          payloadJson:
+            params.payloadJson !== undefined
+              ? params.payloadJson === null
+                ? Prisma.DbNull
+                : (params.payloadJson as Prisma.InputJsonValue)
+              : params.candidateId
+                ? { candidateId: params.candidateId }
+                : Prisma.DbNull,
+          encryptedPayload: encrypted.encryptedPayload,
+          keyId: encrypted.keyId ?? (params.status === 'SENT' ? 'v1' : null),
+          status: params.status,
+          attempts: params.attempts ?? (params.status === 'PENDING' ? 0 : 1),
+          maxAttempts: 3,
+          leaseToken: params.leaseToken ?? null,
+          leaseExpiresAt: params.leaseExpiresAt ?? null,
+          lockedBy: params.lockedBy ?? null,
+          lastError: params.lastError ?? null,
+          lastErrorCode: params.lastErrorCode ?? null,
+          sentAt: params.sentAt ?? null,
+        },
+      });
+      return id;
+    }
+
+    function assertIrrecoverablyErased(
+      row: {
+        id: string;
+        idempotencyKey: string;
+        encryptedPayload: string | null;
+        keyId: string | null;
+        recipientEmail: string | null;
+        subject: string | null;
+        html: string | null;
+        text: string | null;
+        payloadJson: unknown;
+        lastError: string | null;
+        leaseToken: string | null;
+        leaseExpiresAt: Date | null;
+        lockedBy: string | null;
+        nextAttemptAt: Date | null;
+      } | null,
+      secrets: string[],
+      allowedPayloadKeys: string[],
+    ): void {
+      expect(row).not.toBeNull();
+      const r = row!;
+      expect(r.encryptedPayload).toBeNull();
+      expect(r.keyId).toBeNull();
+      expect(r.recipientEmail).toBeNull();
+      expect(r.subject).toBeNull();
+      expect(r.html).toBeNull();
+      expect(r.text).toBeNull();
+      expect(r.leaseToken).toBeNull();
+      expect(r.leaseExpiresAt).toBeNull();
+      expect(r.lockedBy).toBeNull();
+      expect(r.nextAttemptAt).toBeNull();
+      expect(r.idempotencyKey).toBe(`erased:${r.id}`);
+
+      expect(r.payloadJson).toBeTruthy();
+      expect(typeof r.payloadJson).toBe('object');
+      const pj = r.payloadJson as Record<string, unknown>;
+      expect(pj['erased']).toBe(true);
+      expect(typeof pj['erasedAt']).toBe('string');
+      expect(Object.keys(pj).sort()).toEqual([...allowedPayloadKeys].sort());
+
+      const serialized = JSON.stringify(r);
+      for (const secret of secrets) {
+        expect(serialized).not.toContain(secret);
+      }
+    }
+
+    it('erases PENDING, SENDING, SENT, FAILED, PERMANENTLY_REJECTED, and CANCELLED rows while preserving unrelated messages', async () => {
+      const fixture = await createFixture();
+      const secondOrgId = randomUUID();
+      const otherCandId = randomUUID();
+      const org2CandId = randomUUID();
+      const secretEmail = `erase.all.${randomUUID().slice(0, 8)}@candidate-privacy.example`;
+      const otherEmail = `keep.other.${randomUUID().slice(0, 8)}@candidate-privacy.example`;
+      const orgAdminEmail = `recruiter.keep.${randomUUID().slice(0, 8)}@acme.example`;
+      const createdExtraOutboxIds: string[] = [];
+
+      try {
+        await client.candidate.create({
+          data: {
+            id: otherCandId,
+            organizationId: fixture.orgId,
+            candidateCode: `CAN-KEEP-${randomUUID().slice(0, 6).toUpperCase()}`,
+            recordStatus: 'ACTIVE',
+          },
+        });
+        await client.organization.create({
+          data: {
+            id: secondOrgId,
+            name: `Other Org ${secondOrgId.slice(0, 6)}`,
+            normalizedName: `other-org-${secondOrgId.slice(0, 8)}`,
+          },
+        });
+        await client.candidate.create({
+          data: {
+            id: org2CandId,
+            organizationId: secondOrgId,
+            candidateCode: `CAN-ORG2-${randomUUID().slice(0, 6).toUpperCase()}`,
+            recordStatus: 'ACTIVE',
+          },
+        });
+
+        // Seed all 6 lifecycle states & multiple message types for target candidate
+        const pendingId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'consent_invitation',
+          email: secretEmail,
+          subject: `Pending Invite ${secretEmail}`,
+          status: 'PENDING',
+          payloadJson: { candidateId: fixture.candidateId, requisitionId: fixture.reqAId },
+        });
+        const sendingId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'client_submission',
+          recipientRole: 'CLIENT_HIRING_MANAGER',
+          email: secretEmail,
+          subject: `Submission Notice ${secretEmail}`,
+          status: 'SENDING',
+          leaseToken: randomUUID(),
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+          lockedBy: 'worker-in-flight',
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        const sentWithMsgId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'withdrawal_verification',
+          email: secretEmail,
+          subject: 'Sent Verification',
+          status: 'SENT',
+          sentAt: new Date('2026-11-08T10:00:00Z'),
+          attempts: 1,
+          withEncryptedPayload: false,
+          payloadJson: {
+            candidateId: fixture.candidateId,
+            consentId: randomUUID(),
+            messageId: 'smtp-queue-id-7788',
+          },
+        });
+        const sentNoMsgId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'interview_notification',
+          recipientRole: 'CLIENT_HIRING_MANAGER',
+          email: secretEmail,
+          subject: 'Sent Interview Notice',
+          status: 'SENT',
+          sentAt: new Date('2026-11-08T11:00:00Z'),
+          attempts: 2,
+          withEncryptedPayload: false,
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        const failedExhaustedId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'consent_invitation',
+          email: secretEmail,
+          subject: `Failed Invite for ${secretEmail}`,
+          status: 'FAILED',
+          attempts: 3,
+          lastErrorCode: 'MAX_ATTEMPTS_EXHAUSTED',
+          lastError: `421 Deferred delivery to <${secretEmail}> failed after 3 attempts`,
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        const permRejectedId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'candidate_deletion_verification',
+          email: secretEmail,
+          subject: `Rejected Deletion Link for ${secretEmail}`,
+          status: 'PERMANENTLY_REJECTED',
+          attempts: 1,
+          lastErrorCode: 'PERMANENT_REJECTION',
+          lastError: `550 5.1.1 <${secretEmail}>: Recipient address rejected`,
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        // CANCELLED equivalent (status=FAILED + CANDIDATE_DELETION_PENDING) with lingering payload metadata / keyId / plaintext leaks
+        const cancelledId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'client_feedback',
+          recipientRole: 'RECRUITER',
+          email: secretEmail,
+          subject: `Pre-cancelled Email ${secretEmail}`,
+          status: 'FAILED',
+          lastErrorCode: 'CANDIDATE_DELETION_PENDING',
+          lastError: 'Candidate deletion requested earlier',
+          plaintextColumns: true,
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        // Row matched via organizationId=NULL and idempotencyKey containing candidateId (defense in depth)
+        const nullOrgId = await seedEncryptedOutboxRow({
+          organizationId: null,
+          idempotencyKey: `cand-legacy-${fixture.candidateId}-notif`,
+          messageType: 'client_submission',
+          email: secretEmail,
+          subject: `Null Org Legacy ${secretEmail}`,
+          status: 'PENDING',
+          payloadJson: null,
+        });
+        createdExtraOutboxIds.push(nullOrgId);
+
+        // Unrelated messages that MUST remain untouched & decryptable:
+        // 1) Another candidate in same org
+        const otherCandOutboxId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: otherCandId,
+          messageType: 'consent_invitation',
+          email: otherEmail,
+          subject: 'Keep Same-Org Candidate Invite',
+          status: 'PENDING',
+          payloadJson: { candidateId: otherCandId },
+        });
+        // 2) Candidate in another org (same org separation)
+        const org2CandOutboxId = await seedEncryptedOutboxRow({
+          organizationId: secondOrgId,
+          candidateId: org2CandId,
+          messageType: 'consent_invitation',
+          email: otherEmail,
+          subject: 'Keep Other-Org Candidate Invite',
+          status: 'FAILED',
+          lastErrorCode: 'MAX_ATTEMPTS_EXHAUSTED',
+          lastError: `421 Temp error for ${otherEmail}`,
+          payloadJson: { candidateId: org2CandId },
+        });
+        createdExtraOutboxIds.push(org2CandOutboxId);
+        // 3) Org-level recruiter activation email (no candidateId)
+        const orgAdminOutboxId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          messageType: 'account_activation',
+          recipientRole: 'RECRUITER',
+          email: orgAdminEmail,
+          subject: 'Activate Recruiter Account',
+          status: 'PENDING',
+          payloadJson: null,
+        });
+
+        // Execute candidate-initiated self-deletion (also verifies createDeletionRequest/processDeletion equivalence)
+        const rawToken = randomBytes(32).toString('hex');
+        const tokenHash = hashToken(rawToken);
+        await repository.createDeletionVerification({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          tokenHash,
+          email: secretEmail,
+          expiresAt: new Date(Date.now() + 86400_000),
+        });
+
+        const delResult = await repository.confirmCandidateDeletion(tokenHash, async () => {});
+        expect(delResult?.status).toBe('COMPLETED');
+
+        const secrets = [secretEmail, fixture.candidateId, fixture.reqAId];
+        const outboxStore = new PostgresEmailOutboxStore(client);
+
+        // 1. PENDING -> cancelled + erased
+        const rowPending = await client.emailOutbox.findUnique({ where: { id: pendingId } });
+        expect(rowPending?.status).toBe('FAILED');
+        expect(rowPending?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        assertIrrecoverablyErased(rowPending, secrets, ['erased', 'erasedAt']);
+
+        // 2. SENDING -> cancelled + lease cleared + erased
+        const rowSending = await client.emailOutbox.findUnique({ where: { id: sendingId } });
+        expect(rowSending?.status).toBe('FAILED');
+        expect(rowSending?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        assertIrrecoverablyErased(rowSending, secrets, ['erased', 'erasedAt']);
+
+        // 3. SENT (with messageId & without messageId) -> keeps status='SENT', sentAt, attempts, messageId; erases candidateId & keyId
+        const rowSentMsg = await client.emailOutbox.findUnique({ where: { id: sentWithMsgId } });
+        expect(rowSentMsg?.status).toBe('SENT');
+        expect(rowSentMsg?.sentAt?.toISOString()).toBe('2026-11-08T10:00:00.000Z');
+        expect(rowSentMsg?.attempts).toBe(1);
+        expect(rowSentMsg?.lastErrorCode).toBeNull();
+        expect(rowSentMsg?.lastError).toBeNull();
+        expect((rowSentMsg?.payloadJson as Record<string, unknown>)['messageId']).toBe(
+          'smtp-queue-id-7788',
+        );
+        assertIrrecoverablyErased(rowSentMsg, secrets, ['erased', 'erasedAt', 'messageId']);
+
+        const rowSentNoMsg = await client.emailOutbox.findUnique({ where: { id: sentNoMsgId } });
+        expect(rowSentNoMsg?.status).toBe('SENT');
+        expect(rowSentNoMsg?.attempts).toBe(2);
+        assertIrrecoverablyErased(rowSentNoMsg, secrets, ['erased', 'erasedAt']);
+
+        // 4. FAILED (MAX_ATTEMPTS_EXHAUSTED) -> preserves FAILED + code, scrubs SMTP error email & ciphertext
+        const rowFailed = await client.emailOutbox.findUnique({ where: { id: failedExhaustedId } });
+        expect(rowFailed?.status).toBe('FAILED');
+        expect(rowFailed?.lastErrorCode).toBe('MAX_ATTEMPTS_EXHAUSTED');
+        expect(rowFailed?.lastError).toBe(
+          'Delivery error details redacted following candidate deletion',
+        );
+        assertIrrecoverablyErased(rowFailed, secrets, ['erased', 'erasedAt']);
+
+        // 5. PERMANENTLY_REJECTED -> preserves status + code, scrubs SMTP 550 email & ciphertext
+        const rowPerm = await client.emailOutbox.findUnique({ where: { id: permRejectedId } });
+        expect(rowPerm?.status).toBe('PERMANENTLY_REJECTED');
+        expect(rowPerm?.lastErrorCode).toBe('PERMANENT_REJECTION');
+        expect(rowPerm?.lastError).toBe(
+          'Delivery error details redacted following candidate deletion',
+        );
+        assertIrrecoverablyErased(rowPerm, secrets, ['erased', 'erasedAt']);
+
+        // 6. CANCELLED (FAILED + CANDIDATE_DELETION_PENDING) -> fully scrubbed
+        const rowCancelled = await client.emailOutbox.findUnique({ where: { id: cancelledId } });
+        expect(rowCancelled?.status).toBe('FAILED');
+        expect(rowCancelled?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        assertIrrecoverablyErased(rowCancelled, secrets, ['erased', 'erasedAt']);
+
+        // 7. organizationId=NULL & idempotency_key match -> cancelled + erased
+        const rowNullOrg = await client.emailOutbox.findUnique({ where: { id: nullOrgId } });
+        expect(rowNullOrg?.status).toBe('FAILED');
+        expect(rowNullOrg?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        assertIrrecoverablyErased(rowNullOrg, secrets, ['erased', 'erasedAt']);
+
+        // 15. Verify outboxStore.getRecord cannot recover ANY deleted content
+        for (const id of [
+          pendingId,
+          sendingId,
+          sentWithMsgId,
+          failedExhaustedId,
+          permRejectedId,
+          cancelledId,
+        ]) {
+          const rec = await outboxStore.getRecord(id);
+          expect(rec).not.toBeNull();
+          expect(rec?.recipientEmail).toBe('');
+          expect(rec?.subject).toBe('');
+          expect(rec?.html).toBe('');
+          expect(rec?.text).toBe('');
+        }
+
+        // 12. Verify manualRetry & TransactionalEmailService.retryEmail & dispatchRecord refuse erased records
+        for (const id of [pendingId, sendingId, failedExhaustedId, permRejectedId, cancelledId]) {
+          expect(await outboxStore.markSending(id)).toBe(false);
+          expect(await outboxStore.manualRetry(id)).toBeNull();
+        }
+        const provider = new InMemoryEmailProvider();
+        const emailSvc = new TransactionalEmailService({
+          provider,
+          outboxStore,
+          immediateDispatch: true,
+        });
+        expect((await emailSvc.retryEmail(failedExhaustedId)).delivered).toBe(false);
+        expect((await emailSvc.dispatchRecord(pendingId)).delivered).toBe(false);
+        expect(provider.sentMessages).toHaveLength(0);
+
+        // 9. Idempotent repeat deletion (recruiter createDeletionRequest on DELETED candidate) preserves scrubbed tombstones
+        const repeatReq = await repository.createDeletionRequest(
+          fixture.orgId,
+          fixture.candidateId,
+          fixture.userId,
+        );
+        expect(repeatReq.status).toBe('COMPLETED');
+        const recheckedFailed = await client.emailOutbox.findUnique({
+          where: { id: failedExhaustedId },
+        });
+        assertIrrecoverablyErased(recheckedFailed, secrets, ['erased', 'erasedAt']);
+
+        // 8. Verify unrelated messages remain completely intact and decryptable
+        const keptSameOrg = await outboxStore.getRecord(otherCandOutboxId);
+        expect(keptSameOrg?.status).toBe('PENDING');
+        expect(keptSameOrg?.recipientEmail).toBe(otherEmail);
+        expect(keptSameOrg?.subject).toBe('Keep Same-Org Candidate Invite');
+
+        const keptOtherOrg = await outboxStore.getRecord(org2CandOutboxId);
+        expect(keptOtherOrg?.status).toBe('FAILED');
+        expect(keptOtherOrg?.recipientEmail).toBe(otherEmail);
+        expect(keptOtherOrg?.lastError).toContain(otherEmail);
+
+        const keptAdmin = await outboxStore.getRecord(orgAdminOutboxId);
+        expect(keptAdmin?.status).toBe('PENDING');
+        expect(keptAdmin?.recipientEmail).toBe(orgAdminEmail);
+      } finally {
+        if (createdExtraOutboxIds.length > 0) {
+          await client.emailOutbox
+            .deleteMany({ where: { id: { in: createdExtraOutboxIds } } })
+            .catch(() => {});
+        }
+        await client.candidate.deleteMany({ where: { id: otherCandId } }).catch(() => {});
+        await client.candidate.deleteMany({ where: { id: org2CandId } }).catch(() => {});
+        await client.organization.deleteMany({ where: { id: secondOrgId } }).catch(() => {});
+        await fixture.cleanup();
+      }
+    });
+
+    it('recruiter createDeletionRequest and processDeletion erase terminal rows even if deletion is invoked via recruiter workflow', async () => {
+      const fixture = await createFixture();
+      const candEmail = `recruiter.del.${randomUUID().slice(0, 8)}@example.org`;
+      try {
+        const failedId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'consent_invitation',
+          email: candEmail,
+          subject: `Confidential ${candEmail}`,
+          status: 'FAILED',
+          attempts: 3,
+          lastErrorCode: 'MAX_ATTEMPTS_EXHAUSTED',
+          lastError: `SMTP 451 temp error for ${candEmail}`,
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        const permId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'client_submission',
+          email: candEmail,
+          subject: `Rejected ${candEmail}`,
+          status: 'PERMANENTLY_REJECTED',
+          attempts: 1,
+          lastErrorCode: 'PERMANENT_REJECTION',
+          lastError: `550 unknown user ${candEmail}`,
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+        const sentId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'consent_invitation',
+          email: candEmail,
+          subject: 'Sent Invite',
+          status: 'SENT',
+          sentAt: new Date(),
+          withEncryptedPayload: false,
+          payloadJson: { candidateId: fixture.candidateId, messageId: 'm-rec-1' },
+        });
+
+        const delReq = await repository.createDeletionRequest(
+          fixture.orgId,
+          fixture.candidateId,
+          fixture.userId,
+        );
+        expect(delReq.status).toBe('REQUESTED');
+
+        const procRes = await repository.processDeletion(
+          fixture.orgId,
+          delReq.id,
+          async () => {},
+          fixture.userId,
+        );
+        expect(procRes.status).toBe('COMPLETED');
+
+        // Re-running completed processDeletion is idempotent
+        const procAgain = await repository.processDeletion(
+          fixture.orgId,
+          delReq.id,
+          async () => {},
+          fixture.userId,
+        );
+        expect(procAgain.status).toBe('COMPLETED');
+
+        const fRow = await client.emailOutbox.findUnique({ where: { id: failedId } });
+        const pRow = await client.emailOutbox.findUnique({ where: { id: permId } });
+        const sRow = await client.emailOutbox.findUnique({ where: { id: sentId } });
+
+        assertIrrecoverablyErased(fRow, [candEmail, fixture.candidateId], ['erased', 'erasedAt']);
+        assertIrrecoverablyErased(pRow, [candEmail, fixture.candidateId], ['erased', 'erasedAt']);
+        assertIrrecoverablyErased(
+          sRow,
+          [candEmail, fixture.candidateId],
+          ['erased', 'erasedAt', 'messageId'],
+        );
+      } finally {
+        await fixture.cleanup();
+      }
+    });
+
+    it('transaction rollback leaves email_outbox records intact if deletion fails mid-transaction', async () => {
+      const fixture = await createFixture();
+      const candEmail = `rollback.${randomUUID().slice(0, 8)}@example.org`;
+      try {
+        const pendingId = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: fixture.candidateId,
+          messageType: 'consent_invitation',
+          email: candEmail,
+          subject: `Rollback Test ${candEmail}`,
+          status: 'PENDING',
+          payloadJson: { candidateId: fixture.candidateId },
+        });
+
+        // Passing an invalid requestedById FK forces deletionRequest.create to fail inside createDeletionRequest's $transaction
+        await expect(
+          repository.createDeletionRequest(fixture.orgId, fixture.candidateId, randomUUID()),
+        ).rejects.toThrow();
+
+        const afterRollback = await client.emailOutbox.findUnique({ where: { id: pendingId } });
+        expect(afterRollback?.status).toBe('PENDING');
+        expect(afterRollback?.encryptedPayload).not.toBeNull();
+        expect(afterRollback?.keyId).toBe('v1');
+        expect((afterRollback?.payloadJson as Record<string, unknown>)['candidateId']).toBe(
+          fixture.candidateId,
+        );
+
+        const outboxStore = new PostgresEmailOutboxStore(client);
+        const decrypted = await outboxStore.getRecord(pendingId);
+        expect(decrypted?.recipientEmail).toBe(candEmail);
+      } finally {
+        await fixture.cleanup();
+      }
+    });
+
+    it('races deletion against worker claimForDispatch and in-progress dispatch (both success and failure outcomes) without resurrecting data', async () => {
+      const fixture = await createFixture();
+      const raceEmail1 = `race.claim.${randomUUID().slice(0, 8)}@example.org`;
+      const raceEmail2 = `race.send.ok.${randomUUID().slice(0, 8)}@example.org`;
+      const raceEmail3 = `race.send.err.${randomUUID().slice(0, 8)}@example.org`;
+
+      try {
+        // Isolate queue from any lingering PENDING/SENDING rows
+        await client.emailOutbox.deleteMany({
+          where: { status: { in: ['PENDING', 'SENDING'] } },
+        });
+
+        // Sub-case A: Deletion vs claimForDispatch concurrency
+        const candA = fixture.candidateId;
+        const rowA = await seedEncryptedOutboxRow({
+          organizationId: fixture.orgId,
+          candidateId: candA,
+          messageType: 'consent_invitation',
+          email: raceEmail1,
+          subject: 'Race Claim Test',
+          status: 'PENDING',
+          payloadJson: { candidateId: candA },
+        });
+
+        const outboxStore = new PostgresEmailOutboxStore(client);
+        const [, claimResult] = await Promise.all([
+          repository.createDeletionRequest(fixture.orgId, candA, fixture.userId),
+          outboxStore.claimForDispatch('worker-race-claim', 5),
+        ]);
+        expect(claimResult.some((r) => r.id === rowA)).toBe(false);
+        const finalA = await client.emailOutbox.findUnique({ where: { id: rowA } });
+        expect(finalA?.status).toBe('FAILED');
+        expect(finalA?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        assertIrrecoverablyErased(finalA, [raceEmail1, candA], ['erased', 'erasedAt']);
+
+        // Sub-case B & C: Worker claims row, pauses inside provider.send(), deletion commits while in-flight;
+        // prove Phase 4 fences BOTH success:true AND success:false responses!
+        for (const outcome of [
+          { success: true, messageId: 'in-flight-provider-id' },
+          { success: false, error: `550 bounced <${raceEmail3}>`, isPermanentFailure: true },
+        ]) {
+          await client.emailOutbox.deleteMany({
+            where: { status: { in: ['PENDING', 'SENDING'] } },
+          });
+          const candB = randomUUID();
+          await client.candidate.create({
+            data: {
+              id: candB,
+              organizationId: fixture.orgId,
+              candidateCode: `CAN-INF-${randomUUID().slice(0, 6).toUpperCase()}`,
+              recordStatus: 'ACTIVE',
+            },
+          });
+
+          const targetEmail = outcome.success ? raceEmail2 : raceEmail3;
+          const rowB = await seedEncryptedOutboxRow({
+            organizationId: fixture.orgId,
+            candidateId: candB,
+            messageType: 'consent_invitation',
+            email: targetEmail,
+            subject: 'In-flight race test',
+            status: 'PENDING',
+            payloadJson: { candidateId: candB },
+          });
+
+          let enteredSendResolve!: () => void;
+          const enteredSend = new Promise<void>((r) => {
+            enteredSendResolve = r;
+          });
+          let releaseSendResolve!: () => void;
+          const releaseSend = new Promise<void>((r) => {
+            releaseSendResolve = r;
+          });
+
+          const pausingProvider: EmailDispatcherProvider = {
+            async send() {
+              enteredSendResolve();
+              await releaseSend;
+              return outcome;
+            },
+          };
+
+          const dispatcher = new WorkerEmailDispatcher(client, {
+            workerId: 'in-flight-race-worker',
+            leaseDurationSeconds: 60,
+            provider: pausingProvider,
+          });
+
+          const dispatchPromise = dispatcher.processNextEmail();
+          await enteredSend;
+
+          // Deletion executes & commits while provider.send() is still in flight
+          const delTokenHash = hashToken(randomBytes(32).toString('hex'));
+          await repository.createDeletionVerification({
+            organizationId: fixture.orgId,
+            candidateId: candB,
+            tokenHash: delTokenHash,
+            email: targetEmail,
+            expiresAt: new Date(Date.now() + 86400_000),
+          });
+          const confirmed = await repository.confirmCandidateDeletion(delTokenHash, async () => {});
+          expect(confirmed?.status).toBe('COMPLETED');
+
+          // Release provider.send() -> Phase 4 MUST be fenced out and leave erased state untouched
+          releaseSendResolve();
+          const workerResult = await dispatchPromise;
+          if (outcome.success) {
+            expect(workerResult).toBe(false); // updateCount === 0
+          }
+
+          const finalB = await client.emailOutbox.findUnique({ where: { id: rowB } });
+          expect(finalB?.status).toBe('FAILED');
+          expect(finalB?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+          expect(finalB?.sentAt).toBeNull();
+          assertIrrecoverablyErased(
+            finalB,
+            [targetEmail, candB, outcome.messageId ?? targetEmail],
+            ['erased', 'erasedAt'],
+          );
+
+          // Cleanup extra candidate B row
+          await client.emailOutbox.deleteMany({ where: { id: rowB } }).catch(() => {});
+          await client.candidate.deleteMany({ where: { id: candB } }).catch(() => {});
+        }
+      } finally {
+        await fixture.cleanup();
+      }
+    });
   });
 });

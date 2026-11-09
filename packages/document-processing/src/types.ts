@@ -31,3 +31,25 @@ export interface DocumentParser {
   supports(fileType: ResumeFileType): boolean;
   parse(buffer: Buffer): Promise<ParserResult>;
 }
+
+export interface OcrPage {
+  pageNumber: number;
+  text: string;
+  confidence: number;
+  startOffset: number;
+  endOffset: number;
+}
+
+export interface OcrResult {
+  text: string;
+  confidence?: number;
+  engine: string;
+  pages?: OcrPage[];
+  totalPages?: number;
+  isPartial?: boolean;
+}
+
+export interface OcrProvider {
+  supports(buffer: Buffer): boolean;
+  extractText(buffer: Buffer): Promise<OcrResult | null>;
+}

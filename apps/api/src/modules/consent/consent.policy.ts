@@ -77,6 +77,13 @@ export function computeNoticeHash(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
+export function verifyNoticeIntegrity(noticeText: string, expectedNoticeTextHash: string): boolean {
+  if (!noticeText || !expectedNoticeTextHash) return false;
+  return (
+    computeNoticeHash(noticeText).toLowerCase() === expectedNoticeTextHash.trim().toLowerCase()
+  );
+}
+
 export interface ApprovedPolicy {
   version: string;
   noticeTextHash: string;
@@ -113,24 +120,38 @@ export function parseApprovedPolicies(rawConfig?: string): ApprovedPolicy[] {
 }
 
 /**
- * Verifies whether a consent policy version AND its exact noticeTextHash pair
- * have been formally recorded as approved for production use.
+ * Verifies whether a consent policy version is approved for production use.
+ *
+ * Supports two approval tiers:
+ * 1. Policy version approval (template-level approval across organizations and requisitions via approvedPolicyVersions).
+ * 2. Exact version:noticeTextHash pair approval (legacy or specific instance approval via approvedPolicies).
  *
  * FAILS CLOSED:
- * A policy notice is approved ONLY if BOTH version and SHA-256 hash match the
- * explicitly configured approved pair. If unconfigured, changed, missing, or
- * mismatched, it returns false. A text change invalidates approval even if
- * the version string is unmodified.
+ * If neither tier approves the version/hash, returns false.
  */
 export function isPolicyApproved(
   version: string,
   noticeTextHash: string,
   approvedPolicies?: readonly ApprovedPolicy[] | Set<string>,
+  approvedPolicyVersions?: readonly string[] | Set<string>,
 ): boolean {
   if (!version?.trim() || !noticeTextHash?.trim()) return false;
   const cleanVersion = version.trim();
   const cleanHash = noticeTextHash.trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(cleanHash)) return false;
+
+  // 1. Check approved policy versions (template-level approval)
+  if (approvedPolicyVersions) {
+    const versionSet =
+      approvedPolicyVersions instanceof Set
+        ? approvedPolicyVersions
+        : new Set(Array.from(approvedPolicyVersions).map((v) => v.trim()));
+    if (versionSet.has(cleanVersion)) {
+      return true;
+    }
+  }
+
+  // 2. Check explicit approved policy version:hash pairs
   if (!approvedPolicies) return false;
 
   if (approvedPolicies instanceof Set) {

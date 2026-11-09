@@ -13,6 +13,18 @@ const requirementTypeSchema = z.enum(['MUST_HAVE', 'PREFERRED']);
 
 export const emptyGenerationSchema = z.object({}).strict();
 
+export const createScorecardDraftSchema = z
+  .object({
+    mode: z.enum(['ai', 'manual']).optional(),
+    cloneFromVersionId: z.string().uuid().optional(),
+  })
+  .strict()
+  .refine((value) => !(value.mode !== undefined && value.cloneFromVersionId !== undefined), {
+    message: 'Cannot specify both mode and cloneFromVersionId',
+  });
+
+export type CreateScorecardDraftInput = z.infer<typeof createScorecardDraftSchema>;
+
 export const criterionInputSchema = z
   .object({
     id: z.string().uuid().optional(),

@@ -2,10 +2,17 @@ import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import type { RequisitionDto } from './requisition.dto.js';
 import {
   createRequisitionRepository,
+  isValidRequisitionStatusTransition,
   type RequisitionRecord,
   type RequisitionRepository,
 } from './requisition.repository.js';
-import type { CreateRequisitionInput, UpdateRequisitionInput } from './requisition.schemas.js';
+import type {
+  CreateRequisitionInput,
+  TransitionRequisitionStatusInput,
+  UpdateRequisitionInput,
+} from './requisition.schemas.js';
+
+export { isValidRequisitionStatusTransition };
 
 export class RequisitionNotFoundError extends Error {
   constructor() {
@@ -25,6 +32,20 @@ export class RequisitionRoleError extends Error {
   constructor() {
     super('Recruiter role required');
     this.name = 'RequisitionRoleError';
+  }
+}
+
+export class RequisitionStatusTransitionError extends Error {
+  constructor(message = 'Invalid requisition status transition') {
+    super(message);
+    this.name = 'RequisitionStatusTransitionError';
+  }
+}
+
+export class RequisitionScorecardNotApprovedError extends Error {
+  constructor(message = 'Requisition requires an approved scorecard before opening') {
+    super(message);
+    this.name = 'RequisitionScorecardNotApprovedError';
   }
 }
 
@@ -112,6 +133,29 @@ export function createRequisitionService(dependencies: RequisitionServiceDepende
       }
 
       return toDto(record);
+    },
+
+    async transitionStatus(
+      principal: AuthenticatedPrincipal,
+      requisitionId: string,
+      input: TransitionRequisitionStatusInput,
+    ): Promise<RequisitionDto> {
+      requireRecruiter(principal);
+
+      const result = await repository.transitionStatus(principal, requisitionId, input.status);
+      if (result.status === 'not_found') {
+        throw new RequisitionNotFoundError();
+      }
+      if (result.status === 'scorecard_not_approved') {
+        throw new RequisitionScorecardNotApprovedError();
+      }
+      if (result.status === 'invalid_transition') {
+        throw new RequisitionStatusTransitionError(
+          `Cannot transition requisition from ${result.currentStatus} to ${input.status}`,
+        );
+      }
+
+      return toDto(result.record);
     },
   };
 }

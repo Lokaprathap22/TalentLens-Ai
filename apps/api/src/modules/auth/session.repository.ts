@@ -1,5 +1,7 @@
 import { getDatabaseClient, type PrismaClient } from '@talentlens/database';
 
+import type { UserRole } from './auth.dto.js';
+
 export interface SessionCreation {
   userId: string;
   tokenHash: string;
@@ -9,8 +11,13 @@ export interface SessionCreation {
 export interface SessionUser {
   id: string;
   organizationId: string;
-  role: 'RECRUITER' | 'CLIENT_HIRING_MANAGER' | 'DELIVERY_HEAD';
+  name: string | null;
+  email: string;
+  role: UserRole;
   status: 'ACTIVE' | 'INVITED' | 'SUSPENDED' | 'DEACTIVATED';
+  organization: {
+    name: string;
+  };
 }
 
 export interface SessionRecord {
@@ -23,6 +30,8 @@ export interface SessionRepository {
   createForActiveUser(session: SessionCreation): Promise<boolean>;
   findByTokenHash(tokenHash: string): Promise<SessionRecord | null>;
   revokeByTokenHash(tokenHash: string, revokedAt: Date): Promise<void>;
+  revokeAllForUser(userId: string, revokedAt: Date): Promise<void>;
+  revokeOthersForUser(userId: string, currentTokenHash: string, revokedAt: Date): Promise<void>;
 }
 
 type DatabaseSessionRepositoryClient = Pick<PrismaClient, 'user' | 'session'>;
@@ -69,8 +78,15 @@ export function createSessionRepository(
             select: {
               id: true,
               organizationId: true,
+              name: true,
+              email: true,
               role: true,
               status: true,
+              organization: {
+                select: {
+                  name: true,
+                },
+              },
             },
           },
         },
@@ -81,6 +97,33 @@ export function createSessionRepository(
       await database.session.updateMany({
         where: {
           tokenHash,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt,
+        },
+      });
+    },
+
+    async revokeAllForUser(userId, revokedAt): Promise<void> {
+      await database.session.updateMany({
+        where: {
+          userId,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt,
+        },
+      });
+    },
+
+    async revokeOthersForUser(userId, currentTokenHash, revokedAt): Promise<void> {
+      await database.session.updateMany({
+        where: {
+          userId,
+          tokenHash: {
+            not: currentTokenHash,
+          },
           revokedAt: null,
         },
         data: {

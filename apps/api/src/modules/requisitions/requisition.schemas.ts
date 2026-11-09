@@ -19,5 +19,13 @@ export const updateRequisitionSchema = z
     message: 'At least one field is required',
   });
 
+export const transitionRequisitionStatusSchema = z
+  .object({
+    status: z.enum(['OPEN', 'PAUSED', 'CLOSED', 'FILLED']),
+  })
+  .strict();
+
 export type CreateRequisitionInput = z.infer<typeof createRequisitionSchema>;
 export type UpdateRequisitionInput = z.infer<typeof updateRequisitionSchema>;
+export type TransitionRequisitionStatusInput = z.infer<typeof transitionRequisitionStatusSchema>;
+export type TransitionTargetStatus = TransitionRequisitionStatusInput['status'];

@@ -50,3 +50,19 @@ local-secrets/
 
 # Prisma generated client
 packages/database/src/generated/
+
+# QA, E2E, and Playwright outputs
+artifacts/
+playwright-report/
+test-results/
+temp-*.pdf
+temp-*.docx
+
+# Database backup archives (never commit database dumps)
+backups/
+*.sql
+*.sql.gz
+*.sql.gz.sha256
+*.dump
+*.dump.sha256
+!prisma/migrations/**/*.sql

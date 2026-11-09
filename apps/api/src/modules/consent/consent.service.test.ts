@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import { InMemoryEmailDeliveryService } from './consent.email.js';
 import type { ConsentRepository } from './consent.repository.js';
-import { CURRENT_CONSENT_POLICY_VERSION } from './consent.policy.js';
+import { CURRENT_CONSENT_POLICY_VERSION, generateConsentNotice } from './consent.policy.js';
 import {
   ConsentContextNotFoundError,
   ConsentError,
@@ -11,6 +11,7 @@ import {
   ConsentRoleError,
   createConsentService,
   InvitationInvalidOrExpiredError,
+  WithdrawalInvalidOrExpiredError,
 } from './consent.service.js';
 
 const recruiterPrincipal: AuthenticatedPrincipal = {
@@ -358,5 +359,184 @@ describe('consent service unit tests', () => {
     expect(result.status).toBe('WITHDRAWN');
     expect(result.candidateId).toBe('cand-withdraw-1');
     expect(result.heldJobCount).toBe(3);
+  });
+
+  it('rejects inspectNotice and acceptConsent when stored noticeText has been tampered with', async () => {
+    const validHash = 'a'.repeat(64);
+    const mockRepo: Partial<ConsentRepository> = {
+      findPendingNoticeByTokenHash: vi.fn().mockResolvedValue({
+        invitationId: 'inv-tampered',
+        organizationId: 'org-1',
+        organizationName: 'Global Tech Corp',
+        requisitionTitle: 'Engineer',
+        policyVersion: CURRENT_CONSENT_POLICY_VERSION,
+        noticeTextHash: validHash,
+        noticeText: 'Tampered notice text that does not match hash',
+      }),
+      acceptInvitation: vi.fn(),
+    };
+
+    const service = createConsentService({
+      repository: mockRepo as ConsentRepository,
+      emailDeliveryService: new InMemoryEmailDeliveryService(),
+      approvedPolicyVersions: [CURRENT_CONSENT_POLICY_VERSION],
+    });
+
+    await expect(service.inspectNotice('token-1')).rejects.toThrow(
+      /Consent notice integrity verification failed/,
+    );
+    await expect(service.acceptConsent('token-1', 'John Doe')).rejects.toThrow(
+      /Consent notice integrity verification failed/,
+    );
+    expect(mockRepo.acceptInvitation).not.toHaveBeenCalled();
+  });
+
+  it('accepts consent when approvedPolicyVersions approves the template version', async () => {
+    const notice = generateConsentNotice({
+      organizationName: 'Acme Corp',
+      requisitionTitle: 'Senior Designer',
+    });
+
+    const mockRepo: Partial<ConsentRepository> = {
+      findPendingNoticeByTokenHash: vi.fn().mockResolvedValue({
+        invitationId: 'inv-v1',
+        organizationId: 'org-acme',
+        organizationName: 'Acme Corp',
+        requisitionTitle: 'Senior Designer',
+        policyVersion: notice.policyVersion,
+        noticeTextHash: notice.noticeTextHash,
+        noticeText: notice.noticeText,
+      }),
+      acceptInvitation: vi.fn().mockResolvedValue({
+        status: 'ACCEPTED',
+        candidateId: 'cand-1',
+        requisitionId: 'req-1',
+        releasedJobCount: 1,
+      }),
+    };
+
+    const service = createConsentService({
+      repository: mockRepo as ConsentRepository,
+      emailDeliveryService: new InMemoryEmailDeliveryService(),
+      approvedPolicyVersions: [CURRENT_CONSENT_POLICY_VERSION],
+    });
+
+    const result = await service.acceptConsent('token-1', 'Jane Doe');
+    expect(result.status).toBe('ACCEPTED');
+    expect(mockRepo.acceptInvitation).toHaveBeenCalledWith(expect.any(String), 'Jane Doe');
+  });
+
+  it('accepts consent when organization has recorded approval in organizationConsentPolicy', async () => {
+    const notice = generateConsentNotice({
+      organizationName: 'Beta Org',
+      requisitionTitle: 'DevOps Engineer',
+    });
+
+    const mockRepo: Partial<ConsentRepository> = {
+      findPendingNoticeByTokenHash: vi.fn().mockResolvedValue({
+        invitationId: 'inv-beta',
+        organizationId: 'org-beta',
+        organizationName: 'Beta Org',
+        requisitionTitle: 'DevOps Engineer',
+        policyVersion: notice.policyVersion,
+        noticeTextHash: notice.noticeTextHash,
+        noticeText: notice.noticeText,
+      }),
+      isPolicyApprovedForOrganization: vi.fn().mockResolvedValue(true),
+      acceptInvitation: vi.fn().mockResolvedValue({
+        status: 'ACCEPTED',
+        candidateId: 'cand-beta',
+        requisitionId: 'req-beta',
+        releasedJobCount: 0,
+      }),
+    };
+
+    const service = createConsentService({
+      repository: mockRepo as ConsentRepository,
+      emailDeliveryService: new InMemoryEmailDeliveryService(),
+      // No platform-level approvals configured
+      approvedPolicies: [],
+      approvedPolicyVersions: [],
+    });
+
+    const result = await service.acceptConsent('token-beta', 'Alex Smith');
+    expect(result.status).toBe('ACCEPTED');
+    expect(mockRepo.isPolicyApprovedForOrganization).toHaveBeenCalledWith(
+      'org-beta',
+      notice.policyVersion,
+    );
+  });
+
+  it('requestCandidateDeletion enforces anti-enumeration when no matching active candidate exists', async () => {
+    const mockRepo: Partial<ConsentRepository> = {
+      findCandidatesForDeletionByEmail: vi.fn().mockResolvedValue([]),
+      createDeletionVerification: vi.fn(),
+    };
+    const emailService = new InMemoryEmailDeliveryService();
+    const service = createConsentService({
+      repository: mockRepo as ConsentRepository,
+      emailDeliveryService: emailService,
+    });
+
+    const res = await service.requestCandidateDeletion('unknown@example.com');
+    expect(res.message).toContain('verification link has been sent');
+    expect(mockRepo.createDeletionVerification).not.toHaveBeenCalled();
+    expect(emailService.sentDeletions).toHaveLength(0);
+    expect(emailService.sentWithdrawals).toHaveLength(0);
+  });
+
+  it('requestCandidateDeletion sends one deletion verification email per matching active candidate and skips coalesced requests', async () => {
+    const createDeletionVerification = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'ver-1', outboxId: 'out-1', coalesced: false })
+      .mockResolvedValueOnce({ id: 'ver-2', coalesced: true });
+
+    const mockRepo: Partial<ConsentRepository> = {
+      findCandidatesForDeletionByEmail: vi.fn().mockResolvedValue([
+        {
+          organizationId: 'org-1',
+          organizationName: 'Acme Recruiting',
+          candidateId: 'cand-1',
+        },
+        {
+          organizationId: 'org-2',
+          organizationName: 'Beta Staffing',
+          candidateId: 'cand-2',
+        },
+      ]),
+      createDeletionVerification,
+    };
+
+    const emailService = new InMemoryEmailDeliveryService();
+    const service = createConsentService({
+      repository: mockRepo as ConsentRepository,
+      emailDeliveryService: emailService,
+      applicationOrigin: 'https://app.talentlens.ai',
+    });
+
+    const res = await service.requestCandidateDeletion('Candidate@Example.Com');
+    expect(res.message).toContain('verification link has been sent');
+    expect(createDeletionVerification).toHaveBeenCalledTimes(2);
+    expect(emailService.sentWithdrawals).toHaveLength(0);
+    expect(emailService.sentDeletions).toHaveLength(1);
+    expect(emailService.sentDeletions[0]?.deletionUrl).toContain(
+      'https://app.talentlens.ai/consent/deletion#token=',
+    );
+    expect(emailService.sentDeletions[0]?.candidateId).toBe('cand-1');
+    expect(emailService.sentDeletions[0]?.outboxRecordId).toBe('out-1');
+  });
+
+  it('confirmCandidateDeletion throws WithdrawalInvalidOrExpiredError when token is invalid, expired, or replayed', async () => {
+    const mockRepo: Partial<ConsentRepository> = {
+      confirmCandidateDeletion: vi.fn().mockResolvedValue(null),
+    };
+    const service = createConsentService({
+      repository: mockRepo as ConsentRepository,
+      emailDeliveryService: new InMemoryEmailDeliveryService(),
+    });
+
+    await expect(service.confirmCandidateDeletion('replayed-token-123456')).rejects.toThrow(
+      WithdrawalInvalidOrExpiredError,
+    );
   });
 });

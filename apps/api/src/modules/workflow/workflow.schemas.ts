@@ -12,6 +12,9 @@ export function isValidIanaTimezone(tz: string): boolean {
 export const listCandidatesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
   offset: z.coerce.number().int().min(0).default(0),
+  search: z.string().trim().max(100).optional(),
+  sortBy: z.enum(['activity', 'score', 'uploadedAt']).default('activity'),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
   processingStatus: z
     .enum(['PENDING', 'PROCESSING', 'PARSED', 'NEEDS_REVIEW', 'FAILED'])
     .optional(),
@@ -21,6 +24,50 @@ export const listCandidatesQuerySchema = z.object({
     .enum(['SUBMITTED', 'CLIENT_SHORTLISTED', 'CLIENT_REJECTED', 'INTERVIEW_PROPOSED', 'WITHDRAWN'])
     .optional(),
 });
+
+export type ListCandidatesQueryInput = z.infer<typeof listCandidatesQuerySchema>;
+
+export const listGlobalCandidatesQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  search: z.string().trim().max(100).optional(),
+  requisitionId: z.string().uuid().optional(),
+  statusCategory: z
+    .enum(['ALL', 'ASSESSED', 'AWAITING_ASSESSMENT', 'NEEDS_REVIEW', 'FAILED'])
+    .optional(),
+  assessmentStatus: z.enum(['ALL', 'COMPLETE', 'NEEDS_REVIEW', 'FAILED']).optional(),
+  reviewStatus: z.enum(['ALL', 'REVIEWED', 'NEEDS_REVIEW', 'NOT_REVIEWED', 'CLOSED']).optional(),
+  sortBy: z.enum(['activity', 'score', 'createdAt']).default('activity'),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+});
+
+export type ListGlobalCandidatesInput = z.infer<typeof listGlobalCandidatesQuerySchema>;
+
+export const listInterviewsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  search: z.string().trim().max(100).optional(),
+  status: z
+    .enum(['ALL', 'PROPOSED', 'ACCEPTED', 'REJECTED', 'RESCHEDULED', 'COMPLETED', 'CANCELLED'])
+    .optional(),
+  statusCategory: z.enum(['ALL', 'UPCOMING', 'PENDING_ACTION', 'COMPLETED', 'PAST']).optional(),
+  clientId: z.string().uuid().optional(),
+  requisitionId: z.string().uuid().optional(),
+  fromDate: z
+    .string()
+    .datetime({ offset: true })
+    .optional()
+    .or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)),
+  toDate: z
+    .string()
+    .datetime({ offset: true })
+    .optional()
+    .or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)),
+  sortBy: z.enum(['startAt', 'createdAt', 'status']).default('startAt'),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+});
+
+export type ListInterviewsInput = Partial<z.infer<typeof listInterviewsQuerySchema>>;
 
 export const recordReviewSchema = z.object({
   decision: z.enum(['REVIEWED', 'NEEDS_REVIEW', 'CLOSED']),
@@ -120,3 +167,48 @@ export const candidateTimelineQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   offset: z.coerce.number().int().min(0).default(0),
 });
+
+export const listClientsQuerySchema = z.object({
+  includeInactive: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((value) => value === 'true'),
+});
+
+export const createClientSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+  })
+  .strict();
+
+export const updateClientSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    status: z.enum(['ACTIVE', 'INACTIVE']).optional(),
+  })
+  .strict()
+  .refine((data) => data.name !== undefined || data.status !== undefined, {
+    message: 'At least one field (name or status) must be provided.',
+  });
+
+export type CreateClientInput = z.infer<typeof createClientSchema>;
+export type UpdateClientInput = z.infer<typeof updateClientSchema>;
+
+export const inviteClientMemberSchema = z
+  .object({
+    email: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .email({ message: 'Enter a valid work email address.' })
+      .max(320, { message: 'Email address must not exceed 320 characters.' }),
+    name: z
+      .string()
+      .trim()
+      .min(1, { message: 'Name must not be empty if provided.' })
+      .max(200, { message: 'Name must not exceed 200 characters.' })
+      .optional(),
+  })
+  .strict();
+
+export type InviteClientMemberInput = z.infer<typeof inviteClientMemberSchema>;

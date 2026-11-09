@@ -481,7 +481,28 @@ describe('workflow.service', () => {
             },
           ],
         },
-        feedbackHistory: [],
+        feedbackHistory: [
+          {
+            id: 'dec-iv-1',
+            decision: 'PROPOSE_INTERVIEW',
+            reason: 'Initial technical screen',
+            proposedAt: new Date('2026-11-10T10:00:00.000Z'),
+            timezone: 'UTC',
+            createdAt: new Date('2026-11-05T10:00:00.000Z'),
+          },
+        ],
+        interviews: [
+          {
+            id: 'iv-1',
+            startAt: '2026-11-10T10:00:00.000Z',
+            endAt: '2026-11-10T10:45:00.000Z',
+            timezone: 'UTC',
+            format: 'VIDEO',
+            status: 'COMPLETED',
+            reason: 'Initial technical screen',
+            createdAt: '2026-11-05T10:00:00.000Z',
+          },
+        ],
       }),
     };
     const service = createWorkflowService(mockRepo as WorkflowRepository);
@@ -498,6 +519,8 @@ describe('workflow.service', () => {
     expect(maskedClientView['phone']).toBeUndefined();
     expect(maskedClientView['candidateCode']).toBeUndefined();
     expect(clientView.assessment?.criteria[0]?.verifiedQuotes[0]).toContain('Senior TypeScript');
+    expect(clientView.interviews).toHaveLength(1);
+    expect(clientView.interviews?.[0]?.status).toBe('COMPLETED');
   });
 
   it('records client feedback decision and updates status', async () => {
@@ -1069,6 +1092,180 @@ describe('workflow.service', () => {
       expect(timeline.items).toHaveLength(1);
       expect(timeline.items[0]?.toStage).toBe('RECRUITER_SHORTLISTED');
       expect(timeline.items[0]?.createdAt).toBe(eventDate.toISOString());
+    });
+
+    it('listAuthorizedClients forwards includeInactive=true for RECRUITER but never for CLIENT_HIRING_MANAGER', async () => {
+      const now = new Date('2026-11-05T00:00:00.000Z');
+      const mockRepo: Partial<WorkflowRepository> = {
+        listAuthorizedClients: vi.fn().mockResolvedValue([
+          {
+            id: clientId,
+            name: 'Acme Corp',
+            status: 'INACTIVE',
+            createdAt: now,
+            updatedAt: now,
+          },
+        ]),
+      };
+      const service = createWorkflowService(mockRepo as WorkflowRepository);
+
+      const recruiterClients = await service.listAuthorizedClients(recruiterPrincipal, {
+        includeInactive: true,
+      });
+      expect(recruiterClients[0]?.createdAt).toBe(now.toISOString());
+      expect(recruiterClients[0]?.updatedAt).toBe(now.toISOString());
+      expect(mockRepo.listAuthorizedClients).toHaveBeenCalledWith(
+        recruiterPrincipal.organizationId,
+        recruiterPrincipal.userId,
+        'RECRUITER',
+        { includeInactive: true },
+      );
+
+      vi.mocked(mockRepo.listAuthorizedClients!).mockClear();
+      await service.listAuthorizedClients(clientPrincipal, { includeInactive: true });
+      expect(mockRepo.listAuthorizedClients).toHaveBeenCalledWith(
+        clientPrincipal.organizationId,
+        clientPrincipal.userId,
+        'CLIENT_HIRING_MANAGER',
+      );
+    });
+
+    it('createClient and updateClient enforce recruiter role and return formatted client DTOs', async () => {
+      const now = new Date('2026-11-05T00:00:00.000Z');
+      const mockRepo: Partial<WorkflowRepository> = {
+        createClient: vi.fn().mockResolvedValue({
+          id: clientId,
+          name: 'Acme Corp',
+          status: 'ACTIVE',
+          createdAt: now,
+          updatedAt: now,
+        }),
+        updateClient: vi
+          .fn()
+          .mockResolvedValueOnce({
+            id: clientId,
+            name: 'Acme Updated',
+            status: 'INACTIVE',
+            createdAt: now,
+            updatedAt: now,
+          })
+          .mockResolvedValueOnce(null),
+      };
+      const service = createWorkflowService(mockRepo as WorkflowRepository);
+
+      await expect(service.createClient(clientPrincipal, { name: 'Forbidden' })).rejects.toThrow(
+        WorkflowRequisitionAccessDeniedError,
+      );
+
+      await expect(
+        service.updateClient(clientPrincipal, clientId, { status: 'INACTIVE' }),
+      ).rejects.toThrow(WorkflowRequisitionAccessDeniedError);
+
+      const created = await service.createClient(recruiterPrincipal, { name: 'Acme Corp' });
+      expect(created).toEqual({
+        id: clientId,
+        name: 'Acme Corp',
+        status: 'ACTIVE',
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      });
+
+      const updated = await service.updateClient(recruiterPrincipal, clientId, {
+        name: 'Acme Updated',
+        status: 'INACTIVE',
+      });
+      expect(updated.status).toBe('INACTIVE');
+
+      await expect(
+        service.updateClient(recruiterPrincipal, 'missing-id', { status: 'ACTIVE' }),
+      ).rejects.toThrow('Client not found');
+    });
+
+    it('getClient enforces authorization and returns formatted client DTO', async () => {
+      const now = new Date('2026-11-05T00:00:00.000Z');
+      const mockRepo: Partial<WorkflowRepository> = {
+        getClient: vi.fn().mockResolvedValue({
+          id: clientId,
+          name: 'Acme Corp',
+          status: 'ACTIVE',
+          createdAt: now,
+          updatedAt: now,
+        }),
+        listAuthorizedClients: vi.fn().mockResolvedValue([{ id: clientId }]),
+      };
+
+      const service = createWorkflowService(mockRepo as WorkflowRepository);
+
+      // Recruiter succeeds
+      const client = await service.getClient(recruiterPrincipal, clientId);
+      expect(client.id).toBe(clientId);
+      expect(client.name).toBe('Acme Corp');
+
+      // Client hiring manager with membership succeeds
+      const clientHm = await service.getClient(clientPrincipal, clientId);
+      expect(clientHm.id).toBe(clientId);
+
+      // Client hiring manager without membership fails
+      const unauthClientPrincipal: AuthenticatedPrincipal = {
+        userId: 'unauth-client-user',
+        organizationId: 'org-uuid-1',
+        role: 'CLIENT_HIRING_MANAGER',
+      };
+      (mockRepo.listAuthorizedClients as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      await expect(service.getClient(unauthClientPrincipal, clientId)).rejects.toThrow();
+    });
+
+    it('listClientMembers and inviteClientMember enforce recruiter role and forward options', async () => {
+      const now = new Date('2026-11-05T00:00:00.000Z');
+      const memberDto = {
+        id: 'mem-1',
+        membershipId: 'mem-1',
+        userId: 'usr-1',
+        clientId,
+        organizationId: 'org-uuid-1',
+        name: 'Jane Doe',
+        email: 'jane@acme.com',
+        role: 'CLIENT_HIRING_MANAGER' as const,
+        membershipStatus: 'ACTIVE' as const,
+        userStatus: 'INVITED' as const,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      };
+
+      const mockRepo: Partial<WorkflowRepository> = {
+        listClientMembers: vi.fn().mockResolvedValue([memberDto]),
+        inviteClientMember: vi.fn().mockResolvedValue(memberDto),
+      };
+
+      const service = createWorkflowService(mockRepo as WorkflowRepository, {
+        applicationOrigin: 'https://app.talentlens.ai',
+      });
+
+      // Non-recruiter denied
+      await expect(service.listClientMembers(clientPrincipal, clientId)).rejects.toThrow(
+        WorkflowRequisitionAccessDeniedError,
+      );
+      await expect(
+        service.inviteClientMember(clientPrincipal, clientId, { email: 'test@example.com' }),
+      ).rejects.toThrow(WorkflowRequisitionAccessDeniedError);
+
+      // Recruiter succeeds
+      const members = await service.listClientMembers(recruiterPrincipal, clientId);
+      expect(members).toHaveLength(1);
+      expect(members[0]!.email).toBe('jane@acme.com');
+
+      const invited = await service.inviteClientMember(recruiterPrincipal, clientId, {
+        email: 'jane@acme.com',
+        name: 'Jane Doe',
+      });
+      expect(invited.email).toBe('jane@acme.com');
+      expect(mockRepo.inviteClientMember).toHaveBeenCalledWith(
+        recruiterPrincipal.organizationId,
+        recruiterPrincipal.userId,
+        clientId,
+        { email: 'jane@acme.com', name: 'Jane Doe' },
+        { applicationOrigin: 'https://app.talentlens.ai' },
+      );
     });
   });
 });

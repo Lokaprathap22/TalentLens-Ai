@@ -4,8 +4,13 @@ import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
 import type { AuthenticatedPrincipal, SessionService } from '../auth/session.service.js';
-import type { AuthorizationService } from '../authorization/authorization.service.js';
 import {
+  AuthorizationDeniedError,
+  type AuthorizationService,
+} from '../authorization/authorization.service.js';
+import {
+  WorkflowClientConflictError,
+  WorkflowClientNotFoundError,
   WorkflowConsentRequiredError,
   WorkflowProhibitedFeedbackError,
   WorkflowResumeNotInspectedError,
@@ -245,7 +250,28 @@ describe('workflow.routes', () => {
             },
           ],
         },
-        feedbackHistory: [],
+        feedbackHistory: [
+          {
+            id: 'dec-iv-1',
+            decision: 'PROPOSE_INTERVIEW',
+            reason: 'Round 1 technical interview',
+            proposedAt: '2026-11-10T10:00:00.000Z',
+            timezone: 'UTC',
+            createdAt: new Date().toISOString(),
+          },
+        ],
+        interviews: [
+          {
+            id: 'iv-1',
+            startAt: '2026-11-10T10:00:00.000Z',
+            endAt: '2026-11-10T10:45:00.000Z',
+            timezone: 'UTC',
+            format: 'VIDEO',
+            status: 'COMPLETED',
+            reason: 'Round 1 technical interview',
+            createdAt: new Date().toISOString(),
+          },
+        ],
       }),
     };
 
@@ -270,6 +296,8 @@ describe('workflow.routes', () => {
     expect(response.body.phone).toBeUndefined();
     expect(response.body.candidateCode).toBeUndefined();
     expect(response.body.assessment.criteria[0].label).toBe('TypeScript');
+    expect(response.body.interviews).toHaveLength(1);
+    expect(response.body.interviews[0].status).toBe('COMPLETED');
   });
 
   it('client feedback rejects decline without reason with 400', async () => {
@@ -326,6 +354,70 @@ describe('workflow.routes', () => {
 
     expect(response.status).toBe(200);
     expect(response.body.decision).toBe('REJECT');
+  });
+
+  it('client feedback enforces client role, active client membership, and CSRF protection (R-02)', async () => {
+    const recruiterSessionService = createMockSessionService(recruiterPrincipal);
+    const hmSessionService = createMockSessionService(hiringManagerPrincipal);
+    const mockService: Partial<WorkflowService> = {
+      recordClientFeedback: vi.fn(),
+    };
+
+    const recruiterApp = createApp({
+      workflow: {
+        service: mockService as WorkflowService,
+        sessionService: recruiterSessionService,
+        authorizationService: createMockAuthService(),
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const recruiterAttempt = await request(recruiterApp)
+      .post(`/api/v1/clients/${clientId}/submissions/${submissionId}/feedback`)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('Origin', applicationOrigin)
+      .set('x-csrf-token', deriveCsrfToken(rawToken))
+      .send({ decision: 'SHORTLIST', reason: 'Strong fit' });
+    expect(recruiterAttempt.status).toBe(403);
+
+    const unauthorizedMembershipAuth = {
+      authorizeClientMembership: vi.fn().mockRejectedValue(new AuthorizationDeniedError()),
+    };
+    const unauthorizedClientApp = createApp({
+      workflow: {
+        service: mockService as WorkflowService,
+        sessionService: hmSessionService,
+        authorizationService: unauthorizedMembershipAuth,
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const crossTenantAttempt = await request(unauthorizedClientApp)
+      .post(`/api/v1/clients/${clientId}/submissions/${submissionId}/feedback`)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('Origin', applicationOrigin)
+      .set('x-csrf-token', deriveCsrfToken(rawToken))
+      .send({ decision: 'SHORTLIST', reason: 'Strong fit' });
+    expect(crossTenantAttempt.status).toBe(403);
+
+    const authorizedClientApp = createApp({
+      workflow: {
+        service: mockService as WorkflowService,
+        sessionService: hmSessionService,
+        authorizationService: createMockAuthService(),
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+    const missingCsrfAttempt = await request(authorizedClientApp)
+      .post(`/api/v1/clients/${clientId}/submissions/${submissionId}/feedback`)
+      .set('Cookie', [`talentlens_session=${rawToken}`])
+      .set('Origin', applicationOrigin)
+      .send({ decision: 'SHORTLIST', reason: 'Strong fit' });
+    expect(missingCsrfAttempt.status).toBe(403);
+    expect(mockService.recordClientFeedback).not.toHaveBeenCalled();
   });
 
   it('client interview proposal rejects past datetime with 400', async () => {
@@ -712,5 +804,305 @@ describe('workflow.routes', () => {
     expect(response.body.candidateId).toBe(candidateId);
     expect(response.body.items).toHaveLength(1);
     expect(response.body.items[0].toStage).toBe('RECRUITER_SHORTLISTED');
+  });
+
+  describe('Client management routes (M9.3 Step 1 Part A)', () => {
+    it('GET /api/v1/clients?includeInactive=true forwards includeInactive option to service', async () => {
+      const sessionService = createMockSessionService(recruiterPrincipal);
+      const mockService: Partial<WorkflowService> = {
+        listAuthorizedClients: vi.fn().mockResolvedValue([
+          {
+            id: clientId,
+            name: 'Acme Enterprise',
+            status: 'ACTIVE',
+            createdAt: '2026-11-05T00:00:00.000Z',
+            updatedAt: '2026-11-05T00:00:00.000Z',
+          },
+          {
+            id: 'client-inactive',
+            name: 'Legacy Corp',
+            status: 'INACTIVE',
+            createdAt: '2026-11-01T00:00:00.000Z',
+            updatedAt: '2026-11-02T00:00:00.000Z',
+          },
+        ]),
+      };
+
+      const app = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      const response = await request(app)
+        .get('/api/v1/clients?includeInactive=true')
+        .set('Cookie', [`talentlens_session=${rawToken}`]);
+
+      expect(response.status).toBe(200);
+      expect(response.body.clients).toHaveLength(2);
+      expect(mockService.listAuthorizedClients).toHaveBeenCalledWith(recruiterPrincipal, {
+        includeInactive: true,
+      });
+    });
+
+    it('GET /api/v1/clients rejects invalid includeInactive query value with 400', async () => {
+      const sessionService = createMockSessionService(recruiterPrincipal);
+      const mockService: Partial<WorkflowService> = {
+        listAuthorizedClients: vi.fn(),
+      };
+
+      const app = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      const response = await request(app)
+        .get('/api/v1/clients?includeInactive=invalid')
+        .set('Cookie', [`talentlens_session=${rawToken}`]);
+
+      expect(response.status).toBe(400);
+      expect(mockService.listAuthorizedClients).not.toHaveBeenCalled();
+    });
+
+    it('POST /api/v1/clients creates a client for an authenticated recruiter (201)', async () => {
+      const sessionService = createMockSessionService(recruiterPrincipal);
+      const createdClient = {
+        id: clientId,
+        name: 'Acme Enterprise',
+        status: 'ACTIVE',
+        createdAt: '2026-11-05T00:00:00.000Z',
+        updatedAt: '2026-11-05T00:00:00.000Z',
+      };
+      const mockService: Partial<WorkflowService> = {
+        createClient: vi.fn().mockResolvedValue(createdClient),
+      };
+
+      const app = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      const response = await request(app)
+        .post('/api/v1/clients')
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ name: '  Acme Enterprise  ' });
+
+      expect(response.status).toBe(201);
+      expect(response.body).toEqual({ client: createdClient });
+      expect(mockService.createClient).toHaveBeenCalledWith(recruiterPrincipal, {
+        name: 'Acme Enterprise',
+      });
+    });
+
+    it('POST /api/v1/clients validates whitespace, length boundaries, and rejects organizationId injection', async () => {
+      const sessionService = createMockSessionService(recruiterPrincipal);
+      const mockService: Partial<WorkflowService> = {
+        createClient: vi.fn(),
+      };
+
+      const app = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      for (const invalidBody of [
+        { name: '   ' },
+        { name: 'A'.repeat(201) },
+        { name: 'Valid Name', organizationId: 'attacker-org' },
+      ]) {
+        const res = await request(app)
+          .post('/api/v1/clients')
+          .set('Cookie', [`talentlens_session=${rawToken}`])
+          .set('Origin', applicationOrigin)
+          .set('x-csrf-token', deriveCsrfToken(rawToken))
+          .send(invalidBody);
+
+        expect(res.status).toBe(400);
+      }
+
+      expect(mockService.createClient).not.toHaveBeenCalled();
+    });
+
+    it('POST /api/v1/clients enforces recruiter role, CSRF, and Origin protection', async () => {
+      const hmSessionService = createMockSessionService(hiringManagerPrincipal);
+      const recruiterSessionService = createMockSessionService(recruiterPrincipal);
+      const mockService: Partial<WorkflowService> = {
+        createClient: vi.fn(),
+      };
+
+      const hmApp = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService: hmSessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      // Hiring manager forbidden (403)
+      const hmRes = await request(hmApp)
+        .post('/api/v1/clients')
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ name: 'Acme' });
+      expect(hmRes.status).toBe(403);
+
+      const recruiterApp = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService: recruiterSessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      // Missing CSRF (403)
+      const noCsrfRes = await request(recruiterApp)
+        .post('/api/v1/clients')
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .send({ name: 'Acme' });
+      expect(noCsrfRes.status).toBe(403);
+
+      // Wrong Origin (403)
+      const badOriginRes = await request(recruiterApp)
+        .post('/api/v1/clients')
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', 'https://evil.example.com')
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ name: 'Acme' });
+      expect(badOriginRes.status).toBe(403);
+
+      expect(mockService.createClient).not.toHaveBeenCalled();
+    });
+
+    it('POST /api/v1/clients maps duplicate name conflict to 409 conflict', async () => {
+      const sessionService = createMockSessionService(recruiterPrincipal);
+      const mockService: Partial<WorkflowService> = {
+        createClient: vi.fn().mockRejectedValue(new WorkflowClientConflictError()),
+      };
+
+      const app = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      const res = await request(app)
+        .post('/api/v1/clients')
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ name: 'Acme Enterprise' });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe('conflict');
+    });
+
+    it('PATCH /api/v1/clients/:clientId updates client name and status, validates input, and maps 404/409', async () => {
+      const sessionService = createMockSessionService(recruiterPrincipal);
+      const updatedClient = {
+        id: clientId,
+        name: 'Acme Global',
+        status: 'INACTIVE',
+        createdAt: '2026-11-05T00:00:00.000Z',
+        updatedAt: '2026-11-05T01:00:00.000Z',
+      };
+      const mockService: Partial<WorkflowService> = {
+        updateClient: vi
+          .fn()
+          .mockResolvedValueOnce(updatedClient)
+          .mockRejectedValueOnce(new WorkflowClientNotFoundError())
+          .mockRejectedValueOnce(new WorkflowClientConflictError()),
+      };
+
+      const app = createApp({
+        workflow: {
+          service: mockService as WorkflowService,
+          sessionService,
+          authorizationService: createMockAuthService(),
+          applicationOrigin,
+          isProduction: false,
+        },
+      });
+
+      // Empty update rejected (400)
+      const emptyRes = await request(app)
+        .patch(`/api/v1/clients/${clientId}`)
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({});
+      expect(emptyRes.status).toBe(400);
+
+      // Invalid UUID rejected (400)
+      const badIdRes = await request(app)
+        .patch('/api/v1/clients/not-a-uuid')
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ status: 'INACTIVE' });
+      expect(badIdRes.status).toBe(400);
+
+      // Valid update (200)
+      const okRes = await request(app)
+        .patch(`/api/v1/clients/${clientId}`)
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ name: '  Acme Global ', status: 'INACTIVE' });
+      expect(okRes.status).toBe(200);
+      expect(okRes.body).toEqual({ client: updatedClient });
+      expect(mockService.updateClient).toHaveBeenCalledWith(recruiterPrincipal, clientId, {
+        name: 'Acme Global',
+        status: 'INACTIVE',
+      });
+
+      // Cross-tenant / missing client (404)
+      const notFoundRes = await request(app)
+        .patch(`/api/v1/clients/${clientId}`)
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ status: 'ACTIVE' });
+      expect(notFoundRes.status).toBe(404);
+
+      // Duplicate name conflict (409)
+      const conflictRes = await request(app)
+        .patch(`/api/v1/clients/${clientId}`)
+        .set('Cookie', [`talentlens_session=${rawToken}`])
+        .set('Origin', applicationOrigin)
+        .set('x-csrf-token', deriveCsrfToken(rawToken))
+        .send({ name: 'Existing Client' });
+      expect(conflictRes.status).toBe(409);
+    });
   });
 });

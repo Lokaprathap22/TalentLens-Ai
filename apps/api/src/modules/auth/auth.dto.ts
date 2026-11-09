@@ -1,10 +1,12 @@
-import type { AuthenticatedPrincipal } from './session.service.js';
+export type UserRole = 'RECRUITER' | 'CLIENT_HIRING_MANAGER' | 'DELIVERY_HEAD';
 
 export interface AuthenticatedUserDto {
   userId: string;
   organizationId: string;
+  organizationName: string;
   email: string;
-  role: AuthenticatedPrincipal['role'];
+  role: UserRole;
+  name?: string | null;
 }
 
 export interface AuthenticatedSession {

@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 
+import type { AuthenticatedUserDto, UserRole } from './auth.dto.js';
 import { createSessionRepository, type SessionRepository } from './session.repository.js';
 
 export const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
@@ -7,7 +8,9 @@ export const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 export interface AuthenticatedPrincipal {
   userId: string;
   organizationId: string;
-  role: 'RECRUITER' | 'CLIENT_HIRING_MANAGER' | 'DELIVERY_HEAD';
+  organizationName?: string;
+  email?: string;
+  role: UserRole;
 }
 
 export interface CreatedSession {
@@ -60,7 +63,7 @@ export function createSessionService(dependencies: SessionServiceDependencies = 
 
     async validateSession(
       rawToken: string | null | undefined,
-    ): Promise<AuthenticatedPrincipal | null> {
+    ): Promise<AuthenticatedUserDto | null> {
       if (!rawToken || !isSessionToken(rawToken)) {
         return null;
       }
@@ -78,7 +81,10 @@ export function createSessionService(dependencies: SessionServiceDependencies = 
       return {
         userId: session.user.id,
         organizationId: session.user.organizationId,
+        organizationName: session.user.organization.name,
+        email: session.user.email,
         role: session.user.role,
+        name: session.user.name ?? null,
       };
     },
 
@@ -88,6 +94,18 @@ export function createSessionService(dependencies: SessionServiceDependencies = 
       }
 
       await repository.revokeByTokenHash(hashToken(rawToken), new Date(now()));
+    },
+
+    async revokeUserSessions(userId: string): Promise<void> {
+      await repository.revokeAllForUser(userId, new Date(now()));
+    },
+
+    async revokeOtherUserSessions(userId: string, rawCurrentToken: string): Promise<void> {
+      if (!isSessionToken(rawCurrentToken)) {
+        await repository.revokeAllForUser(userId, new Date(now()));
+        return;
+      }
+      await repository.revokeOthersForUser(userId, hashToken(rawCurrentToken), new Date(now()));
     },
   };
 }

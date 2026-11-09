@@ -509,5 +509,164 @@ describe('scorecard service', () => {
         }),
       ).rejects.toBeInstanceOf(ScorecardRoleError);
     });
+
+    it('rejects approval when any active criterion has weight 0 even if weights sum to 100', async () => {
+      const draft = record();
+      draft.criteria = [
+        {
+          id: 'criterion-a',
+          key: 'skill-1',
+          label: 'Java',
+          category: 'SKILL',
+          requirementType: 'MUST_HAVE',
+          weight: 100,
+          ruleJson: {
+            description: 'Java',
+            evidence: {
+              sourceQuote: 'Java',
+              sourceStart: 0,
+              sourceEnd: 4,
+              verificationStatus: 'VERIFIED',
+            },
+          },
+          active: true,
+          displayOrder: 0,
+        },
+        {
+          id: 'criterion-b',
+          key: 'skill-2',
+          label: 'Zero Weight Skill',
+          category: 'SKILL',
+          requirementType: 'PREFERRED',
+          weight: 0,
+          ruleJson: {
+            description: 'Zero',
+            evidence: {
+              sourceQuote: 'Java',
+              sourceStart: 0,
+              sourceEnd: 4,
+              verificationStatus: 'VERIFIED',
+            },
+          },
+          active: true,
+          displayOrder: 1,
+        },
+      ];
+      const repo = repository({ find: vi.fn(async () => draft) });
+      const service = createScorecardService({
+        repository: repo,
+        extractionProvider: { extract: vi.fn(async () => extraction) },
+      });
+
+      await expect(
+        service.approve(principal, 'requisition-a', 'scorecard-a'),
+      ).rejects.toBeInstanceOf(ScorecardInvalidError);
+      expect(repo.approve).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('manual and cloned draft creation (M9.3 Step 1 Part C)', () => {
+    it('creates an empty manual draft without invoking the AI extraction provider', async () => {
+      const manualRecord: ScorecardRecord = {
+        ...record('DRAFT'),
+        version: 2,
+        criteria: [],
+      };
+      const repo = repository({
+        createManualDraft: vi.fn(async () => manualRecord),
+      });
+      const provider = { extract: vi.fn(async () => extraction) };
+      const service = createScorecardService({ repository: repo, extractionProvider: provider });
+
+      const result = await service.generate(principal, 'requisition-a', { mode: 'manual' });
+
+      expect(provider.extract).not.toHaveBeenCalled();
+      expect(repo.createManualDraft).toHaveBeenCalledWith(principal, {
+        id: 'requisition-a',
+        title: 'Senior Java Developer',
+        jdText: 'Need Java experience.',
+      });
+      expect(result.version).toBe(2);
+      expect(result.status).toBe('DRAFT');
+      expect(result.criteria).toEqual([]);
+    });
+
+    it('clones an existing version without invoking AI, resetting matching quotes to PENDING_RECRUITER_REVIEW with updated offsets and outdated quotes to UNVERIFIED', async () => {
+      const capturedEvidence: Array<Record<string, unknown> | null> = [];
+      const repo = repository({
+        findAuthorizedRequisition: vi.fn(async () => ({
+          id: 'requisition-a',
+          title: 'Senior Java Developer',
+          jdText: 'Prefix text. Need Java experience in distributed systems.',
+        })),
+        cloneDraft: vi.fn(async (_p, _req, _srcId, transformEvidence) => {
+          // Simulate source criterion 1: VERIFIED quote that still exists at new offset in updated JD
+          const ev1 = transformEvidence({
+            sourceQuote: 'Need Java experience',
+            sourceStart: 0,
+            sourceEnd: 20,
+            verificationStatus: 'VERIFIED',
+          });
+          // Simulate source criterion 2: VERIFIED quote that no longer exists in updated JD
+          const ev2 = transformEvidence({
+            sourceQuote: 'Legacy COBOL requirement',
+            sourceStart: 10,
+            sourceEnd: 34,
+            verificationStatus: 'VERIFIED',
+          });
+          capturedEvidence.push(ev1, ev2);
+          return {
+            ...record('DRAFT'),
+            id: 'scorecard-cloned',
+            version: 3,
+            approvedById: null,
+            approvedAt: null,
+          };
+        }),
+      });
+      const provider = { extract: vi.fn(async () => extraction) };
+      const service = createScorecardService({ repository: repo, extractionProvider: provider });
+
+      const cloned = await service.generate(principal, 'requisition-a', {
+        cloneFromVersionId: '123e4567-e89b-42d3-a456-426614174001',
+      });
+
+      expect(provider.extract).not.toHaveBeenCalled();
+      expect(cloned.version).toBe(3);
+      expect(cloned.status).toBe('DRAFT');
+      expect(cloned.approvedById).toBeNull();
+      expect(cloned.approvedAt).toBeNull();
+
+      // Quote 1 still exists in 'Prefix text. Need Java experience in distributed systems.' at index 13..33
+      expect(capturedEvidence[0]).toEqual({
+        sourceQuote: 'Need Java experience',
+        sourceStart: 13,
+        sourceEnd: 33,
+        verificationStatus: 'PENDING_RECRUITER_REVIEW',
+      });
+
+      // Quote 2 no longer exists in JD -> UNVERIFIED with null offsets
+      expect(capturedEvidence[1]).toEqual({
+        sourceQuote: 'Legacy COBOL requirement',
+        sourceStart: null,
+        sourceEnd: null,
+        verificationStatus: 'UNVERIFIED',
+      });
+    });
+
+    it('rejects cloning when source version does not belong to the requisition or organization', async () => {
+      const repo = repository({
+        cloneDraft: vi.fn(async () => null),
+      });
+      const provider = { extract: vi.fn(async () => extraction) };
+      const service = createScorecardService({ repository: repo, extractionProvider: provider });
+
+      await expect(
+        service.generate(principal, 'requisition-a', {
+          cloneFromVersionId: '999e4567-e89b-42d3-a456-426614174999',
+        }),
+      ).rejects.toThrow('Scorecard not found');
+      expect(provider.extract).not.toHaveBeenCalled();
+    });
   });
 });

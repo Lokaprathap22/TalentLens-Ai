@@ -4,7 +4,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../../app.js';
 import { deriveCsrfToken } from '../../middleware/csrf.js';
 import type { SessionService } from '../auth/session.service.js';
-import { ConsentPolicyUnapprovedError, type ConsentService } from './consent.service.js';
+import {
+  ConsentPolicyUnapprovedError,
+  WithdrawalInvalidOrExpiredError,
+  type ConsentService,
+} from './consent.service.js';
 
 const rawToken = 'A'.repeat(43);
 const requisitionId = '123e4567-e89b-42d3-a456-426614174000';
@@ -375,5 +379,75 @@ describe('consent routes integration tests', () => {
     expect(response.status).toBe(200);
     expect(response.body.status).toBe('CONFIRMED');
     expect(response.body.heldJobCount).toBe(2);
+  });
+
+  it('handles self-deletion request with anti-enumeration response', async () => {
+    const sessionService = createMockSessionService(null);
+    const mockConsentService = {
+      requestCandidateDeletion: vi.fn().mockResolvedValue({
+        message:
+          'If an active candidate record is associated with this email, a verification link has been sent.',
+      }),
+    } as unknown as ConsentService;
+
+    const app = createApp({
+      consent: {
+        consentService: mockConsentService,
+        sessionService,
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/v1/consent/deletion/request')
+      .send({ email: 'candidate@example.com' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.message).toContain('verification link has been sent');
+    expect(mockConsentService.requestCandidateDeletion).toHaveBeenCalledWith(
+      'candidate@example.com',
+      undefined,
+    );
+  });
+
+  it('confirms candidate deletion and rejects replayed/expired tokens with 400 WITHDRAWAL_INVALID_OR_EXPIRED', async () => {
+    const sessionService = createMockSessionService(null);
+    const confirmCandidateDeletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: 'COMPLETED',
+        candidateId,
+        deletionRequestId: 'del-req-1',
+      })
+      .mockRejectedValueOnce(new WithdrawalInvalidOrExpiredError());
+
+    const mockConsentService = {
+      confirmCandidateDeletion,
+    } as unknown as ConsentService;
+
+    const app = createApp({
+      consent: {
+        consentService: mockConsentService,
+        sessionService,
+        applicationOrigin,
+        isProduction: false,
+      },
+    });
+
+    const first = await request(app)
+      .post('/api/v1/consent/deletion/confirm')
+      .send({ token: 'valid-deletion-token-123456' });
+
+    expect(first.status).toBe(200);
+    expect(first.body.status).toBe('COMPLETED');
+    expect(first.body.candidateId).toBe(candidateId);
+
+    const replay = await request(app)
+      .post('/api/v1/consent/deletion/confirm')
+      .send({ token: 'valid-deletion-token-123456' });
+
+    expect(replay.status).toBe(400);
+    expect(replay.body.error).toBe('WITHDRAWAL_INVALID_OR_EXPIRED');
   });
 });
