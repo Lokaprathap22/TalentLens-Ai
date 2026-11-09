@@ -50,3 +50,11 @@ local-secrets/
 
 # Prisma generated client
 packages/database/src/generated/
+
+# Database backup archives (never commit database dumps)
+backups/
+*.sql
+*.sql.gz
+*.sql.gz.sha256
+!prisma/migrations/**/*.sql
+

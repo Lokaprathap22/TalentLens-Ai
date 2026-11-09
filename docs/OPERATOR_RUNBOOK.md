@@ -12,8 +12,15 @@ TalentLens AI enforces strict multi-tenancy and does not allow unauthenticated p
 
 To provision the first tenant organization and the initial active recruiter account:
 
+**In Production (Docker Environment):**
+
 ```bash
-# From repository root or apps/api directory:
+docker compose -f docker-compose.prod.yml exec api node apps/api/dist/scripts/bootstrap.js "Enterprise Client Name" "recruiter.admin@client.com"
+```
+
+**In Local Development:**
+
+```bash
 npm run bootstrap --workspace @talentlens/api -- "Enterprise Client Name" "recruiter.admin@client.com"
 ```
 
@@ -30,6 +37,18 @@ npm run bootstrap --workspace @talentlens/api -- "Enterprise Client Name" "recru
 
 Every production secret must be generated with cryptographically strong pseudo-random number generators. Never reuse keys between staging and production.
 
+TalentLens AI provides an automated, idempotent secret generator script:
+
+```bash
+# Preview generated secrets without modifying files:
+npm run generate:secrets
+
+# Apply generated secrets into .env from .env.example (preserves all manual credentials):
+npm run generate:secrets -- --write
+```
+
+Manual generation commands (if generating out-of-band):
+
 ```bash
 # 1. Dedicated AES-256-GCM Email Outbox Payload Encryption Key (exactly 32 bytes / 64 hex chars)
 openssl rand -hex 32
@@ -39,12 +58,9 @@ openssl rand -hex 32
 openssl rand -hex 32
 # Set as: EMAIL_OUTBOX_IDEMPOTENCY_SECRET=<generated-hex-string>
 
-# 3. Session Signing Secret (at least 32 bytes / 64 hex chars)
-openssl rand -hex 32
-# Set as: SESSION_SECRET=<generated-hex-string>
-
-# 4. PostgreSQL Database Password
-openssl rand -base64 32
+# 3. PostgreSQL Database Password (URL-safe base64url or hex)
+openssl rand -hex 24
+# Set as: POSTGRES_PASSWORD=<generated-string>
 ```
 
 > [!CAUTION]
@@ -57,28 +73,34 @@ openssl rand -base64 32
 
 ### Mandatory API Environment Variables (`apps/api`):
 
-| Variable                          | Required | Description                              | Example / Notes                                            |
-| :-------------------------------- | :------- | :--------------------------------------- | :--------------------------------------------------------- |
-| `NODE_ENV`                        | Yes      | Deployment environment mode              | `production` or `staging`                                  |
-| `PORT`                            | Yes      | HTTP listening port                      | `3000`                                                     |
-| `DATABASE_URL`                    | Yes      | PostgreSQL connection string             | `postgresql://user:pass@postgres:5432/talentlens`          |
-| `APP_ORIGIN`                      | Yes      | Strict client origin for CSRF & CORS     | `https://app.talentlens.ai` (no trailing slash/path)       |
-| `EMAIL_OUTBOX_ENCRYPTION_KEY`     | Yes      | Primary AES-256-GCM key for outbox       | 64-char hex string (32 bytes)                              |
-| `EMAIL_OUTBOX_IDEMPOTENCY_SECRET` | Yes      | HMAC key for deterministic outbox hashes | 64-char hex string (32 bytes)                              |
-| `STORAGE_DRIVER`                  | Yes      | Resume storage adapter                   | `s3` (mandatory in staging/production)                     |
-| `S3_BUCKET`                       | Yes      | Private S3 bucket name                   | `talentlens-resumes-prod`                                  |
-| `S3_REGION`                       | Yes      | AWS S3 region                            | `us-east-1`                                                |
-| `S3_ACCESS_KEY_ID`                | Yes      | IAM access key with S3 read/write        | `AKIA...`                                                  |
-| `S3_SECRET_ACCESS_KEY`            | Yes      | IAM secret key                           | Secret string                                              |
-| `SCANNER_DRIVER`                  | Yes      | Antivirus scanner driver                 | `clamav`                                                   |
-| `CLAMAV_HOST`                     | Yes      | ClamAV daemon hostname                   | `clamav` (or IP)                                           |
-| `CLAMAV_PORT`                     | Yes      | ClamAV daemon TCP port                   | `3310`                                                     |
-| `SCANNER_FAIL_CLOSED`             | Yes      | Reject uploads if scanner unreachable    | `true`                                                     |
-| `SMTP_HOST`                       | Yes      | Transactional SMTP server hostname       | `smtp.mailgun.org` or `email-smtp.us-east-1.amazonaws.com` |
-| `SMTP_PORT`                       | Yes      | SMTP port (587 STARTTLS or 465 SSL)      | `587`                                                      |
-| `SMTP_USER`                       | Optional | SMTP authentication username             | `postmaster@talentlens.ai`                                 |
-| `SMTP_PASS`                       | Optional | SMTP authentication password             | Password string                                            |
-| `EMAIL_FROM`                      | Yes      | Default sender address                   | `notifications@talentlens.ai`                              |
+| Variable                          | Required | Description                              | Example / Notes                                                                                                   |
+| :-------------------------------- | :------- | :--------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                        | Yes      | Deployment environment mode              | `production` or `staging`                                                                                         |
+| `PORT`                            | Yes      | HTTP listening port                      | `3000`                                                                                                            |
+| `DATABASE_URL`                    | Yes      | PostgreSQL connection string             | `postgresql://user:pass@postgres:5432/talentlens`                                                                 |
+| `APP_ORIGIN`                      | Yes      | Strict client origin for CSRF & CORS     | `https://app.talentlens.ai` (no trailing slash/path)                                                              |
+| `EMAIL_OUTBOX_ENCRYPTION_KEY`     | Yes      | Primary AES-256-GCM key for outbox       | 64-char hex string (32 bytes)                                                                                     |
+| `EMAIL_OUTBOX_IDEMPOTENCY_SECRET` | Yes      | HMAC key for deterministic outbox hashes | 64-char hex string (32 bytes)                                                                                     |
+| `STORAGE_DRIVER`                  | Yes      | Resume storage adapter                   | `s3` (mandatory in staging/production)                                                                            |
+| `S3_BUCKET`                       | Yes      | Private S3 bucket name                   | `talentlens-resumes`                                                                                              |
+| `S3_REGION`                       | Yes      | OCI Object Storage region                | `ap-hyderabad-1`                                                                                                  |
+| `S3_ENDPOINT`                     | Optional | OCI S3-compatible endpoint URL           | Dedicated: `https://<ns>.compat.objectstorage.ap-hyderabad-1.oci.customer-oci.com` (or generic `oraclecloud.com`) |
+| `S3_ACCESS_KEY_ID`                | Yes      | OCI Customer Secret Key Access Key       | OCI Access Key String                                                                                             |
+| `S3_SECRET_ACCESS_KEY`            | Yes      | OCI Customer Secret Key Secret           | OCI Secret String                                                                                                 |
+| `S3_FORCE_PATH_STYLE`             | Optional | Enforce path style URL structure         | `true`                                                                                                            |
+| `SCANNER_DRIVER`                  | Yes      | Antivirus scanner driver                 | `clamav`                                                                                                          |
+| `CLAMAV_HOST`                     | Yes      | ClamAV daemon hostname                   | `clamav` (or IP)                                                                                                  |
+| `CLAMAV_PORT`                     | Yes      | ClamAV daemon TCP port                   | `3310`                                                                                                            |
+| `SCANNER_FAIL_CLOSED`             | Yes      | Reject uploads if scanner unreachable    | `true`                                                                                                            |
+| `SMTP_HOST`                       | Yes      | Transactional SMTP server hostname       | `smtp.email.ap-hyderabad-1.oci.oraclecloud.com`                                                                   |
+| `SMTP_PORT`                       | Yes      | SMTP port (587 STARTTLS or 465 SSL)      | `587`                                                                                                             |
+| `SMTP_USER`                       | Optional | SMTP authentication username             | `ocid1.user.oc1...`                                                                                               |
+| `SMTP_PASS`                       | Optional | SMTP authentication password             | SMTP password string                                                                                              |
+| `EMAIL_FROM`                      | Yes      | Default sender address                   | `notifications@talentlens.ai`                                                                                     |
+| `GEMINI_API_KEY`                  | Yes      | Google Gemini API key from AI Studio     | `AIzaSy...`                                                                                                       |
+| `GEMINI_MODEL`                    | Optional | Canonical Gemini production model        | `gemini-3.8-flash`                                                                                                |
+| `GEMINI_TIMEOUT_MS`               | Optional | Gemini API timeout in milliseconds       | `30000` (30s)                                                                                                     |
+| `ASSESSMENT_PROVIDER`             | Optional | AI provider engine                       | `gemini`                                                                                                          |
 
 > [!NOTE]
 > Sessions are stateful and stored in PostgreSQL (`Session` table) via SHA-256 token digests. CSRF tokens are derived dynamically via HMAC-SHA256 from the active session token (`deriveCsrfToken`). No external `SESSION_SECRET` or `CSRF_SECRET` environment variable is required.
@@ -92,8 +114,9 @@ The background worker requires an identical database, storage, SMTP, and crypto 
 - `EMAIL_OUTBOX_ENCRYPTION_KEY`
 - `EMAIL_OUTBOX_IDEMPOTENCY_SECRET`
 - `STORAGE_DRIVER=s3`
-- `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`
+- `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM`
+- `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.8-flash`, `GEMINI_TIMEOUT_MS`, `ASSESSMENT_PROVIDER=gemini`
 
 ---
 
@@ -187,9 +210,13 @@ Database schema changes must NEVER run automatically on every API or Worker repl
 
 ## 8. Backup and Disaster Recovery Expectations
 
-1. **PostgreSQL Database**:
-   - Configure continuous archiving (WAL archiving) and automated daily snapshots.
-   - Test restoration procedure quarterly into an isolated test instance.
+1. **PostgreSQL Database Storage & External Destination**:
+   - **Local Stage**: Encrypted `.sql.gz` backups generated by `scripts/backup.sh` in `./backups/` with strict file permissions (`chmod 0600`).
+   - **Repository Protection**: `./backups/` and all `*.sql`/`*.sql.gz` files are strictly excluded from Git tracking via `.gitignore` and from Docker container build context via `.dockerignore`. Database dumps must NEVER be committed to source control or baked into image layers.
+   - **Documented External Backup Location**: Automated off-host replication pushes encrypted dumps to a dedicated private OCI Object Storage bucket:
+     `https://<tenancy-namespace>.compat.objectstorage.ap-hyderabad-1.oci.customer-oci.com/talentlens-backups/database/`
+     (Retention policy: 90-day retention lock, cross-region replication).
+   - Test restoration procedure quarterly into an isolated test instance using `scripts/restore.sh`.
 2. **S3 Object Bucket**:
    - Enable S3 Object Versioning to protect against accidental object deletion.
    - Configure lifecycle rules to transition older objects to S3 Glacier Flexible Retrieval if retention policies require long-term archival.

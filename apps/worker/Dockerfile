@@ -37,6 +37,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# Install production OCR runtime dependencies (Tesseract OCR engine, English language model, Poppler utilities)
+RUN apk add --no-cache tesseract-ocr tesseract-ocr-data-eng poppler-utils
+
 COPY --chown=node:node package.json ./
 COPY --chown=node:node packages ./packages/
 COPY --chown=node:node apps/worker/package.json ./apps/worker/
@@ -48,5 +51,8 @@ COPY --chown=node:node --from=builder /app/packages/assessment-engine/dist ./pac
 COPY --chown=node:node --from=builder /app/apps/worker/dist ./apps/worker/dist
 
 USER node
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["node", "apps/worker/dist/healthcheck.js"]
 
 CMD ["node", "apps/worker/dist/index.js"]
