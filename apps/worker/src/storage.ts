@@ -48,13 +48,21 @@ export class WorkerStorageService {
   constructor(storageRoot?: string) {
     this.storageRoot = resolveStorageRoot(storageRoot);
     this.driver = (process.env['STORAGE_DRIVER'] ?? 'local') as 'local' | 's3';
+    const nodeEnv = process.env['NODE_ENV'];
+    const isProductionOrStaging = nodeEnv === 'production' || nodeEnv === 'staging';
+
+    if (this.driver !== 's3' && isProductionOrStaging) {
+      throw new Error(
+        'Worker requires STORAGE_DRIVER=s3 in production/staging. Local storage is not permitted.',
+      );
+    }
 
     if (this.driver === 's3') {
       this.bucket = process.env['S3_BUCKET'];
       this.accessKeyId = process.env['S3_ACCESS_KEY_ID'] || process.env['AWS_ACCESS_KEY_ID'];
       this.secretAccessKey =
         process.env['S3_SECRET_ACCESS_KEY'] || process.env['AWS_SECRET_ACCESS_KEY'];
-      this.region = process.env['S3_REGION'] || process.env['AWS_REGION'] || 'us-east-1';
+      this.region = process.env['S3_REGION'] || process.env['AWS_REGION'] || 'ap-hyderabad-1';
       this.endpoint = process.env['S3_ENDPOINT'];
       this.forcePathStyle =
         process.env['S3_FORCE_PATH_STYLE'] === 'true' ||
@@ -62,9 +70,6 @@ export class WorkerStorageService {
           this.endpoint &&
           (this.endpoint.includes('localhost') || this.endpoint.includes('127.0.0.1')),
         );
-
-      const nodeEnv = process.env['NODE_ENV'];
-      const isProductionOrStaging = nodeEnv === 'production' || nodeEnv === 'staging';
 
       if (!this.bucket || !this.accessKeyId || !this.secretAccessKey) {
         if (isProductionOrStaging) {

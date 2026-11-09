@@ -114,7 +114,7 @@ export function calculateAssessmentSummary(
     }
 
     if (def?.requirementType === 'MUST_HAVE') {
-      if (res.status === 'NOT_FOUND' || res.status === 'UNVERIFIED' || res.status === 'UNCERTAIN') {
+      if (res.status !== 'MATCH') {
         hasMustHaveFailureOrMissing = true;
       }
     }

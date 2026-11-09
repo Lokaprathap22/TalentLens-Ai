@@ -53,6 +53,10 @@ function resolvePageNumber(offset: number, pages: PageMapEntry[]): number | null
   return null;
 }
 
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function findExactOrFuzzyQuote(
   sourceText: string,
   rawQuote: string,
@@ -82,23 +86,22 @@ function findExactOrFuzzyQuote(
     };
   }
 
-  // 3. Normalized whitespace match
-  const normalizedQuote = normalizeWhitespace(quote);
-  const normalizedSource = normalizeWhitespace(sourceText);
-  const normIdx = normalizedSource.indexOf(normalizedQuote);
-  if (normIdx !== -1 && normalizedQuote.length > 15) {
-    // Locate approximate window in source text
-    const sample = normalizedQuote.slice(0, 15);
-    const sampleIdx = sourceText.indexOf(sample);
-    if (sampleIdx !== -1) {
-      return {
-        startOffset: sampleIdx,
-        endOffset: Math.min(sourceText.length, sampleIdx + quote.length),
-        matchedQuote: sourceText.slice(
-          sampleIdx,
-          Math.min(sourceText.length, sampleIdx + quote.length),
-        ),
-      };
+  // 3. Accurate whitespace and newline normalization match with exact source offset mapping
+  const words = quote.split(/\s+/).filter(Boolean);
+  if (words.length > 0) {
+    try {
+      const pattern = words.map(escapeRegExp).join('\\s+');
+      const regex = new RegExp(pattern, 'i');
+      const m = regex.exec(sourceText);
+      if (m && m.index !== undefined) {
+        return {
+          startOffset: m.index,
+          endOffset: m.index + m[0].length,
+          matchedQuote: m[0],
+        };
+      }
+    } catch {
+      // Fallback if regex generation fails for edge-case characters
     }
   }
 
@@ -116,6 +119,9 @@ export function verifyCriterionAssessments(
   const providerOutputMap = new Map<string, AssessmentCriterionOutput>();
 
   for (const out of providerOutputs) {
+    if (providerOutputMap.has(out.criterionId)) {
+      throw new Error(`Duplicate criterionId in provider outputs: ${out.criterionId}`);
+    }
     providerOutputMap.set(out.criterionId, out);
   }
 

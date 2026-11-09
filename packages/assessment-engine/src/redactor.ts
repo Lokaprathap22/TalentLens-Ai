@@ -1,5 +1,6 @@
 export interface RedactionEntry {
-  type: 'EMAIL' | 'PHONE' | 'URL' | 'IDENTIFIER' | 'NAME' | 'ADDRESS' | 'DATE_OF_BIRTH';
+  type:
+    'EMAIL' | 'PHONE' | 'URL' | 'IDENTIFIER' | 'NAME' | 'ADDRESS' | 'DATE_OF_BIRTH' | 'DEMOGRAPHIC';
   startOffset: number;
   endOffset: number;
 }
@@ -75,6 +76,16 @@ const ZIP_CODE_REGEX = /\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/g;
 // Explicitly labeled dates of birth (strictly excludes employment date ranges like 2018 - 2022)
 const DOB_REGEX =
   /\b(?:DOB|D\.O\.B\.|Date of Birth|Birthdate|Birth Date|Born on|Born)\s*[:-]?\s*(?:\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?),?\s+\d{4})\b/gi;
+
+// Protected demographic declarations
+const GENDER_REGEX = /\b(?:Gender|Sex)\s*[:-]?\s*(?:Male|Female|Non-binary|Transgender|Other)\b/gi;
+const SALUTATION_REGEX = /\b(?:Mr\.|Mrs\.|Ms\.|Miss)\s+[A-Z][a-z]+\b/g;
+const MARITAL_STATUS_REGEX =
+  /\b(?:Marital\s+Status|Family\s+Status)\s*[:-]?\s*(?:Single|Married|Divorced|Widowed|Separated)\b/gi;
+const DEMOGRAPHIC_DECLARATION_REGEX =
+  /\b(?:Nationality|Citizenship|Religion|Caste)\s*[:-]?\s*[A-Za-z\s-]{2,30}\b/gi;
+const AGE_DECLARATION_REGEX =
+  /\b(?:Age\s*[:-]?\s*\d{1,2}(?:\s*years(?:\s*old)?)?|\b\d{1,2}\s+years\s+old)\b/gi;
 
 /**
  * Deterministically redacts known candidate PII (names, contact details, explicit addresses, DOB)
@@ -188,6 +199,25 @@ export function redactResumeText(
       end: match.index + match[0].length,
       type: 'DATE_OF_BIRTH',
     });
+  }
+
+  // 5b. Demographic declarations (Gender, Salutations, Marital Status, Nationality, explicit Age)
+  const demographicRegexes = [
+    GENDER_REGEX,
+    SALUTATION_REGEX,
+    MARITAL_STATUS_REGEX,
+    DEMOGRAPHIC_DECLARATION_REGEX,
+    AGE_DECLARATION_REGEX,
+  ];
+  for (const regex of demographicRegexes) {
+    const rx = new RegExp(regex);
+    while ((match = rx.exec(sourceText)) !== null) {
+      spans.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        type: 'DEMOGRAPHIC',
+      });
+    }
   }
 
   // 6. Known candidate names (from candidate profile / consent confirmation)

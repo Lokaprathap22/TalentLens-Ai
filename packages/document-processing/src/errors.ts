@@ -18,3 +18,19 @@ export class EncryptedDocumentError extends Error {
     this.name = 'EncryptedDocumentError';
   }
 }
+
+export class OcrRuntimeUnavailableError extends Error {
+  constructor(
+    message = 'OCR runtime (tesseract or pdftoppm) is not installed or available on this system',
+  ) {
+    super(message);
+    this.name = 'OcrRuntimeUnavailableError';
+  }
+}
+
+export class DocumentProcessingTimeoutError extends Error {
+  constructor(message = 'Document processing exceeded timeout limit') {
+    super(message);
+    this.name = 'DocumentProcessingTimeoutError';
+  }
+}

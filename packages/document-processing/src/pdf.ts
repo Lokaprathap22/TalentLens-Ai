@@ -1,15 +1,83 @@
-import zlib from 'node:zlib';
-
-import { InvalidDocumentFormatError, SecurityLimitExceededError } from './errors.js';
+import { inflateBounded } from './decompress.js';
+import {
+  DocumentProcessingTimeoutError,
+  EncryptedDocumentError,
+  InvalidDocumentFormatError,
+  SecurityLimitExceededError,
+} from './errors.js';
+import { assertPdfGeometryWithinLimitsAsync, type ImageDimensionLimits } from './image-limits.js';
 import type {
   DocumentParser,
   ExtractionQualityStatus,
+  OcrProvider,
   PagePosition,
   ParserResult,
   ResumeFileType,
 } from './types.js';
 
+export interface PdfExtractorOptions {
+  maxFileSizeBytes?: number;
+  maxDecompressedStreamBytes?: number;
+  maxTotalDecompressedBytes?: number;
+  maxPages?: number;
+  maxStreams?: number;
+  maxCompressionRatio?: number;
+  maxImageWidth?: number;
+  maxImageHeight?: number;
+  maxImagePixels?: number;
+  maxAggregateImagePixels?: number;
+  pdfRasterDpi?: number;
+  maxRasterDpi?: number;
+  maxInspectedDictionaries?: number;
+  maxInspectedObjects?: number;
+  timeoutMs?: number;
+}
+
+interface PdfDecompressionState {
+  totalDecompressedBytes: number;
+  streamCount: number;
+  deadlineMs: number;
+}
+
 export class PdfTextExtractor implements DocumentParser {
+  private readonly maxFileSizeBytes: number;
+  private readonly maxDecompressedStreamBytes: number;
+  private readonly maxTotalDecompressedBytes: number;
+  private readonly maxPages: number;
+  private readonly maxStreams: number;
+  private readonly maxCompressionRatio: number;
+  private readonly maxInspectedObjects: number;
+  private readonly imageLimits: ImageDimensionLimits;
+  private readonly timeoutMs: number;
+
+  constructor(
+    private readonly ocrProvider?: OcrProvider,
+    options: PdfExtractorOptions = {},
+  ) {
+    this.maxFileSizeBytes = options.maxFileSizeBytes ?? 25 * 1024 * 1024; // 25 MB
+    this.maxDecompressedStreamBytes = options.maxDecompressedStreamBytes ?? 10 * 1024 * 1024; // 10 MB per stream
+    this.maxTotalDecompressedBytes = options.maxTotalDecompressedBytes ?? 25 * 1024 * 1024; // 25 MB aggregate
+    this.maxPages = options.maxPages ?? 200;
+    this.maxStreams = options.maxStreams ?? 2000;
+    this.maxCompressionRatio = options.maxCompressionRatio ?? 100;
+    this.maxInspectedObjects = options.maxInspectedObjects ?? 25_000;
+    this.imageLimits = {
+      maxImageWidth: options.maxImageWidth ?? 10_000,
+      maxImageHeight: options.maxImageHeight ?? 10_000,
+      maxImagePixels: options.maxImagePixels ?? 25_000_000,
+      maxAggregatePixels: options.maxAggregateImagePixels ?? 75_000_000,
+      maxRenderedPages: 10,
+      maxInputPages: this.maxPages,
+      pdfRasterDpi: options.pdfRasterDpi ?? 150,
+      maxRasterDpi: options.maxRasterDpi ?? 600,
+      ...(options.maxInspectedDictionaries !== undefined
+        ? { maxInspectedDictionaries: options.maxInspectedDictionaries }
+        : {}),
+      maxInspectedObjects: this.maxInspectedObjects,
+    };
+    this.timeoutMs = options.timeoutMs ?? 15_000;
+  }
+
   public supports(fileType: ResumeFileType): boolean {
     return fileType === 'PDF';
   }
@@ -19,6 +87,15 @@ export class PdfTextExtractor implements DocumentParser {
     if (!buffer.subarray(0, 5).toString('ascii').startsWith('%PDF')) {
       throw new InvalidDocumentFormatError('Missing PDF file signature (%PDF)');
     }
+
+    if (buffer.length > this.maxFileSizeBytes) {
+      throw new SecurityLimitExceededError(
+        `PDF size ${buffer.length} bytes exceeds ${this.maxFileSizeBytes} byte security limit`,
+      );
+    }
+
+    const deadlineMs = Date.now() + this.timeoutMs;
+    this.checkDeadline(deadlineMs);
 
     // 2. Encryption check: reject encrypted documents safely with clear message
     if (this.isEncrypted(buffer)) {
@@ -38,18 +115,62 @@ export class PdfTextExtractor implements DocumentParser {
     }
 
     try {
+      const pdfText = buffer.toString('binary');
+      this.checkDeadline(deadlineMs);
+
+      // 3. Bound image dimensions, /ObjStm streams, and rendered page sizes before decoding content streams or OCR
+      const geometry = await assertPdfGeometryWithinLimitsAsync(buffer, {
+        ...this.imageLimits,
+        maxDecompressedStreamBytes: this.maxDecompressedStreamBytes,
+        maxTotalDecompressedBytes: this.maxTotalDecompressedBytes,
+        maxStreams: this.maxStreams,
+        maxCompressionRatio: this.maxCompressionRatio,
+        deadlineMs,
+      });
+
+      // 4. Reject excessive declared page counts early
+      this.assertDeclaredPageCountWithinLimit(pdfText);
+
+      // 5. Index indirect PDF objects linearly and merge bounded /ObjStm expanded objects
+      const objectsMap = this.indexPdfObjects(pdfText, deadlineMs);
+      for (const [objNum, body] of geometry.objectBodies.entries()) {
+        if (!objectsMap.has(objNum)) {
+          objectsMap.set(objNum, body);
+        }
+      }
+      if (objectsMap.size > this.maxInspectedObjects) {
+        throw new SecurityLimitExceededError(
+          `PDF object count exceeds maximum inspected limit of ${this.maxInspectedObjects}`,
+        );
+      }
+
       const pagePositions: PagePosition[] = [];
       const extractedPages: string[] = [];
 
       // Check for PDF 1.5+ Object Streams
-      const hasObjectStreams = buffer.includes(Buffer.from('/ObjStm'));
+      const hasObjectStreams = geometry.hasObjectStreams || buffer.includes(Buffer.from('/ObjStm'));
 
-      // Find all page objects in the PDF
-      const pageObjectIndices = this.findPageObjects(buffer);
+      // Find all page objects in the PDF (preserving catalog/tree page order when available)
+      const pageObjectIndices =
+        geometry.orderedPageObjNums.length > 0
+          ? geometry.orderedPageObjNums
+          : this.findPageObjects(objectsMap);
+      if (pageObjectIndices.length > this.maxPages) {
+        throw new SecurityLimitExceededError(
+          `PDF contains ${pageObjectIndices.length} pages, exceeding ${this.maxPages} page limit`,
+        );
+      }
+
+      const decompressionState: PdfDecompressionState = {
+        totalDecompressedBytes: geometry.decompressedBytes,
+        streamCount: geometry.streamCount,
+        deadlineMs,
+      };
+      const visitedStreamObjNums = new Set<number>(geometry.expandedObjStmIds);
 
       if (pageObjectIndices.length === 0) {
         // Fallback: extract any content streams in the entire document
-        const streamTexts = this.extractAllStreams(buffer);
+        const streamTexts = await this.extractAllStreams(pdfText, decompressionState);
         if (streamTexts.length > 0) {
           extractedPages.push(streamTexts.join('\n'));
           pagePositions.push({
@@ -62,8 +183,14 @@ export class PdfTextExtractor implements DocumentParser {
       } else {
         let currentOffset = 0;
         for (let i = 0; i < pageObjectIndices.length; i += 1) {
+          this.checkDeadline(deadlineMs);
           const pageObjNum = pageObjectIndices[i]!;
-          const pageText = this.extractTextForPage(buffer, pageObjNum);
+          const pageText = await this.extractTextForPage(
+            objectsMap,
+            pageObjNum,
+            decompressionState,
+            visitedStreamObjNums,
+          );
           extractedPages.push(pageText);
 
           const startOffset = currentOffset;
@@ -78,25 +205,90 @@ export class PdfTextExtractor implements DocumentParser {
           // 2 newline separation between pages
           currentOffset = endOffset + 2;
         }
+
+        // Verify any remaining FlateDecode streams (e.g., XObjects or unreferenced objects) cannot bypass decompression bounds
+        await this.verifyUnvisitedFlateStreams(
+          objectsMap,
+          visitedStreamObjNums,
+          decompressionState,
+        );
       }
 
       const fullText = extractedPages.join('\n\n').trim();
 
-      // Check if scanned, object-stream-compressed without extracted text, or empty
-      const isScannedOrEmpty = fullText.length === 0;
-      const hasImages = buffer.includes(Buffer.from('/Image'));
+      // Check if scanned (no text layer) or image-dominant with sparse text (< 100 characters)
+      const hasImages =
+        buffer.includes(Buffer.from('/Image')) || buffer.includes(Buffer.from('/DCTDecode'));
+      const isScannedOrEmpty = fullText.length === 0 || (hasImages && fullText.length < 100);
 
       let warning: string | undefined;
       let qualityStatus: ExtractionQualityStatus = 'COMPLETE';
+      let ocrUsed = false;
+      let finalExtractedText = fullText;
 
       if (isScannedOrEmpty) {
-        qualityStatus = 'NEEDS_REVIEW';
-        if (hasImages) {
-          warning = 'Document appears to be a scanned image or photograph. OCR is required.';
-        } else if (hasObjectStreams) {
-          warning = 'Document uses PDF 1.5+ object stream compression without extractable text.';
+        if (this.ocrProvider && this.ocrProvider.supports(buffer)) {
+          try {
+            this.checkDeadline(deadlineMs);
+            const ocrResult = await this.ocrProvider.extractText(buffer);
+            if (
+              ocrResult &&
+              ocrResult.text.trim().length > 0 &&
+              (ocrResult.confidence === undefined || ocrResult.confidence >= 0.5)
+            ) {
+              finalExtractedText = ocrResult.text.trim();
+              ocrUsed = true;
+              qualityStatus = ocrResult.isPartial ? 'NEEDS_REVIEW' : 'COMPLETE';
+              if (ocrResult.isPartial) {
+                warning = `Document has ${ocrResult.totalPages ?? 'multiple'} pages, exceeding the OCR processing limit. Partial OCR extraction performed on first ${ocrResult.pages?.length ?? 10} pages. Recruiter review required.`;
+              }
+              pagePositions.length = 0;
+              if (ocrResult.pages && ocrResult.pages.length > 0) {
+                for (const p of ocrResult.pages) {
+                  pagePositions.push({
+                    pageNumber: p.pageNumber,
+                    startOffset: p.startOffset,
+                    endOffset: p.endOffset,
+                    text: p.text,
+                  });
+                }
+              } else {
+                pagePositions.push({
+                  pageNumber: 1,
+                  startOffset: 0,
+                  endOffset: finalExtractedText.length,
+                  text: finalExtractedText,
+                });
+              }
+            } else {
+              qualityStatus = 'NEEDS_REVIEW';
+              finalExtractedText = ocrResult?.text.trim() || fullText;
+              warning = hasImages
+                ? 'Document appears to be a scanned image or photograph. OCR yielded low-confidence or sparse text.'
+                : 'Document contains low-confidence or unreadable text content.';
+            }
+          } catch (err: unknown) {
+            if (
+              err instanceof SecurityLimitExceededError ||
+              err instanceof DocumentProcessingTimeoutError ||
+              err instanceof InvalidDocumentFormatError
+            ) {
+              throw err;
+            }
+            qualityStatus = 'NEEDS_REVIEW';
+            ocrUsed = false;
+            finalExtractedText = fullText;
+            warning = 'OCR extraction failed. Recruiter review required.';
+          }
         } else {
-          warning = 'Document contains no readable text content.';
+          qualityStatus = 'NEEDS_REVIEW';
+          if (hasImages) {
+            warning = 'Document appears to be a scanned image or photograph. OCR is required.';
+          } else if (hasObjectStreams) {
+            warning = 'Document uses PDF 1.5+ object stream compression without extractable text.';
+          } else {
+            warning = 'Document contains no readable text content.';
+          }
         }
       }
 
@@ -107,22 +299,28 @@ export class PdfTextExtractor implements DocumentParser {
         ...(isScannedOrEmpty
           ? {
               scanned: hasImages,
+              ocrUsed,
               warning,
             }
           : {}),
       };
 
       return {
-        extractedText: fullText,
+        extractedText: finalExtractedText,
         pageMapJson,
-        parser: 'talentlens-pdf-v1',
-        ocrUsed: false,
+        parser: ocrUsed ? 'talentlens-pdf-ocr-v1' : 'talentlens-pdf-v1',
+        ocrUsed,
         qualityStatus,
         warning,
         objectStreamsDetected: hasObjectStreams,
       };
     } catch (err: unknown) {
-      if (err instanceof InvalidDocumentFormatError || err instanceof SecurityLimitExceededError) {
+      if (
+        err instanceof InvalidDocumentFormatError ||
+        err instanceof SecurityLimitExceededError ||
+        err instanceof EncryptedDocumentError ||
+        err instanceof DocumentProcessingTimeoutError
+      ) {
         throw err;
       }
       return {
@@ -135,37 +333,196 @@ export class PdfTextExtractor implements DocumentParser {
     }
   }
 
+  private checkDeadline(deadlineMs: number): void {
+    if (Date.now() > deadlineMs) {
+      throw new DocumentProcessingTimeoutError(
+        `PDF parsing exceeded ${this.timeoutMs}ms timeout limit`,
+      );
+    }
+  }
+
   private isEncrypted(buffer: Buffer): boolean {
     const text = buffer.toString('binary');
-    // Match /Encrypt in dictionary trailer or root
     return /\/Encrypt\b/i.test(text);
   }
 
-  private findPageObjects(buffer: Buffer): number[] {
-    const pages: number[] = [];
-    const text = buffer.toString('binary');
-    // Match: N M obj << ... /Type /Page ... >> within a single object, excluding /Pages
-    const pageRegex = /(\d+)\s+\d+\s+obj\b(?:(?!endobj)[\s\S])*?\/Type\s*\/Page\b(?!s)/gi;
+  private assertDeclaredPageCountWithinLimit(pdfText: string): void {
+    const pagesCountRegex = /\/Type\s*\/Pages\b(?:(?!endobj)[\s\S])*?\/Count\s+(\d+)/gi;
     let match: RegExpExecArray | null;
+    while ((match = pagesCountRegex.exec(pdfText)) !== null) {
+      const count = parseInt(match[1]!, 10);
+      if (!isNaN(count) && count > this.maxPages) {
+        throw new SecurityLimitExceededError(
+          `PDF declares ${count} pages, exceeding ${this.maxPages} page limit`,
+        );
+      }
+    }
+  }
 
-    while ((match = pageRegex.exec(text)) !== null) {
+  private indexPdfObjects(pdfText: string, deadlineMs: number): Map<number, string> {
+    const objects = new Map<number, string>();
+    const headerRegex = /(\d+)\s+\d+\s+obj\b/g;
+    let match: RegExpExecArray | null;
+    let scanned = 0;
+
+    while ((match = headerRegex.exec(pdfText)) !== null) {
+      scanned += 1;
+      if (scanned % 200 === 0) {
+        this.checkDeadline(deadlineMs);
+      }
+      if (scanned > this.maxInspectedObjects) {
+        throw new SecurityLimitExceededError(
+          `PDF object count exceeds maximum inspected limit of ${this.maxInspectedObjects}`,
+        );
+      }
+
       const objNum = parseInt(match[1]!, 10);
-      if (!isNaN(objNum)) {
+      const bodyStart = match.index + match[0].length;
+      const endObjIdx = pdfText.indexOf('endobj', bodyStart);
+      if (endObjIdx === -1) {
+        continue;
+      }
+
+      if (!isNaN(objNum) && !objects.has(objNum)) {
+        objects.set(objNum, pdfText.slice(bodyStart, endObjIdx));
+      }
+      headerRegex.lastIndex = endObjIdx + 'endobj'.length;
+    }
+
+    return objects;
+  }
+
+  private findPageObjects(objectsMap: Map<number, string>): number[] {
+    const pages: number[] = [];
+    for (const [objNum, body] of objectsMap.entries()) {
+      if (/\/Type\s*\/Page\b(?!s)/i.test(body)) {
         pages.push(objNum);
       }
     }
     return pages;
   }
 
-  private extractTextForPage(buffer: Buffer, pageObjNum: number): string {
-    const text = buffer.toString('binary');
+  private extractStreamSegmentsFromBody(
+    body: string,
+  ): { header: string; rawData: Buffer; isFlate: boolean; isImage: boolean } | null {
+    const streamKwRegex = /\bstream(?:\r\n|\n|\r)/;
+    const streamKwMatch = streamKwRegex.exec(body);
+    if (!streamKwMatch) return null;
 
-    // Find the page object definition
-    const objRegex = new RegExp(`${pageObjNum}\\s+\\d+\\s+obj\\b([\\s\\S]*?)endobj`, 'i');
-    const objMatch = objRegex.exec(text);
-    if (!objMatch) return '';
+    const header = body.slice(0, streamKwMatch.index);
+    const dataStart = streamKwMatch.index + streamKwMatch[0].length;
 
-    const pageBody = objMatch[1]!;
+    const endStreamIdx = body.indexOf('endstream', dataStart);
+    if (endStreamIdx === -1) return null;
+
+    let dataEnd = endStreamIdx;
+    if (dataEnd >= dataStart + 2 && body[dataEnd - 2] === '\r' && body[dataEnd - 1] === '\n') {
+      dataEnd -= 2;
+    } else if (
+      dataEnd >= dataStart + 1 &&
+      (body[dataEnd - 1] === '\n' || body[dataEnd - 1] === '\r')
+    ) {
+      dataEnd -= 1;
+    }
+
+    const rawData = Buffer.from(body.slice(dataStart, dataEnd), 'binary');
+    const isFlate = /\/Filter\s*(?:\[[^\]]*)?\/FlateDecode\b/i.test(header);
+    const isImage = /\/Subtype\s*\/Image\b/i.test(header);
+    return { header, rawData, isFlate, isImage };
+  }
+
+  private hasOnlyFlateFilter(header: string): boolean {
+    return (
+      /\/Filter\s*(?:\[\s*)?\/FlateDecode\b/i.test(header) &&
+      !/\/(?:ASCII85Decode|ASCIIHexDecode|LZWDecode|RunLengthDecode|DCTDecode|JPXDecode|CCITTFaxDecode|JBIG2Decode)\b/i.test(
+        header,
+      )
+    );
+  }
+
+  private async inflatePdfStreamBounded(
+    raw: Buffer,
+    state: PdfDecompressionState,
+    retainOutput: boolean,
+    label: string,
+    strictFlateErrors: boolean,
+  ): Promise<Buffer | null> {
+    this.checkDeadline(state.deadlineMs);
+
+    state.streamCount += 1;
+    if (state.streamCount > this.maxStreams) {
+      throw new SecurityLimitExceededError(`PDF contains more than ${this.maxStreams} streams`);
+    }
+
+    const remainingTotal = this.maxTotalDecompressedBytes - state.totalDecompressedBytes;
+    const budget = Math.min(this.maxDecompressedStreamBytes, remainingTotal);
+    if (budget <= 0 && raw.length > 0) {
+      throw new SecurityLimitExceededError(
+        `Total PDF decompressed stream bytes exceed ${this.maxTotalDecompressedBytes} byte limit`,
+      );
+    }
+
+    let result;
+    try {
+      result = await inflateBounded(raw, {
+        mode: 'zlib',
+        maxOutputBytes: budget,
+        maxCompressionRatio: this.maxCompressionRatio,
+        ratioMinOutputBytes: 512,
+        deadlineMs: state.deadlineMs,
+        retainOutput,
+        entryLabel: label,
+      });
+    } catch (zlibErr: unknown) {
+      if (
+        zlibErr instanceof SecurityLimitExceededError ||
+        zlibErr instanceof DocumentProcessingTimeoutError
+      ) {
+        throw zlibErr;
+      }
+      // Retry as raw DEFLATE only when standard zlib header failed
+      try {
+        result = await inflateBounded(raw, {
+          mode: 'raw',
+          maxOutputBytes: budget,
+          maxCompressionRatio: this.maxCompressionRatio,
+          ratioMinOutputBytes: 512,
+          deadlineMs: state.deadlineMs,
+          retainOutput,
+          entryLabel: label,
+        });
+      } catch (rawErr: unknown) {
+        if (
+          rawErr instanceof SecurityLimitExceededError ||
+          rawErr instanceof DocumentProcessingTimeoutError
+        ) {
+          throw rawErr;
+        }
+        if (strictFlateErrors) {
+          throw new InvalidDocumentFormatError(`Malformed FlateDecode stream in PDF (${label})`);
+        }
+        return null;
+      }
+    }
+
+    state.totalDecompressedBytes += result.bytesOut;
+    if (state.totalDecompressedBytes > this.maxTotalDecompressedBytes) {
+      throw new SecurityLimitExceededError(
+        `Total PDF decompressed stream bytes exceed ${this.maxTotalDecompressedBytes} byte limit`,
+      );
+    }
+
+    return result.buffer;
+  }
+
+  private async extractTextForPage(
+    objectsMap: Map<number, string>,
+    pageObjNum: number,
+    state: PdfDecompressionState,
+    visitedStreamObjNums: Set<number>,
+  ): Promise<string> {
+    const pageBody = objectsMap.get(pageObjNum);
+    if (!pageBody) return '';
 
     // Extract Contents references: /Contents N 0 R or /Contents [N 0 R M 0 R]
     const contentsRefRegex = /\/Contents\s+(?:\[([\d\sR]+)\]|(\d+)\s+\d+\s+R)/i;
@@ -186,66 +543,115 @@ export class PdfTextExtractor implements DocumentParser {
 
     const pageTexts: string[] = [];
     for (const streamObjNum of streamObjNums) {
-      const streamText = this.extractStreamText(buffer, streamObjNum);
+      visitedStreamObjNums.add(streamObjNum);
+      const streamText = await this.extractStreamText(objectsMap, streamObjNum, state);
       if (streamText) pageTexts.push(streamText);
     }
 
     return pageTexts.join('\n').trim();
   }
 
-  private extractStreamText(buffer: Buffer, streamObjNum: number): string {
-    const text = buffer.toString('binary');
-    const streamRegex = new RegExp(
-      `${streamObjNum}\\s+\\d+\\s+obj\\b([\\s\\S]*?)stream\r?\n([\\s\\S]*?)\r?\nendstream`,
-      'i',
-    );
-    const match = streamRegex.exec(text);
-    if (!match) return '';
+  private async extractStreamText(
+    objectsMap: Map<number, string>,
+    streamObjNum: number,
+    state: PdfDecompressionState,
+  ): Promise<string> {
+    const objBody = objectsMap.get(streamObjNum);
+    if (!objBody) return '';
 
-    const header = match[1]!;
-    const streamRaw = Buffer.from(match[2]!, 'binary');
+    const seg = this.extractStreamSegmentsFromBody(objBody);
+    if (!seg) return '';
 
-    let decompressed: Buffer = streamRaw;
-    if (/\/Filter\s*\/FlateDecode/i.test(header)) {
-      try {
-        decompressed = zlib.inflateSync(streamRaw);
-      } catch {
-        try {
-          decompressed = zlib.inflateRawSync(streamRaw);
-        } catch {
-          return '';
-        }
-      }
+    let decompressed: Buffer = seg.rawData;
+    if (seg.isFlate) {
+      const strict = !seg.isImage && this.hasOnlyFlateFilter(seg.header);
+      const inflated = await this.inflatePdfStreamBounded(
+        seg.rawData,
+        state,
+        true,
+        `object ${streamObjNum}`,
+        strict,
+      );
+      if (!inflated) return '';
+      decompressed = inflated;
     }
 
     return this.parsePdfContentStream(decompressed);
   }
 
-  private extractAllStreams(buffer: Buffer): string[] {
-    const text = buffer.toString('binary');
-    const streamRegex = /<<([\s\S]*?)>>\s*stream\r?\n([\s\S]*?)\r?\nendstream/gi;
+  private async verifyUnvisitedFlateStreams(
+    objectsMap: Map<number, string>,
+    visitedStreamObjNums: Set<number>,
+    state: PdfDecompressionState,
+  ): Promise<void> {
+    for (const [objNum, body] of objectsMap.entries()) {
+      if (visitedStreamObjNums.has(objNum)) continue;
+      const seg = this.extractStreamSegmentsFromBody(body);
+      if (!seg || !seg.isFlate) continue;
+
+      const strict = !seg.isImage && this.hasOnlyFlateFilter(seg.header);
+      await this.inflatePdfStreamBounded(seg.rawData, state, false, `object ${objNum}`, strict);
+    }
+  }
+
+  private async extractAllStreams(
+    pdfText: string,
+    state: PdfDecompressionState,
+  ): Promise<string[]> {
     const results: string[] = [];
+    const headerStreamRegex = /<<([\s\S]*?)>>\s*stream(?:\r\n|\n|\r)/gi;
     let match: RegExpExecArray | null;
+    let streamIndex = 0;
 
-    while ((match = streamRegex.exec(text)) !== null) {
+    while ((match = headerStreamRegex.exec(pdfText)) !== null) {
+      this.checkDeadline(state.deadlineMs);
+      streamIndex += 1;
+
       const header = match[1]!;
-      const raw = Buffer.from(match[2]!, 'binary');
-      let decompressed = raw;
+      const dataStart = match.index + match[0].length;
+      const endStreamIdx = pdfText.indexOf('endstream', dataStart);
+      if (endStreamIdx === -1) break;
 
-      if (/\/Filter\s*\/FlateDecode/i.test(header)) {
-        try {
-          decompressed = zlib.inflateSync(raw);
-        } catch {
-          try {
-            decompressed = zlib.inflateRawSync(raw);
-          } catch {
-            continue;
-          }
-        }
+      let dataEnd = endStreamIdx;
+      if (
+        dataEnd >= dataStart + 2 &&
+        pdfText[dataEnd - 2] === '\r' &&
+        pdfText[dataEnd - 1] === '\n'
+      ) {
+        dataEnd -= 2;
+      } else if (
+        dataEnd >= dataStart + 1 &&
+        (pdfText[dataEnd - 1] === '\n' || pdfText[dataEnd - 1] === '\r')
+      ) {
+        dataEnd -= 1;
       }
 
-      const streamText = this.parsePdfContentStream(decompressed);
-      if (streamText.trim()) results.push(streamText.trim());
+      headerStreamRegex.lastIndex = endStreamIdx + 'endstream'.length;
+
+      const raw = Buffer.from(pdfText.slice(dataStart, dataEnd), 'binary');
+      const isObjStm = /\/Type\s*\/ObjStm\b/i.test(header);
+      if (isObjStm) continue;
+      const isFlate = /\/Filter\s*(?:\[[^\]]*)?\/FlateDecode\b/i.test(header);
+      const isImage = /\/Subtype\s*\/Image\b/i.test(header);
+
+      let decompressed: Buffer = raw;
+      if (isFlate) {
+        const strict = !isImage && this.hasOnlyFlateFilter(header);
+        const inflated = await this.inflatePdfStreamBounded(
+          raw,
+          state,
+          !isImage,
+          `stream ${streamIndex}`,
+          strict,
+        );
+        if (!inflated) continue;
+        decompressed = inflated;
+      }
+
+      if (!isImage) {
+        const streamText = this.parsePdfContentStream(decompressed);
+        if (streamText.trim()) results.push(streamText.trim());
+      }
     }
 
     return results;

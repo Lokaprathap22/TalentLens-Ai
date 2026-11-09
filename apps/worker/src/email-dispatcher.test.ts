@@ -539,5 +539,217 @@ maybeDescribe(
       expect(key1).toMatch(/^interview:[a-f0-9]{32}$/);
       expect(key1).not.toContain('shared-identity');
     });
+
+    it('preserves payloadJson.candidateId alongside provider messageId when marking SENT', async () => {
+      provider.clear();
+      const org = await prisma.organization.create({
+        data: {
+          name: `Disp Preserve Org ${randomUUID().slice(0, 6)}`,
+          normalizedName: `disp-preserve-${Date.now()}-${randomUUID().slice(0, 6)}`,
+        },
+      });
+      const cand = await prisma.candidate.create({
+        data: {
+          organizationId: org.id,
+          candidateCode: `CAN-DISP-${randomUUID().slice(0, 6).toUpperCase()}`,
+          recordStatus: 'ACTIVE',
+        },
+      });
+
+      const id = randomUUID();
+      const key = `worker-preserve-cand-${Date.now()}`;
+      try {
+        const { encryptedPayload, keyId } = encryptEmailPayload(
+          {
+            recipientEmail: 'preserve@example.com',
+            subject: 'Preserve CandidateId',
+            html: '<p>Preserve</p>',
+            text: 'Preserve',
+            metadata: { candidateId: cand.id },
+          },
+          { recordId: id, idempotencyKey: key },
+        );
+
+        await prisma.emailOutbox.create({
+          data: {
+            id,
+            organizationId: org.id,
+            idempotencyKey: key,
+            messageType: 'consent_invitation',
+            recipientEmail: null,
+            recipientRole: 'CANDIDATE',
+            subject: null,
+            html: null,
+            text: null,
+            payloadJson: { candidateId: cand.id },
+            encryptedPayload,
+            keyId,
+            status: 'PENDING',
+          },
+        });
+
+        const processed = await dispatcher.processNextEmail();
+        expect(processed).toBe(true);
+        expect(provider.sentMessages).toHaveLength(1);
+
+        const updated = await prisma.emailOutbox.findUnique({ where: { id } });
+        expect(updated?.status).toBe('SENT');
+        expect(updated?.encryptedPayload).toBeNull();
+        const pj = updated?.payloadJson as Record<string, unknown> | null;
+        expect(pj?.['candidateId']).toBe(cand.id);
+        expect(typeof pj?.['messageId']).toBe('string');
+      } finally {
+        await prisma.emailOutbox.deleteMany({ where: { id } }).catch(() => {});
+        await prisma.candidate.deleteMany({ where: { id: cand.id } }).catch(() => {});
+        await prisma.organization.deleteMany({ where: { id: org.id } }).catch(() => {});
+      }
+    });
+
+    it('cancels and redacts pending outbox record without sending when linked candidate is DELETION_PENDING', async () => {
+      provider.clear();
+      const org = await prisma.organization.create({
+        data: {
+          name: `Disp Cancel Org ${randomUUID().slice(0, 6)}`,
+          normalizedName: `disp-cancel-${Date.now()}-${randomUUID().slice(0, 6)}`,
+        },
+      });
+      const cand = await prisma.candidate.create({
+        data: {
+          organizationId: org.id,
+          candidateCode: `CAN-DEL-${randomUUID().slice(0, 6).toUpperCase()}`,
+          recordStatus: 'DELETION_PENDING',
+        },
+      });
+
+      const id = randomUUID();
+      const key = `worker-cancel-del-${Date.now()}`;
+      try {
+        const { encryptedPayload, keyId } = encryptEmailPayload(
+          {
+            recipientEmail: 'deleted-cand@example.com',
+            subject: 'Should Never Send',
+            html: '<p>Never</p>',
+            text: 'Never',
+            metadata: { candidateId: cand.id },
+          },
+          { recordId: id, idempotencyKey: key },
+        );
+
+        await prisma.emailOutbox.create({
+          data: {
+            id,
+            organizationId: org.id,
+            idempotencyKey: key,
+            messageType: 'consent_invitation',
+            recipientEmail: null,
+            recipientRole: 'CANDIDATE',
+            subject: null,
+            html: null,
+            text: null,
+            payloadJson: { candidateId: cand.id },
+            encryptedPayload,
+            keyId,
+            status: 'PENDING',
+          },
+        });
+
+        const processed = await dispatcher.processNextEmail();
+        expect(processed).toBe(true);
+        expect(provider.sentMessages).toHaveLength(0);
+
+        const updated = await prisma.emailOutbox.findUnique({ where: { id } });
+        expect(updated?.status).toBe('FAILED');
+        expect(updated?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        expect(updated?.encryptedPayload).toBeNull();
+      } finally {
+        await prisma.emailOutbox.deleteMany({ where: { id } }).catch(() => {});
+        await prisma.candidate.deleteMany({ where: { id: cand.id } }).catch(() => {});
+        await prisma.organization.deleteMany({ where: { id: org.id } }).catch(() => {});
+      }
+    });
+
+    it('serializes cleanly with concurrent candidate deletion holding FOR UPDATE lock without deadlock or send', async () => {
+      provider.clear();
+      const org = await prisma.organization.create({
+        data: {
+          name: `Disp Race Org ${randomUUID().slice(0, 6)}`,
+          normalizedName: `disp-race-${Date.now()}-${randomUUID().slice(0, 6)}`,
+        },
+      });
+      const cand = await prisma.candidate.create({
+        data: {
+          organizationId: org.id,
+          candidateCode: `CAN-RACE-${randomUUID().slice(0, 6).toUpperCase()}`,
+          recordStatus: 'ACTIVE',
+        },
+      });
+
+      const id = randomUUID();
+      const key = `worker-lock-race-${Date.now()}`;
+      try {
+        const { encryptedPayload, keyId } = encryptEmailPayload(
+          {
+            recipientEmail: 'race-cand@example.com',
+            subject: 'Concurrent Race Test',
+            html: '<p>Race</p>',
+            text: 'Race',
+            metadata: { candidateId: cand.id },
+          },
+          { recordId: id, idempotencyKey: key },
+        );
+
+        await prisma.emailOutbox.create({
+          data: {
+            id,
+            organizationId: org.id,
+            idempotencyKey: key,
+            messageType: 'consent_invitation',
+            recipientEmail: null,
+            recipientRole: 'CANDIDATE',
+            subject: null,
+            html: null,
+            text: null,
+            payloadJson: { candidateId: cand.id },
+            encryptedPayload,
+            keyId,
+            status: 'PENDING',
+          },
+        });
+
+        // TX A acquires candidates FOR UPDATE first, sleeps so TX B queues behind the row lock,
+        // then flips candidate to DELETION_PENDING and commits (leaving email_outbox untouched
+        // to prove dispatcher re-evaluates committed candidate state after lock wait).
+        let txALockedResolve!: () => void;
+        const txALocked = new Promise<void>((resolve) => {
+          txALockedResolve = resolve;
+        });
+
+        const txAPromise = prisma.$transaction(async (tx) => {
+          await tx.$queryRaw`SELECT id FROM "candidates" WHERE id = ${cand.id}::uuid FOR UPDATE`;
+          txALockedResolve();
+          await new Promise((r) => setTimeout(r, 200));
+          await tx.candidate.update({
+            where: { id: cand.id },
+            data: { recordStatus: 'DELETION_PENDING' },
+          });
+        });
+
+        await txALocked;
+        const dispatchPromise = dispatcher.processNextEmail();
+        const [, dispatchResult] = await Promise.all([txAPromise, dispatchPromise]);
+
+        expect(dispatchResult).toBe(true);
+        expect(provider.sentMessages).toHaveLength(0);
+
+        const updated = await prisma.emailOutbox.findUnique({ where: { id } });
+        expect(updated?.status).toBe('FAILED');
+        expect(updated?.lastErrorCode).toBe('CANDIDATE_DELETION_PENDING');
+        expect(updated?.encryptedPayload).toBeNull();
+      } finally {
+        await prisma.emailOutbox.deleteMany({ where: { id } }).catch(() => {});
+        await prisma.candidate.deleteMany({ where: { id: cand.id } }).catch(() => {});
+        await prisma.organization.deleteMany({ where: { id: org.id } }).catch(() => {});
+      }
+    });
   },
 );
