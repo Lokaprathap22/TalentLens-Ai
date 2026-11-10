@@ -81,34 +81,40 @@ openssl rand -hex 24
 
 ### Mandatory API Environment Variables (`apps/api`):
 
-| Variable                          | Required | Description                              | Example / Notes                                                                                                   |
-| :-------------------------------- | :------- | :--------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                        | Yes      | Deployment environment mode              | `production` or `staging`                                                                                         |
-| `PORT`                            | Yes      | HTTP listening port                      | `3000`                                                                                                            |
-| `DATABASE_URL`                    | Yes      | PostgreSQL connection string             | `postgresql://user:pass@postgres:5432/talentlens`                                                                 |
-| `APP_ORIGIN`                      | Yes      | Strict client origin for CSRF & CORS     | `https://app.talentlens.ai` (no trailing slash/path)                                                              |
-| `EMAIL_OUTBOX_ENCRYPTION_KEY`     | Yes      | Primary AES-256-GCM key for outbox       | 64-char hex string (32 bytes)                                                                                     |
-| `EMAIL_OUTBOX_IDEMPOTENCY_SECRET` | Yes      | HMAC key for deterministic outbox hashes | 64-char hex string (32 bytes)                                                                                     |
-| `STORAGE_DRIVER`                  | Yes      | Resume storage adapter                   | `s3` (mandatory in staging/production)                                                                            |
-| `S3_BUCKET`                       | Yes      | Private S3 bucket name                   | `talentlens-resumes`                                                                                              |
-| `S3_REGION`                       | Yes      | OCI Object Storage region                | `ap-hyderabad-1`                                                                                                  |
-| `S3_ENDPOINT`                     | Optional | OCI S3-compatible endpoint URL           | Dedicated: `https://<ns>.compat.objectstorage.ap-hyderabad-1.oci.customer-oci.com` (or generic `oraclecloud.com`) |
-| `S3_ACCESS_KEY_ID`                | Yes      | OCI Customer Secret Key Access Key       | OCI Access Key String                                                                                             |
-| `S3_SECRET_ACCESS_KEY`            | Yes      | OCI Customer Secret Key Secret           | OCI Secret String                                                                                                 |
-| `S3_FORCE_PATH_STYLE`             | Optional | Enforce path style URL structure         | `true`                                                                                                            |
-| `SCANNER_DRIVER`                  | Yes      | Antivirus scanner driver                 | `clamav`                                                                                                          |
-| `CLAMAV_HOST`                     | Yes      | ClamAV daemon hostname                   | `clamav` (or IP)                                                                                                  |
-| `CLAMAV_PORT`                     | Yes      | ClamAV daemon TCP port                   | `3310`                                                                                                            |
-| `SCANNER_FAIL_CLOSED`             | Yes      | Reject uploads if scanner unreachable    | `true`                                                                                                            |
-| `SMTP_HOST`                       | Yes      | Transactional SMTP server hostname       | `smtp.email.ap-hyderabad-1.oci.oraclecloud.com`                                                                   |
-| `SMTP_PORT`                       | Yes      | SMTP port (587 STARTTLS or 465 SSL)      | `587`                                                                                                             |
-| `SMTP_USER`                       | Optional | SMTP authentication username             | `ocid1.user.oc1...`                                                                                               |
-| `SMTP_PASS`                       | Optional | SMTP authentication password             | SMTP password string                                                                                              |
-| `EMAIL_FROM`                      | Yes      | Default sender address                   | `notifications@talentlens.ai`                                                                                     |
-| `GEMINI_API_KEY`                  | Yes      | Google Gemini API key from AI Studio     | `AIzaSy...`                                                                                                       |
-| `GEMINI_MODEL`                    | Optional | Canonical Gemini production model        | `gemini-3.8-flash`                                                                                                |
-| `GEMINI_TIMEOUT_MS`               | Optional | Gemini API timeout in milliseconds       | `30000` (30s)                                                                                                     |
-| `ASSESSMENT_PROVIDER`             | Optional | AI provider engine                       | `gemini`                                                                                                          |
+| Variable                          | Required    | Description                                 | Example / Notes                                                                                                   |
+| :-------------------------------- | :---------- | :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                        | Yes         | Deployment environment mode                 | `production` or `staging`                                                                                         |
+| `PORT`                            | Yes         | HTTP listening port                         | `3000`                                                                                                            |
+| `DATABASE_URL`                    | Yes         | PostgreSQL connection string                | `postgresql://user:pass@postgres:5432/talentlens`                                                                 |
+| `APP_ORIGIN`                      | Yes         | Strict client origin for CSRF & CORS        | `https://app.talentlens.ai` (no trailing slash/path)                                                              |
+| `EMAIL_OUTBOX_ENCRYPTION_KEY`     | Yes         | Primary AES-256-GCM key for outbox          | 64-char hex string (32 bytes)                                                                                     |
+| `EMAIL_OUTBOX_IDEMPOTENCY_SECRET` | Yes         | HMAC key for deterministic outbox hashes    | 64-char hex string (32 bytes)                                                                                     |
+| `STORAGE_DRIVER`                  | Yes         | Resume storage adapter                      | `s3` (mandatory in staging/production)                                                                            |
+| `S3_BUCKET`                       | Yes         | Private S3 bucket name                      | `talentlens-resumes`                                                                                              |
+| `S3_REGION`                       | Yes         | OCI Object Storage region                   | `ap-hyderabad-1`                                                                                                  |
+| `S3_ENDPOINT`                     | Optional    | OCI S3-compatible endpoint URL              | Dedicated: `https://<ns>.compat.objectstorage.ap-hyderabad-1.oci.customer-oci.com` (or generic `oraclecloud.com`) |
+| `S3_ACCESS_KEY_ID`                | Yes         | OCI Customer Secret Key Access Key          | OCI Access Key String                                                                                             |
+| `S3_SECRET_ACCESS_KEY`            | Yes         | OCI Customer Secret Key Secret              | OCI Secret String                                                                                                 |
+| `S3_FORCE_PATH_STYLE`             | Optional    | Enforce path style URL structure            | `true`                                                                                                            |
+| `SCANNER_DRIVER`                  | Yes         | Antivirus scanner driver                    | `clamav`                                                                                                          |
+| `CLAMAV_HOST`                     | Yes         | ClamAV daemon hostname                      | `clamav` (or IP)                                                                                                  |
+| `CLAMAV_PORT`                     | Yes         | ClamAV daemon TCP port                      | `3310`                                                                                                            |
+| `SCANNER_FAIL_CLOSED`             | Yes         | Reject uploads if scanner unreachable       | `true`                                                                                                            |
+| `SMTP_HOST`                       | Yes         | Transactional SMTP server hostname          | `smtp.email.ap-hyderabad-1.oci.oraclecloud.com`                                                                   |
+| `SMTP_PORT`                       | Yes         | SMTP port (587 STARTTLS or 465 SSL)         | `587`                                                                                                             |
+| `SMTP_USER`                       | Optional    | SMTP authentication username                | `ocid1.user.oc1...`                                                                                               |
+| `SMTP_PASS`                       | Optional    | SMTP authentication password                | SMTP password string                                                                                              |
+| `EMAIL_FROM`                      | Yes         | Default sender address                      | `notifications@talentlens.ai`                                                                                     |
+| `GEMINI_API_KEY`                  | Conditional | Google Gemini API key from AI Studio        | `AIzaSy...` (required unless Groq-only mode via `AI_PROVIDER_ORDER=groq`)                                         |
+| `GEMINI_MODEL`                    | Optional    | Primary Free-Tier Gemini model              | `gemini-3.6-flash`                                                                                                |
+| `GEMINI_FALLBACK_MODEL`           | Optional    | Bounded fallback Free-Tier Gemini model     | `gemini-3.5-flash`                                                                                                |
+| `GEMINI_TIMEOUT_MS`               | Optional    | Gemini API timeout in milliseconds          | `90000` (90s)                                                                                                     |
+| `AI_PROVIDER_ORDER`               | Optional    | Ordered comma-separated AI failover chain   | `gemini,groq` (fails over across configured providers without code edits)                                         |
+| `GROQ_API_KEY`                    | Conditional | Groq Cloud API key for independent failover | `gsk_...` (optional for Gemini-only; enable Groq Console Zero Data Retention before production use)               |
+| `GROQ_MODEL`                      | Optional    | Groq structured-output model ID             | `openai/gpt-oss-120b`                                                                                             |
+| `GROQ_BASE_URL`                   | Optional    | Groq OpenAI-compatible API base URL         | `https://api.groq.com/openai/v1` (`https://` mandatory in production/staging)                                     |
+| `GROQ_TIMEOUT_MS`                 | Optional    | Groq HTTP request timeout in ms             | `90000` (90s)                                                                                                     |
+| `ASSESSMENT_PROVIDER`             | Optional    | AI provider engine mode                     | `gemini` \| `groq` \| `auto` (`gemini` default runs ordered failover chain `AI_PROVIDER_ORDER`)                   |
 
 > [!NOTE]
 > Sessions are stateful and stored in PostgreSQL (`Session` table) via SHA-256 token digests. CSRF tokens are derived dynamically via HMAC-SHA256 from the active session token (`deriveCsrfToken`). No external `SESSION_SECRET` or `CSRF_SECRET` environment variable is required.
@@ -124,7 +130,17 @@ The background worker requires an identical database, storage, SMTP, and crypto 
 - `STORAGE_DRIVER=s3`
 - `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM`
-- `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.8-flash`, `GEMINI_TIMEOUT_MS`, `ASSESSMENT_PROVIDER=gemini`
+- `AI_PROVIDER_ORDER=gemini,groq`, `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.6-flash`, `GEMINI_FALLBACK_MODEL=gemini-3.5-flash`, `GEMINI_TIMEOUT_MS=90000`, `GROQ_API_KEY`, `GROQ_MODEL=openai/gpt-oss-120b`, `GROQ_BASE_URL=https://api.groq.com/openai/v1`, `GROQ_TIMEOUT_MS=90000`, `ASSESSMENT_PROVIDER=gemini`
+
+### Multi-Provider AI Failover & Groq Zero Data Retention (ZDR) Governance
+
+TalentLens AI orchestrates JD extraction (`apps/api`) and candidate assessment (`apps/worker`) across an ordered failover chain (`AI_PROVIDER_ORDER`, default `gemini,groq`):
+
+- **Automatic Failover Eligibility:** If a configured provider fails with invalid/unauthorized credentials (`401`/`403`), rate limits/quota exhaustion (`429`), service capacity unavailability (`503`), upstream 5xx/network errors, timeouts, or repeated invalid JSON/schema output, TalentLens automatically records a sanitized failover warning and attempts the next configured provider (`groq` using `openai/gpt-oss-120b` strict JSON Schema structured outputs).
+- **Fail-Closed Hard-Stop Rules:** Content-safety/policy blocks (`CONTENT_SAFETY`, Groq `finish_reason=content_filter`, or model refusals) and explicit input-validation rejections (`USER_INPUT_INVALID`, e.g., context-length or payload errors) **never retry or fail over** to another provider.
+- **Groq Privacy & Zero Data Retention (ZDR):** Candidate resume assessment prompts contain PII-redacted text (`2026-11-redactor-v2`), while JD extraction sends job descriptions to the active AI vendor. Before enabling `GROQ_API_KEY` on live production or non-synthetic recruitment data, operators **must enable Zero Data Retention (ZDR) / disable data logging and model training in Groq Cloud Console** (`Settings -> Data Controls`), ensuring Groq does not retain prompts or completions after request execution.
+- **Live Verification & Deploy Controllers:** Validate providers independently with `npm run test:gemini`, `npm run test:groq`, and `npm run diagnose:jd -- --provider=auto`. For environment orchestration, use `npm run deploy:local` (`-- --dry-run`, `-- --force`) locally and `npm run deploy:production` (default safe dry-run; `-- --execute --confirm-production --ssh-host <user@host> --remote-dir <path>` for the 10-stage OCI SSH rollout with pre-rollout `.dump` backup, `.release-previous/` source/Compose snapshot, stale-file clean sync, `--strict-perms`, and `.current-release.json` idempotency) validated by `node --test scripts/deploy-scripts.test.mjs` (22 tests).
+- **OCI Server Overlay Requirement (`docker-compose.oci.yml`):** Live OCI deployments running a server-only `docker-compose.oci.yml` must pass `AI_PROVIDER_ORDER`, `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_BASE_URL`, `GROQ_TIMEOUT_MS`, and `ASSESSMENT_PROVIDER` into both `api` and `worker` containers alongside `.env.candidate` before Groq failover is claimed active in live OCI production.
 
 ---
 

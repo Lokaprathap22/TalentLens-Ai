@@ -71,7 +71,12 @@ TALENTLENS_DEPLOY_TEST_MODE="${TALENTLENS_DEPLOY_TEST_MODE:-0}"
 DEPLOY_HTTPS_CURL_CA="${DEPLOY_HTTPS_CURL_CA:-}"
 DEPLOY_CURL_RESOLVE="${DEPLOY_CURL_RESOLVE:-}"
 
-COMPOSE_CMD=("${DOCKER_BIN}" compose -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}")
+COMPOSE_PROJECT_DIR_ARGS=()
+if [[ "${COMPOSE_FILE}" == */* ]]; then
+    COMPOSE_PROJECT_DIR_ARGS=(--project-directory "$(pwd)")
+fi
+
+COMPOSE_CMD=("${DOCKER_BIN}" compose "${COMPOSE_PROJECT_DIR_ARGS[@]}" -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}")
 
 read_env_value() {
     local key="$1"
@@ -156,6 +161,10 @@ if ! command -v "${CURL_BIN}" &>/dev/null; then
     fail_deploy "curl" "curl binary (${CURL_BIN}) is required for readiness probing."
 fi
 
+if [ -L "${ENV_FILE}" ]; then
+    fail_deploy "env-file" "Environment file must not be a symbolic link: ${ENV_FILE}"
+fi
+
 if [ ! -f "${ENV_FILE}" ]; then
     fail_deploy "env-file" "Missing environment file: ${ENV_FILE}"
 fi
@@ -181,11 +190,14 @@ else
     if [ "${ENV_NODE_ENV}" != "production" ]; then
         fail_deploy "env-preflight" "NODE_ENV must be set to 'production' in ${ENV_FILE}."
     fi
-    for req_key in APP_ORIGIN DATABASE_URL POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB EMAIL_OUTBOX_ENCRYPTION_KEY EMAIL_OUTBOX_IDEMPOTENCY_SECRET S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_BUCKET SMTP_HOST SMTP_PORT EMAIL_FROM GEMINI_API_KEY; do
+    for req_key in APP_ORIGIN DATABASE_URL POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB EMAIL_OUTBOX_ENCRYPTION_KEY EMAIL_OUTBOX_IDEMPOTENCY_SECRET S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_BUCKET SMTP_HOST SMTP_PORT EMAIL_FROM; do
         if [ -z "$(read_env_value "${req_key}")" ]; then
             fail_deploy "env-preflight" "Required environment variable '${req_key}' is missing or empty in ${ENV_FILE}."
         fi
     done
+    if [ -z "$(read_env_value GEMINI_API_KEY)" ] && [ -z "$(read_env_value AI_API_KEY)" ] && [ -z "$(read_env_value GROQ_API_KEY)" ]; then
+        fail_deploy "env-preflight" "At least one AI provider key (GEMINI_API_KEY or GROQ_API_KEY) must be configured in ${ENV_FILE}."
+    fi
 fi
 
 PUBLIC_ORIGIN="$(read_env_value APP_ORIGIN)"

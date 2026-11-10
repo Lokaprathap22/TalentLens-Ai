@@ -6,6 +6,7 @@ param (
     [string]$BackupDir = "backups",
     [int]$RetentionDays = 7,
     [string]$ComposeFile = "docker-compose.prod.yml",
+    [string]$ProjectName = "",
     [string]$TargetContainer = "",
     [ValidateSet("plain", "custom")]
     [string]$Format = "plain",
@@ -210,12 +211,17 @@ try {
 
     $envUser = Resolve-EnvSetting -Key "POSTGRES_USER" -FilePath $EnvFile
     $envDb = Resolve-EnvSetting -Key "POSTGRES_DB" -FilePath $EnvFile
+    $envProject = Resolve-EnvSetting -Key "COMPOSE_PROJECT_NAME" -FilePath $EnvFile
 
     $PostgresUser = if ($User.Trim()) { $User.Trim() } elseif ($env:POSTGRES_USER) { $env:POSTGRES_USER.Trim() } elseif ($envUser) { $envUser } else { "talentlens" }
     $PostgresDb = if ($Database.Trim()) { $Database.Trim() } elseif ($env:POSTGRES_DB) { $env:POSTGRES_DB.Trim() } elseif ($envDb) { $envDb } else { "talentlens" }
+    $ResolvedProjectName = if ($ProjectName.Trim()) { $ProjectName.Trim() } elseif ($env:COMPOSE_PROJECT_NAME) { $env:COMPOSE_PROJECT_NAME.Trim() } elseif ($envProject) { $envProject } else { "" }
 
     Assert-PgIdentifier -Value $PostgresUser -Label "PostgreSQL user"
     Assert-PgIdentifier -Value $PostgresDb -Label "PostgreSQL database"
+    if ($ResolvedProjectName.Length -gt 0 -and -not ($ResolvedProjectName -cmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$')) {
+        throw "Invalid ProjectName '$ResolvedProjectName'. Must match ^[A-Za-z0-9][A-Za-z0-9_-]*$."
+    }
 
     Write-Host "================================================================================" -ForegroundColor Cyan
     Write-Host "TALENTLENS AI - DATABASE BACKUP CONTROLLER (POWERSHELL)" -ForegroundColor Cyan
@@ -231,6 +237,7 @@ try {
     $resolvedBackupDir = (Resolve-Path -LiteralPath $BackupDir).Path
 
     # Deterministic container resolution (no arbitrary multi-container selection)
+    $execBinary = $DockerBin
     $dockerPrefix = $null
     $targetDesc = ""
 
@@ -239,15 +246,49 @@ try {
         $dockerPrefix = @("exec", "-i", $resolvedContainer)
         $targetDesc = "container:$resolvedContainer"
     } elseif (Test-Path -LiteralPath $ComposeFile -PathType Leaf) {
-        $composeIdsRaw = ""
+        $composeBinary = ""
+        $composeBaseArgs = New-Object System.Collections.Generic.List[string]
+        $hasDockerComposeSub = $false
         try {
-            $composeIdsRaw = Invoke-NativeTool -FilePath $DockerBin -Arguments @("compose", "-f", $ComposeFile, "ps", "-q", "postgres")
+            [void](Invoke-NativeTool -FilePath $DockerBin -Arguments @("compose", "version"))
+            $hasDockerComposeSub = $true
         } catch {
-            $composeIdsRaw = ""
+            $hasDockerComposeSub = $false
         }
-        if ($composeIdsRaw.Trim().Length -gt 0) {
-            $dockerPrefix = @("compose", "-f", $ComposeFile, "exec", "-T", "postgres")
-            $targetDesc = "compose:$ComposeFile#postgres"
+
+        if ($hasDockerComposeSub) {
+            $composeBinary = $DockerBin
+            $composeBaseArgs.Add("compose")
+        } elseif ($null -ne (Get-Command "docker-compose" -ErrorAction SilentlyContinue)) {
+            $composeBinary = "docker-compose"
+        }
+
+        if ($composeBinary.Length -gt 0) {
+            if ($ResolvedProjectName.Length -gt 0) {
+                $composeBaseArgs.Add("-p")
+                $composeBaseArgs.Add($ResolvedProjectName)
+            }
+            if ($EnvFile.Trim().Length -gt 0 -and (Test-Path -LiteralPath $EnvFile -PathType Leaf)) {
+                $composeBaseArgs.Add("--env-file")
+                $composeBaseArgs.Add($EnvFile)
+            }
+            $composeBaseArgs.Add("-f")
+            $composeBaseArgs.Add($ComposeFile)
+
+            foreach ($svc in @("postgres", "db")) {
+                $composeIdsRaw = ""
+                try {
+                    $composeIdsRaw = Invoke-NativeTool -FilePath $composeBinary -Arguments ($composeBaseArgs.ToArray() + @("ps", "-q", $svc))
+                } catch {
+                    $composeIdsRaw = ""
+                }
+                if ($composeIdsRaw.Trim().Length -gt 0) {
+                    $execBinary = $composeBinary
+                    $dockerPrefix = $composeBaseArgs.ToArray() + @("exec", "-T", $svc)
+                    $targetDesc = "compose:$ComposeFile#$svc"
+                    break
+                }
+            }
         }
     }
 
@@ -256,6 +297,7 @@ try {
         $containers = @($psOut -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 } | Sort-Object -Unique)
         if ($containers.Count -eq 1) {
             $resolvedContainer = $containers[0]
+            $execBinary = $DockerBin
             $dockerPrefix = @("exec", "-i", $resolvedContainer)
             $targetDesc = "container:$resolvedContainer"
         } elseif ($containers.Count -gt 1) {
@@ -268,7 +310,7 @@ try {
     Write-Host "Resolved Target:  $targetDesc" -ForegroundColor Cyan
 
     # Verify PostgreSQL connectivity and target database existence before dumping
-    $dbCheck = Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    $dbCheck = Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", "postgres", "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
         "-t", "-A", "-c", "SELECT 1 FROM pg_database WHERE datname = '$PostgresDb'"
     ))
@@ -288,7 +330,7 @@ try {
 
     Write-Host "Executing pg_dump for '$PostgresDb'..." -ForegroundColor Blue
     if ($Format -eq "custom") {
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
             "pg_dump", "-U", $PostgresUser, "-d", $PostgresDb,
             "--format=custom", "--no-owner", "--no-acl", "--clean", "--if-exists"
         )) -StdoutFilePath $tmpArchiveFile)
@@ -301,9 +343,9 @@ try {
         if ($magicText -cne "PGDMP") {
             throw "Generated custom backup is missing PGDMP header."
         }
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @("pg_restore", "--list")) -StdinFilePath $tmpArchiveFile)
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @("pg_restore", "--list")) -StdinFilePath $tmpArchiveFile)
     } else {
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
             "pg_dump", "-U", $PostgresUser, "-d", $PostgresDb,
             "--format=plain", "--no-owner", "--no-acl", "--clean", "--if-exists"
         )) -StdoutFilePath $tmpRawFile)

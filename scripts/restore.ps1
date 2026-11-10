@@ -12,6 +12,7 @@ param (
     [string]$User = "",
     [string]$TargetContainer = "",
     [string]$ComposeFile = "docker-compose.prod.yml",
+    [string]$ProjectName = "",
     [string]$EnvFile = ".env",
     [string]$DockerBin = "docker"
 )
@@ -172,6 +173,7 @@ function Read-FilePrefixBytes {
 $tempSql = ""
 $createdByScript = $false
 $restoreCompleted = $false
+$execBinary = $DockerBin
 $dockerPrefix = $null
 $PostgresUser = "talentlens"
 
@@ -184,10 +186,15 @@ try {
     }
 
     $envUser = Resolve-EnvSetting -Key "POSTGRES_USER" -FilePath $EnvFile
+    $envProject = Resolve-EnvSetting -Key "COMPOSE_PROJECT_NAME" -FilePath $EnvFile
     $PostgresUser = if ($User.Trim()) { $User.Trim() } elseif ($env:POSTGRES_USER) { $env:POSTGRES_USER.Trim() } elseif ($envUser) { $envUser } else { "talentlens" }
+    $ResolvedProjectName = if ($ProjectName.Trim()) { $ProjectName.Trim() } elseif ($env:COMPOSE_PROJECT_NAME) { $env:COMPOSE_PROJECT_NAME.Trim() } elseif ($envProject) { $envProject } else { "" }
 
     Assert-PgIdentifier -Value $PostgresUser -Label "PostgreSQL user"
     Assert-PgIdentifier -Value $TargetDb.Trim() -Label "target database"
+    if ($ResolvedProjectName.Length -gt 0 -and -not ($ResolvedProjectName -cmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$')) {
+        throw "Invalid ProjectName '$ResolvedProjectName'. Must match ^[A-Za-z0-9][A-Za-z0-9_-]*$."
+    }
     $TargetDb = $TargetDb.Trim()
 
     Write-Host "================================================================================" -ForegroundColor Cyan
@@ -294,18 +301,53 @@ try {
     $targetDesc = ""
     if ($TargetContainer.Trim().Length -gt 0) {
         $resolvedContainer = $TargetContainer.Trim()
+        $execBinary = $DockerBin
         $dockerPrefix = @("exec", "-i", $resolvedContainer)
         $targetDesc = "container:$resolvedContainer"
     } elseif (Test-Path -LiteralPath $ComposeFile -PathType Leaf) {
-        $composeIdsRaw = ""
+        $composeBinary = ""
+        $composeBaseArgs = New-Object System.Collections.Generic.List[string]
+        $hasDockerComposeSub = $false
         try {
-            $composeIdsRaw = Invoke-NativeTool -FilePath $DockerBin -Arguments @("compose", "-f", $ComposeFile, "ps", "-q", "postgres")
+            [void](Invoke-NativeTool -FilePath $DockerBin -Arguments @("compose", "version"))
+            $hasDockerComposeSub = $true
         } catch {
-            $composeIdsRaw = ""
+            $hasDockerComposeSub = $false
         }
-        if ($composeIdsRaw.Trim().Length -gt 0) {
-            $dockerPrefix = @("compose", "-f", $ComposeFile, "exec", "-T", "postgres")
-            $targetDesc = "compose:$ComposeFile#postgres"
+
+        if ($hasDockerComposeSub) {
+            $composeBinary = $DockerBin
+            $composeBaseArgs.Add("compose")
+        } elseif ($null -ne (Get-Command "docker-compose" -ErrorAction SilentlyContinue)) {
+            $composeBinary = "docker-compose"
+        }
+
+        if ($composeBinary.Length -gt 0) {
+            if ($ResolvedProjectName.Length -gt 0) {
+                $composeBaseArgs.Add("-p")
+                $composeBaseArgs.Add($ResolvedProjectName)
+            }
+            if ($EnvFile.Trim().Length -gt 0 -and (Test-Path -LiteralPath $EnvFile -PathType Leaf)) {
+                $composeBaseArgs.Add("--env-file")
+                $composeBaseArgs.Add($EnvFile)
+            }
+            $composeBaseArgs.Add("-f")
+            $composeBaseArgs.Add($ComposeFile)
+
+            foreach ($svc in @("postgres", "db")) {
+                $composeIdsRaw = ""
+                try {
+                    $composeIdsRaw = Invoke-NativeTool -FilePath $composeBinary -Arguments ($composeBaseArgs.ToArray() + @("ps", "-q", $svc))
+                } catch {
+                    $composeIdsRaw = ""
+                }
+                if ($composeIdsRaw.Trim().Length -gt 0) {
+                    $execBinary = $composeBinary
+                    $dockerPrefix = $composeBaseArgs.ToArray() + @("exec", "-T", $svc)
+                    $targetDesc = "compose:$ComposeFile#$svc"
+                    break
+                }
+            }
         }
     }
 
@@ -314,6 +356,7 @@ try {
         $containers = @($psOut -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 } | Sort-Object -Unique)
         if ($containers.Count -eq 1) {
             $resolvedContainer = $containers[0]
+            $execBinary = $DockerBin
             $dockerPrefix = @("exec", "-i", $resolvedContainer)
             $targetDesc = "container:$resolvedContainer"
         } elseif ($containers.Count -gt 1) {
@@ -329,15 +372,15 @@ try {
 
     if ($archiveFormat -eq "custom") {
         Write-Host "Validating custom archive table of contents via pg_restore --list..." -ForegroundColor Blue
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @("pg_restore", "--list")) -StdinFilePath $resolvedArchive)
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @("pg_restore", "--list")) -StdinFilePath $resolvedArchive)
     }
 
     # 4. Target Database Safety Checks
-    [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", "postgres", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-c", "SELECT 1;"
     )))
 
-    $dbExistsRaw = Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    $dbExistsRaw = Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", "postgres", "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
         "-t", "-A", "-c", "SELECT 1 FROM pg_database WHERE datname = '$TargetDb'"
     ))
@@ -353,19 +396,19 @@ try {
             throw "Target database '$TargetDb' does not exist on $targetDesc. Verify the target name or pass -CreateTarget for a fresh staging database."
         }
         Write-Host "Creating fresh staging database '$TargetDb'..." -ForegroundColor Blue
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @("createdb", "-U", $PostgresUser, $TargetDb)))
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @("createdb", "-U", $PostgresUser, $TargetDb)))
         $createdByScript = $true
     }
 
     # 5. Transactional Fail-Closed Restore
     Write-Host "Restoring schema and data transactionally into '$TargetDb'..." -ForegroundColor Blue
     if ($archiveFormat -eq "custom") {
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
             "pg_restore", "-U", $PostgresUser, "-d", $TargetDb,
             "--single-transaction", "--exit-on-error", "--no-owner", "--no-acl", "--clean", "--if-exists"
         )) -StdinFilePath $streamFile)
     } else {
-        [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+        [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
             "psql", "-U", $PostgresUser, "-d", $TargetDb,
             "--no-psqlrc", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-q"
         )) -StdinFilePath $streamFile)
@@ -373,11 +416,11 @@ try {
 
     # 6. Strict Post-Restore Integrity Verification
     Write-Host "Running post-restore schema, migration, and data verification..." -ForegroundColor Blue
-    [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", $TargetDb, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-c", "SELECT 1;"
     )))
 
-    $schemaOk = (Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    $schemaOk = (Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", $TargetDb, "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
         "-t", "-A", "-c", "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'public'"
     ))).Trim()
@@ -385,7 +428,7 @@ try {
         throw "Verification failed: 'public' schema missing in '$TargetDb'."
     }
 
-    $migOk = (Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    $migOk = (Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", $TargetDb, "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
         "-t", "-A", "-c", "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NOT NULL THEN (SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END FROM public._prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL) ELSE 0 END"
     ))).Trim()
@@ -406,7 +449,7 @@ try {
         "candidate_assessments"
     )
     foreach ($tbl in $requiredTables) {
-        $tblOk = (Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+        $tblOk = (Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
             "psql", "-U", $PostgresUser, "-d", $TargetDb, "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
             "-t", "-A", "-c", "SELECT CASE WHEN to_regclass('public.$tbl') IS NOT NULL THEN 1 ELSE 0 END"
         ))).Trim()
@@ -416,7 +459,7 @@ try {
     }
 
     $verifyQuery = "SELECT 'migrations_applied: ' || count(*) FROM public._prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL UNION ALL SELECT 'organizations: ' || count(*) FROM public.organizations UNION ALL SELECT 'users: ' || count(*) FROM public.users UNION ALL SELECT 'clients: ' || count(*) FROM public.clients UNION ALL SELECT 'requisitions: ' || count(*) FROM public.requisitions UNION ALL SELECT 'scorecard_versions: ' || count(*) FROM public.scorecard_versions UNION ALL SELECT 'candidates: ' || count(*) FROM public.candidates UNION ALL SELECT 'candidate_consents: ' || count(*) FROM public.candidate_consents UNION ALL SELECT 'email_outbox: ' || count(*) FROM public.email_outbox UNION ALL SELECT 'resume_documents: ' || count(*) FROM public.resume_documents UNION ALL SELECT 'candidate_assessments: ' || count(*) FROM public.candidate_assessments;"
-    $counts = Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+    $counts = Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
         "psql", "-U", $PostgresUser, "-d", $TargetDb, "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
         "-t", "-A", "-c", $verifyQuery
     ))
@@ -441,7 +484,7 @@ try {
     if (-not $restoreCompleted -and $createdByScript -and $null -ne $dockerPrefix) {
         try {
             Write-Warning "Cleaning up failed staging database '$TargetDb' created by this run..."
-            [void](Invoke-NativeTool -FilePath $DockerBin -Arguments ($dockerPrefix + @(
+            [void](Invoke-NativeTool -FilePath $execBinary -Arguments ($dockerPrefix + @(
                 "psql", "-U", $PostgresUser, "-d", "postgres", "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
                 "-c", "DROP DATABASE IF EXISTS `"$TargetDb`";"
             )))

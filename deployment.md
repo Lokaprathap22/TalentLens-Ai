@@ -10,7 +10,7 @@
 >
 > In OCI Ubuntu 24.04 production, all 14 Prisma migrations are applied, all five runtime containers (`web`, `api`, `worker`, `postgres`, `clamav`) are healthy, host Caddy HTTPS is active, `GET /` returns HTTP 200, `GET /api/v1/health/ready` returns `{"status":"ready","database":"connected"}`, and existing recruiter login, dashboard access, and preserved tenant/client/requisition data have been verified.
 >
-> End-to-end live production smoke tests for **resume upload/OCR/AI assessment** and the **complete client hiring-manager portal workflow** remain **pending** and are documented as such until executed.
+> Before claiming multi-provider Gemini -> Groq failover active in live OCI production, the server-only overlay `/home/ubuntu/talentlens-release-staging-20261110/source/docker-compose.oci.yml` must also propagate `AI_PROVIDER_ORDER` and `GROQ_*` environment variables to both `api` and `worker` containers and deploy the updated codebase. End-to-end live production smoke tests for **resume upload/OCR/AI assessment** and the **complete client hiring-manager portal workflow** remain **pending** and are documented as such until executed.
 
 This guide separates **local development setup** from **OCI production deployment and disaster recovery** so host developer workstations and the production VM never share unsafe defaults. Operational background controls (ClamAV streaming internals, S3 privacy controls, keyring rotation, and single-replica API rate limiting) are also covered in [docs/OPERATOR_RUNBOOK.md](./docs/OPERATOR_RUNBOOK.md).
 
@@ -82,11 +82,17 @@ RESUME_STORAGE_ROOT=./storage/resumes
 SCANNER_DRIVER=mock
 SCANNER_FAIL_CLOSED=true
 
-# Set real Gemini key when exercising live JD extraction or CV AI scoring;
-# leave empty only for UI/API flows not calling Gemini.
+# Multi-Provider AI Configuration (Primary: Gemini -> Fallback: Groq)
+# Leave a provider key empty only if not exercising live AI flows (or failover for that vendor).
+AI_PROVIDER_ORDER=gemini,groq
 GEMINI_API_KEY=
-GEMINI_MODEL=gemini-3.8-flash
-GEMINI_TIMEOUT_MS=30000
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_FALLBACK_MODEL=gemini-3.5-flash
+GEMINI_TIMEOUT_MS=90000
+GROQ_API_KEY=
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+GROQ_TIMEOUT_MS=90000
 ASSESSMENT_PROVIDER=gemini
 
 CONSENT_APPROVED_POLICY_VERSIONS=2026-11-v1
@@ -178,7 +184,15 @@ npm test
 npm run build
 npm run format:check
 node --test scripts/e2e-safety-guard.test.mjs
+node --test scripts/deploy-scripts.test.mjs
 ```
+
+### 10. PowerShell-Compatible Local & Production Preflight Automation
+
+- **Local setup & check (`scripts/deploy-local.mjs`):** Run `npm run deploy:local -- --dry-run` to preview checks without mutating Docker or files, or `npm run deploy:local` to inspect `.env` safely (fail-closed on `NODE_ENV=production` or remote non-local DB hosts, flagging placeholder AI keys unless `--skip-preflight`), auto-detect `docker compose` / `docker-compose`, start PostgreSQL (`db`) and poll `pg_isready`, run SHA-256 fingerprint-cached sequential library builds (`--force` to rebuild unchanged packages), and check migration status (`npx prisma migrate status`, or `--apply-migrations` / `--start`).
+- **Live provider diagnostics (opt-in):** Run `npm run test:gemini`, `npm run test:groq`, or `npm run diagnose:jd -- --provider=auto`.
+- **Production preflight & 10-stage OCI SSH controller (`scripts/deploy-production.mjs`):** Run `npm run deploy:production` (defaults strictly to safe dry-run mode; pass `-- --env-file <prod.env>` or `-- --strict` to enforce fail-closed preflight and Compose validation). With `-- --execute --confirm-production --ssh-host <user@host> --remote-dir <path>`, executes the 10-stage OCI rollout (sanitized tarball + `.sha256`, SSH probe & server-only `docker-compose.oci.yml` auto-reuse, `.current-release.json` source/compose/env fingerprint + container/HTTP/HTTPS idempotency skip unless `--force`, `scp` + remote `sha256sum -c` before unpack, pre-rollout `.release-previous/` source/Compose snapshot + stale-file clean sync preserving `docker-compose.oci.yml`/`.env*`/`node_modules`, zero-dependency remote `preflight-env --strict-perms` + Compose validation with automatic snapshot restore if preflight/compose/backup fail, mandatory pre-rollout `--format custom` `.dump` backup where `--skip-backup` fails closed, `:previous` image tagging, `deploy.sh`, HTTPS check, and deterministic snapshot + container + DB rollback command output).
+- **Deploy automation tests:** Run `node --test scripts/deploy-scripts.test.mjs` (22 deterministic unit, tarball, stale-file clean-sync/snapshot-restore, OCI overlay/idempotency/rollback, mock-SSH pipeline, and CLI tests).
 
 > [!TIP]
 > Avoid running `npm run build`, `npm run typecheck`, and `npm test` concurrently against the same working tree because `packages/*` share `dist/` artifacts. Run them sequentially.
@@ -208,7 +222,7 @@ Never commit `.env`, `.env.candidate`, backup files, or real secret values to Gi
 npm run generate:secrets -- --write
 ```
 
-### 1. Canonical `.env.example` Variables (37 Variables)
+### 1. Canonical `.env.example` Variables (42 Variables)
 
 #### Application Runtime & Networking
 
@@ -230,14 +244,23 @@ npm run generate:secrets -- --write
 | `POSTGRES_DB`       | PostgreSQL database name                                         | Required            | `talentlens`                                                            | `postgres`, `deploy.sh`, `backup.{sh,ps1}`                     | Kept internal to Docker network in production.                                         |
 | `DATABASE_URL`      | Full PostgreSQL connection string for Prisma Client & migrations | Required            | `postgresql://talentlens:<pass>@postgres:5432/talentlens?schema=public` | `api`, `worker`, `migration`, `database`, `prisma.config.ts`   | Use host `postgres` inside Compose, `localhost` for host dev; keep credentials secret. |
 
-#### Google Gemini AI Engine
+#### Multi-Provider AI Engine (Google Gemini Primary + Groq Failover)
 
-| Variable Name         | Purpose                                                           | Required / Optional             | Example Placeholder / Safe Default | Consuming Services                   | Security Notes                                                               |
-| :-------------------- | :---------------------------------------------------------------- | :------------------------------ | :--------------------------------- | :----------------------------------- | :--------------------------------------------------------------------------- |
-| `GEMINI_API_KEY`      | Google AI Studio API key for JD extraction & candidate assessment | Required in prod                | `<gemini-api-key>`                 | `api`, `worker`, `assessment-engine` | Never expose to browser or logs; required when `ASSESSMENT_PROVIDER=gemini`. |
-| `GEMINI_MODEL`        | Gemini model identifier                                           | Optional (defaulted)            | `gemini-3.8-flash`                 | `api`, `worker`, `assessment-engine` | Defaults to `gemini-3.8-flash` across code and `.env.example`.               |
-| `GEMINI_TIMEOUT_MS`   | Upstream Gemini HTTP request timeout in ms                        | Optional                        | `30000`                            | `api`, `worker`, `assessment-engine` | Clamped to `1000..120000` in API `env.ts`.                                   |
-| `ASSESSMENT_PROVIDER` | AI backend selector (`gemini` or `fake`)                          | Optional (prod checks `gemini`) | `gemini`                           | `api`, `worker`, `preflight-env.mjs` | `fake` is strictly rejected outside `NODE_ENV=test`.                         |
+| Variable Name           | Purpose                                                           | Required / Optional              | Example Placeholder / Safe Default | Consuming Services                   | Security Notes                                                                                             |
+| :---------------------- | :---------------------------------------------------------------- | :------------------------------- | :--------------------------------- | :----------------------------------- | :--------------------------------------------------------------------------------------------------------- |
+| `AI_PROVIDER_ORDER`     | Ordered comma-separated failover chain without code edits         | Optional (defaulted)             | `gemini,groq`                      | `api`, `worker`, `assessment-engine` | Must contain only supported providers (`gemini`, `groq`); rejects empty entries or unknown provider names. |
+| `GEMINI_API_KEY`        | Google AI Studio API key for JD extraction & candidate assessment | Conditional (primary)            | `<gemini-api-key>`                 | `api`, `worker`, `assessment-engine` | Required unless running Groq-only mode; never expose to browser or logs.                                   |
+| `GEMINI_MODEL`          | Primary Free-Tier Gemini model identifier                         | Optional (defaulted)             | `gemini-3.6-flash`                 | `api`, `worker`, `assessment-engine` | Defaults to `gemini-3.6-flash`; Flash-Lite, `gemini-3.8-flash`, and legacy models are rejected.            |
+| `GEMINI_FALLBACK_MODEL` | Bounded fallback Free-Tier Gemini model on primary capacity loss  | Optional (defaulted)             | `gemini-3.5-flash`                 | `api`, `worker`, `assessment-engine` | Defaults to `gemini-3.5-flash`; executes at most 1 attempt after primary retry exhaustion (deduped if eq). |
+| `GEMINI_TIMEOUT_MS`     | Upstream Gemini HTTP request timeout in ms                        | Optional                         | `90000`                            | `api`, `worker`, `assessment-engine` | Clamped to `1000..120000` in API `env.ts`; canonical default `90000`.                                      |
+| `GROQ_API_KEY`          | Optional Groq Cloud API key for independent failover              | Conditional (failover)           | `<groq-api-key>`                   | `api`, `worker`, `assessment-engine` | Optional for Gemini-only setups; **enable Groq Console Zero Data Retention (ZDR)** before production use.  |
+| `GROQ_MODEL`            | Canonical Groq model supporting strict JSON Schema outputs        | Optional (defaulted)             | `openai/gpt-oss-120b`              | `api`, `worker`, `assessment-engine` | Validated non-empty identifier (`openai/gpt-oss-120b` default).                                            |
+| `GROQ_BASE_URL`         | Groq OpenAI-compatible chat completions base URL                  | Optional (defaulted)             | `https://api.groq.com/openai/v1`   | `api`, `worker`, `assessment-engine` | `https://` strictly required in `production` and `staging` (HTTP allowed only in `development`/`test`).    |
+| `GROQ_TIMEOUT_MS`       | Upstream Groq HTTP request timeout in ms                          | Optional (defaulted)             | `90000`                            | `api`, `worker`, `assessment-engine` | Integer `1000..120000`; falls back to `AI_TIMEOUT_MS` -> `GEMINI_TIMEOUT_MS` -> `90000`.                   |
+| `ASSESSMENT_PROVIDER`   | AI backend mode (`gemini`, `groq`, `auto`, or `fake`)             | Optional (`gemini` default prod) | `gemini`                           | `api`, `worker`, `preflight-env.mjs` | `fake` is strictly rejected outside `NODE_ENV=test`; `gemini`/`auto` traverse `AI_PROVIDER_ORDER`.         |
+
+> [!IMPORTANT]
+> **Groq Privacy & Zero Data Retention (ZDR):** Candidate resume assessment text is redacted by `2026-11-redactor-v2` before transmission, whereas JD extraction sends the recruiter's job description text. Before activating `GROQ_API_KEY` for production or confidential recruitment workloads, open **Groq Console -> Settings -> Data Controls** and enable **Zero Data Retention (ZDR)** / opt out of prompt logging and model training.
 
 #### Object Storage (OCI S3-Compatible / Local Dev)
 
@@ -291,22 +314,22 @@ npm run generate:secrets -- --write
 
 Used by specific modules, Docker/OCI operational scripts, and isolated tests outside `.env.example`:
 
-| Variable Name                                                                                                          | Purpose                                                          | Required / Optional | Default / Example                                                           | Consuming Component                                            | Security Notes                                                                                                                            |
-| :--------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- | :------------------ | :-------------------------------------------------------------------------- | :------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- |
-| `AI_API_KEY`, `AI_MODEL`, `AI_TIMEOUT_MS`, `ASSESSMENT_TIMEOUT_MS`                                                     | Legacy/fallback aliases for Gemini configuration                 | Optional            | Mapped from `GEMINI_*` (`gemini-3.8-flash`, `30000`)                        | `api` `env.ts`, `assessment-engine`                            | Prefer canonical `GEMINI_*` variables.                                                                                                    |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`                                                             | Fallback AWS SDK-style env names if `S3_*` omitted               | Optional            | Falls back after `S3_*`                                                     | `api`/`worker` storage                                         | Prefer `S3_*` variables.                                                                                                                  |
-| `SMTP_SECURE`, `SMTP_REQUIRE_TLS`                                                                                      | Explicit SMTPS (`true`/`false`) and mandatory STARTTLS override  | Optional            | Auto (`465` secure, `587` `requireTls`)                                     | `worker` (`email-dispatcher.ts`), `api`                        | Certificate check (`rejectUnauthorized: true`) remains enforced for TLS; only disable `SMTP_REQUIRE_TLS=false` on isolated local Mailpit. |
-| `TESSERACT_PATH`, `PDFTOPPM_PATH`, `PDFINFO_PATH`                                                                      | Override executable paths for OCR & PDF geometry inspection      | Optional            | `tesseract`, `pdftoppm`, `pdfinfo`                                          | `document-processing` (`ocr.ts`)                               | Alpine packages already place these on `PATH` inside `worker`.                                                                            |
-| `WORKER_READINESS_FILE`, `WORKER_HEARTBEAT_MAX_AGE_MS`                                                                 | Path & staleness limit for worker readiness JSON heartbeat       | Optional            | `<tmpdir>/talentlens-worker-ready.json`, `45000`                            | `worker` (`index.ts`, `healthcheck.ts`, `readiness.ts`)        | Used by Docker container healthcheck (`healthcheck.js`).                                                                                  |
-| `COMPOSE_FILE`, `ENV_FILE`, `COMPOSE_PROJECT_NAME`                                                                     | Target Compose file, env file, and project namespace for deploy  | Optional            | `docker-compose.prod.yml`, `.env`, `talentlens`                             | `deploy.sh`, `backup.sh`, `restore.sh`                         | Essential when deploying OCI overrides or candidate env files.                                                                            |
-| `CADDYFILE_PATH`, `CADDY_CONF_D` / `CONF_D`, `LOG_DIR`, `APP_DOMAIN`                                                   | Host Caddy setup/validation paths and domain override            | Optional            | `/etc/caddy/Caddyfile`, `/etc/caddy/conf.d`, `/var/log/caddy`               | `deploy.sh`, `scripts/setup-caddy.sh`                          | Do not disable host Caddy validation.                                                                                                     |
-| `DOCKER_BIN`, `CADDY_BIN`, `SYSTEMCTL_BIN`, `CURL_BIN`, `NODE_BIN`                                                     | Binary overrides for deployment automation & mock harness tests  | Optional            | `docker`, `caddy`, `systemctl`, `curl`, `node`                              | `deploy.sh`, `backup.{sh,ps1}`, `restore.{sh,ps1}`             | Leave defaults in normal operations.                                                                                                      |
-| `DEPLOY_DB_RETRIES`, `DEPLOY_CLAMAV_RETRIES`, `DEPLOY_SERVICE_RETRIES`, `DEPLOY_HTTPS_RETRIES`, `DEPLOY_POLL_INTERVAL` | Retry/poll timing tuning in `deploy.sh`                          | Optional            | `30`, `100`, `30`, `5`, `2` (seconds)                                       | `deploy.sh`                                                    | ClamAV allows extra cold-start time for signature DB load.                                                                                |
-| `TALENTLENS_DEPLOY_TEST_MODE`, `DEPLOY_HTTPS_CURL_CA`, `DEPLOY_CURL_RESOLVE`                                           | Isolated deployment self-test hooks for custom CA (`--cacert`)   | Test only           | `0`, empty                                                                  | `deploy.sh`                                                    | Blocked when `TALENTLENS_DEPLOY_TEST_MODE != 1`; `-k`/insecure TLS is never allowed.                                                      |
-| `BACKUP_DIR`, `RETENTION_DAYS`, `TARGET_CONTAINER`, `BACKUP_FORMAT`                                                    | Backup script defaults overridable by CLI flags                  | Optional            | `/var/backups/talentlens` (`.sh`) / `backups` (`.ps1`), `7`, empty, `plain` | `scripts/backup.{sh,ps1}`                                      | Restrict permissions on target directory (`chmod 700` / restricted ACLs).                                                                 |
-| `TARGET_ENV`, `ENV_PATH`                                                                                               | Target env file override for secret generation / preflight       | Optional            | `.env`                                                                      | `generate-secrets.mjs`, `preflight-env.mjs`                    | Useful when creating `.env.candidate` safely.                                                                                             |
-| `TALENTLENS_RUN_PG_INTEGRATION`, `TALENTLENS_INTEGRATION_DATABASE_URL`                                                 | Opt-in gate & target URI for real PostgreSQL integration suites  | Test only           | unset                                                                       | `*.integration.test.ts`, `email-dispatcher.test.ts`            | Always point to a disposable local/CI test database, never production.                                                                    |
-| `TALENTLENS_E2E_ENV`, `TALENTLENS_E2E_TOPOLOGY`, `MAILPIT_URL`, `CHROME_EXECUTABLE_PATH`, `TALENTLENS_ARTIFACT_DIR`    | E2E safety-guard markers, browser binary, and artifact directory | Test only           | `local-isolated` / `compose-isolated`, `artifacts/{e2e,visual-qa}`          | `run-browser-e2e.mjs`, `visual-qa.mjs`, `e2e-safety-guard.mjs` | Safety guard fails closed unless pointed exclusively at approved E2E test infrastructure.                                                 |
+| Variable Name                                                                                                          | Purpose                                                          | Required / Optional | Default / Example                                                           | Consuming Component                                            | Security Notes                                                                                                                              |
+| :--------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- | :------------------ | :-------------------------------------------------------------------------- | :------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------ |
+| `AI_API_KEY`, `AI_MODEL`, `AI_FALLBACK_MODEL`, `AI_TIMEOUT_MS`, `ASSESSMENT_TIMEOUT_MS`                                | Fallback aliases for Gemini configuration                        | Optional            | Mapped from `GEMINI_*` (`gemini-3.6-flash`, `gemini-3.5-flash`, `90000`)    | `api` `env.ts`, `assessment-engine`                            | Prefer canonical `GEMINI_*` variables; Groq uses `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_BASE_URL`, `GROQ_TIMEOUT_MS`, and `AI_PROVIDER_ORDER`. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`                                                             | Fallback AWS SDK-style env names if `S3_*` omitted               | Optional            | Falls back after `S3_*`                                                     | `api`/`worker` storage                                         | Prefer `S3_*` variables.                                                                                                                    |
+| `SMTP_SECURE`, `SMTP_REQUIRE_TLS`                                                                                      | Explicit SMTPS (`true`/`false`) and mandatory STARTTLS override  | Optional            | Auto (`465` secure, `587` `requireTls`)                                     | `worker` (`email-dispatcher.ts`), `api`                        | Certificate check (`rejectUnauthorized: true`) remains enforced for TLS; only disable `SMTP_REQUIRE_TLS=false` on isolated local Mailpit.   |
+| `TESSERACT_PATH`, `PDFTOPPM_PATH`, `PDFINFO_PATH`                                                                      | Override executable paths for OCR & PDF geometry inspection      | Optional            | `tesseract`, `pdftoppm`, `pdfinfo`                                          | `document-processing` (`ocr.ts`)                               | Alpine packages already place these on `PATH` inside `worker`.                                                                              |
+| `WORKER_READINESS_FILE`, `WORKER_HEARTBEAT_MAX_AGE_MS`                                                                 | Path & staleness limit for worker readiness JSON heartbeat       | Optional            | `<tmpdir>/talentlens-worker-ready.json`, `45000`                            | `worker` (`index.ts`, `healthcheck.ts`, `readiness.ts`)        | Used by Docker container healthcheck (`healthcheck.js`).                                                                                    |
+| `COMPOSE_FILE`, `ENV_FILE`, `COMPOSE_PROJECT_NAME`                                                                     | Target Compose file, env file, and project namespace for deploy  | Optional            | `docker-compose.prod.yml`, `.env`, `talentlens`                             | `deploy.sh`, `backup.sh`, `restore.sh`                         | Essential when deploying OCI overrides or candidate env files.                                                                              |
+| `CADDYFILE_PATH`, `CADDY_CONF_D` / `CONF_D`, `LOG_DIR`, `APP_DOMAIN`                                                   | Host Caddy setup/validation paths and domain override            | Optional            | `/etc/caddy/Caddyfile`, `/etc/caddy/conf.d`, `/var/log/caddy`               | `deploy.sh`, `scripts/setup-caddy.sh`                          | Do not disable host Caddy validation.                                                                                                       |
+| `DOCKER_BIN`, `CADDY_BIN`, `SYSTEMCTL_BIN`, `CURL_BIN`, `NODE_BIN`                                                     | Binary overrides for deployment automation & mock harness tests  | Optional            | `docker`, `caddy`, `systemctl`, `curl`, `node`                              | `deploy.sh`, `backup.{sh,ps1}`, `restore.{sh,ps1}`             | Leave defaults in normal operations.                                                                                                        |
+| `DEPLOY_DB_RETRIES`, `DEPLOY_CLAMAV_RETRIES`, `DEPLOY_SERVICE_RETRIES`, `DEPLOY_HTTPS_RETRIES`, `DEPLOY_POLL_INTERVAL` | Retry/poll timing tuning in `deploy.sh`                          | Optional            | `30`, `100`, `30`, `5`, `2` (seconds)                                       | `deploy.sh`                                                    | ClamAV allows extra cold-start time for signature DB load.                                                                                  |
+| `TALENTLENS_DEPLOY_TEST_MODE`, `DEPLOY_HTTPS_CURL_CA`, `DEPLOY_CURL_RESOLVE`                                           | Isolated deployment self-test hooks for custom CA (`--cacert`)   | Test only           | `0`, empty                                                                  | `deploy.sh`                                                    | Blocked when `TALENTLENS_DEPLOY_TEST_MODE != 1`; `-k`/insecure TLS is never allowed.                                                        |
+| `BACKUP_DIR`, `RETENTION_DAYS`, `TARGET_CONTAINER`, `BACKUP_FORMAT`                                                    | Backup script defaults overridable by CLI flags                  | Optional            | `/var/backups/talentlens` (`.sh`) / `backups` (`.ps1`), `7`, empty, `plain` | `scripts/backup.{sh,ps1}`                                      | Restrict permissions on target directory (`chmod 700` / restricted ACLs).                                                                   |
+| `TARGET_ENV`, `ENV_PATH`                                                                                               | Target env file override for secret generation / preflight       | Optional            | `.env`                                                                      | `generate-secrets.mjs`, `preflight-env.mjs`                    | Useful when creating `.env.candidate` safely.                                                                                               |
+| `TALENTLENS_RUN_PG_INTEGRATION`, `TALENTLENS_INTEGRATION_DATABASE_URL`                                                 | Opt-in gate & target URI for real PostgreSQL integration suites  | Test only           | unset                                                                       | `*.integration.test.ts`, `email-dispatcher.test.ts`            | Always point to a disposable local/CI test database, never production.                                                                      |
+| `TALENTLENS_E2E_ENV`, `TALENTLENS_E2E_TOPOLOGY`, `MAILPIT_URL`, `CHROME_EXECUTABLE_PATH`, `TALENTLENS_ARTIFACT_DIR`    | E2E safety-guard markers, browser binary, and artifact directory | Test only           | `local-isolated` / `compose-isolated`, `artifacts/{e2e,visual-qa}`          | `run-browser-e2e.mjs`, `visual-qa.mjs`, `e2e-safety-guard.mjs` | Safety guard fails closed unless pointed exclusively at approved E2E test infrastructure.                                                   |
 
 ---
 
@@ -343,9 +366,9 @@ flowchart LR
     end
 
     API -->|"SigV4 HTTPS PUT/GET/DELETE (AES256)"| S3[("OCI Object Storage S3")]
-    API -->|"JD Extraction API"| GEMINI["Google Gemini API"]
+    API -->|"JD Extraction (Gemini -> Groq Failover)"| AI["Multi-Provider AI (Gemini / Groq)"]
     WORKER -->|"SigV4 GET"| S3
-    WORKER -->|"CV Assessment API"| GEMINI
+    WORKER -->|"CV Assessment (Gemini -> Groq Failover)"| AI
     WORKER -->|"STARTTLS 587 / TLS 465"| SMTP["OCI / Transactional SMTP"]
 ```
 
@@ -382,8 +405,8 @@ flowchart LR
 The repository intentionally keeps [docker-compose.prod.yml](./docker-compose.prod.yml) as the sole maintained canonical production Compose definition rather than fabricating or committing `docker-compose.oci.yml`:
 
 1. **Portability vs. Host Coupling:** Hard-coding pre-existing external network names, VM-specific subnets (`172.18.0.0/16`), external volume bindings, and local-only image tags into Git would break clean greenfield deployments on new hosts and conflict with `TRUSTED_PROXY_IPS` defaults in `.env.example` (`172.28.0.10,172.28.0.1,127.0.0.1`).
-2. **Source-of-Truth Integrity:** `docker-compose.oci.yml` was authored as a host-side adaptation around pre-existing OCI infrastructure rather than in this workstation's source tree; reconstructing server-only files from memory would violate factual accuracy guarantees.
-3. **Built-in Tooling Support:** [deploy.sh](./deploy.sh) natively accepts `COMPOSE_FILE`, `ENV_FILE`, and `COMPOSE_PROJECT_NAME`, allowing OCI operators to pass `docker-compose.oci.yml` and `.env.candidate` cleanly without dirtying tracked Git state.
+2. **Source-of-Truth Integrity & Pending OCI Overlay Env Update:** `docker-compose.oci.yml` was authored as a host-side adaptation around pre-existing OCI infrastructure rather than in this workstation's source tree (`deploy:production` tarball creation explicitly excludes `docker-compose.oci.yml` so server-side infrastructure definitions are preserved). Operators updating OCI for Groq failover must ensure `docker-compose.oci.yml` passes `AI_PROVIDER_ORDER`, `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_BASE_URL`, `GROQ_TIMEOUT_MS`, and `ASSESSMENT_PROVIDER` into both `api` and `worker` services alongside updating `.env.candidate`.
+3. **Built-in Tooling Support:** [deploy.sh](./deploy.sh), [scripts/backup.sh](./scripts/backup.sh), [scripts/restore.sh](./scripts/restore.sh), and [scripts/deploy-production.mjs](./scripts/deploy-production.mjs) natively accept `COMPOSE_FILE`, `ENV_FILE`, and `COMPOSE_PROJECT_NAME`, allowing OCI operators to pass `docker-compose.oci.yml` and `../.env.candidate` cleanly without dirtying tracked Git state.
 
 ---
 
@@ -406,7 +429,7 @@ Never deploy production by blindly running `git pull` inside the active director
    unzip -q TalentLens-AI-FINAL-RELEASE-AUDIT.zip -d /home/ubuntu/talentlens-release-staging-YYYYMMDD/source
    cd /home/ubuntu/talentlens-release-staging-YYYYMMDD/source
    ```
-5. **Install locked dependencies if host scripts need `node_modules`:** (for running `preflight-env.mjs` / `generate-secrets.mjs` with `dotenv` on the host):
+5. _(Optional for isolated release directories — `preflight-env.mjs` and `generate-secrets.mjs` run with Node built-ins alone and require no `node_modules` on the host):_ **Install locked workspace dependencies if running additional host Node utilities directly:**
    ```bash
    npm ci --ignore-scripts
    ```
@@ -414,9 +437,11 @@ Never deploy production by blindly running `git pull` inside the active director
    ```bash
    chmod 600 ../.env.candidate
    ```
-7. **Run fail-closed environment preflight:**
+7. **Run fail-closed environment preflight (or safe dry-run production controller):**
    ```bash
    node scripts/preflight-env.mjs ../.env.candidate
+   # Or run the unified dry-run & compose validator:
+   npm run deploy:production -- --compose-file docker-compose.oci.yml --env-file ../.env.candidate
    ```
    Abort immediately if any `[FAIL]` check appears.
 8. **Validate Compose configuration without exposing secrets:**
@@ -437,14 +462,23 @@ Never deploy production by blindly running `git pull` inside the active director
     docker compose -p talentlens --env-file ../.env.candidate -f docker-compose.oci.yml \
       run --rm --no-deps api npx prisma migrate status
     ```
-12. **Run controlled deployment via [deploy.sh](./deploy.sh):**
+12. **Run controlled deployment via [deploy.sh](./deploy.sh) (or orchestrate Steps 2–14 remotely from a verified release commit via `npm run deploy:production`):**
     ```bash
+    # Option A: Automated 10-stage OCI SSH controller from clean reviewed main commit:
+    npm run deploy:production -- --execute --confirm-production \
+      --ssh-host ubuntu@<oci-host> \
+      --remote-dir /home/ubuntu/talentlens-release-staging-20261110/source \
+      --compose-file docker-compose.oci.yml \
+      --env-file ../.env.candidate \
+      --project-name talentlens
+
+    # Option B: Direct on-host execution on the OCI VM:
     COMPOSE_FILE=docker-compose.oci.yml \
     ENV_FILE=/home/ubuntu/talentlens-release-staging-20261110/.env.candidate \
     COMPOSE_PROJECT_NAME=talentlens \
     ./deploy.sh
     ```
-    [deploy.sh](./deploy.sh) runs fail-closed preflight -> image build -> `postgres` health wait -> one-shot `migration` (`prisma migrate deploy`) -> `clamav` health wait -> `up -d api worker web` -> internal HTTP readiness -> worker heartbeat readiness -> non-destructive `caddy validate` + `systemctl reload caddy` -> strict HTTPS probe (`APP_ORIGIN/api/v1/health/ready`, `-k` forbidden).
+    Both [deploy.sh](./deploy.sh) and `deploy:production` enforce fail-closed preflight (`--strict-perms` on remote POSIX hosts) -> checksum/backup guards -> pre-rollout source/Compose snapshot + clean stale-file sync -> container image build -> `postgres` health wait -> one-shot `migration` (`prisma migrate deploy`) -> `clamav` health wait -> `up -d api worker web` -> internal HTTP readiness -> worker heartbeat readiness -> non-destructive `caddy validate` + `systemctl reload caddy` -> strict HTTPS probe (`APP_ORIGIN/api/v1/health/ready`, `-k` forbidden). Pass `--force` to bypass unchanged-release idempotency skip; live `--execute` rollouts enforce mandatory pre-rollout `--format custom` backups and reject `--skip-backup`. When targeting a new isolated `--remote-dir`, copy `docker-compose.oci.yml` into the new directory (or pass its explicit path — `deploy-production` and `deploy.sh` add `--project-directory .` automatically so Docker builds use the new directory) and pass an absolute `--env-file /home/ubuntu/talentlens-release-staging-20261110/.env.candidate` if the env file sits outside its parent directory.
 13. **Verify container health & readiness state:**
     ```bash
     docker compose -p talentlens --env-file ../.env.candidate -f docker-compose.oci.yml ps
@@ -482,6 +516,7 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
     -o, --backup-dir <dir>      Output backup directory (default: /var/backups/talentlens)
     -r, --retention-days <days> Positive integer retention days (default: 7)
     -f, --compose-file <file>   Compose file path (default: docker-compose.prod.yml)
+    -p, --project-name <name>   Optional Compose project name (default: COMPOSE_PROJECT_NAME)
     -c, --container <name>      Explicit PostgreSQL container name
         --format <plain|custom> Archive format: plain (.sql.gz, default) or custom (.dump)
         --env-file <file>       Optional env file for safe variable lookup (default: .env)
@@ -494,7 +529,7 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
   ```
 
 - **Windows PowerShell (`scripts/backup.ps1`):**
-  Parameters: `-Database`, `-User`, `-BackupDir` (default `backups`), `-RetentionDays` (default `7`), `-ComposeFile` (default `docker-compose.prod.yml`), `-TargetContainer`, `-Format <plain|custom>`, `-EnvFile` (default `.env`), `-DockerBin` (default `docker`).
+  Parameters: `-Database`, `-User`, `-BackupDir` (default `backups`), `-RetentionDays` (default `7`), `-ComposeFile` (default `docker-compose.prod.yml`), `-ProjectName` (default `$env:COMPOSE_PROJECT_NAME`), `-TargetContainer`, `-Format <plain|custom>`, `-EnvFile` (default `.env`), `-DockerBin` (default `docker`).
 
   Example (Windows local Docker Compose):
 
@@ -523,12 +558,13 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
         --create-target             Create target database if it does not already exist
     -c, --container <name>          Explicit PostgreSQL container name
     -f, --compose-file <file>       Compose file path (default: docker-compose.prod.yml)
+    -p, --project-name <name>       Optional Compose project name (default: COMPOSE_PROJECT_NAME)
     -u, --user <name>               PostgreSQL role name (default: POSTGRES_USER or talentlens)
         --env-file <file>           Optional env file for safe variable lookup (default: .env)
   ```
 
 - **Windows PowerShell (`scripts/restore.ps1`):**
-  Positional / named parameters: `-Archive <path>`, `-TargetDb <name>`, `-ConfirmReplaceExisting`, `-CreateTarget`, `-User`, `-TargetContainer`, `-ComposeFile`, `-EnvFile`, `-DockerBin`.
+  Positional / named parameters: `-Archive <path>`, `-TargetDb <name>`, `-ConfirmReplaceExisting`, `-CreateTarget`, `-User`, `-TargetContainer`, `-ComposeFile`, `-ProjectName`, `-EnvFile`, `-DockerBin`.
 
 **Recommended Verification Drill (Non-Destructive Staging Database):**
 

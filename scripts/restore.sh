@@ -40,6 +40,7 @@ Options:
       --create-target             Create target database if it does not already exist (recommended for staging recovery)
   -c, --container <name>          Explicit PostgreSQL container name
   -f, --compose-file <file>       Compose file path (default: docker-compose.prod.yml)
+  -p, --project-name <name>       Optional Compose project name (default: COMPOSE_PROJECT_NAME)
   -u, --user <name>               PostgreSQL role name (default: POSTGRES_USER or talentlens)
       --env-file <file>           Optional env file for safe variable lookup (default: .env)
   -h, --help                      Show this help text
@@ -53,9 +54,11 @@ EOF
 
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
 ENV_FILE="${ENV_FILE:-.env}"
 TARGET_CONTAINER="${TARGET_CONTAINER:-}"
 EXPLICIT_USER=""
+EXPLICIT_PROJECT_NAME=""
 CONFIRM_REPLACE_EXISTING=false
 CREATE_TARGET=false
 POSITIONAL=()
@@ -78,6 +81,11 @@ while [ "$#" -gt 0 ]; do
         -f|--compose-file)
             [ "$#" -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
             COMPOSE_FILE="$2"
+            shift 2
+            ;;
+        -p|--project-name)
+            [ "$#" -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+            EXPLICIT_PROJECT_NAME="$2"
             shift 2
             ;;
         -u|--user)
@@ -157,7 +165,13 @@ compute_sha256() {
 }
 
 ENV_POSTGRES_USER="$(read_env_var "POSTGRES_USER" "${ENV_FILE}")"
+ENV_COMPOSE_PROJECT_NAME="$(read_env_var "COMPOSE_PROJECT_NAME" "${ENV_FILE}")"
 POSTGRES_USER="${EXPLICIT_USER:-${POSTGRES_USER:-${ENV_POSTGRES_USER:-talentlens}}}"
+COMPOSE_PROJECT_NAME="${EXPLICIT_PROJECT_NAME:-${COMPOSE_PROJECT_NAME:-${ENV_COMPOSE_PROJECT_NAME:-}}}"
+if [ -n "${COMPOSE_PROJECT_NAME}" ] && [[ ! "${COMPOSE_PROJECT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+    log_error "Invalid Compose project name: '${COMPOSE_PROJECT_NAME}'. Must match ^[A-Za-z0-9][A-Za-z0-9_-]*$."
+    exit 1
+fi
 
 CREATED_BY_SCRIPT=false
 RESTORE_COMPLETED=false
@@ -293,21 +307,47 @@ TARGET_DESC=""
 if [ -n "${TARGET_CONTAINER}" ]; then
     DOCKER_EXEC_PREFIX=("${DOCKER_BIN}" exec -i "${TARGET_CONTAINER}")
     TARGET_DESC="container:${TARGET_CONTAINER}"
-elif [ -f "${COMPOSE_FILE}" ] && "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps -q postgres 2>/dev/null | grep -q .; then
-    DOCKER_EXEC_PREFIX=("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres)
-    TARGET_DESC="compose:${COMPOSE_FILE}#postgres"
 else
-    mapfile -t MATCHING_CONTAINERS < <("${DOCKER_BIN}" ps --filter "name=postgres" --filter "name=db" --format "{{.Names}}" | awk 'NF' | sort -u)
-    if [ "${#MATCHING_CONTAINERS[@]}" -eq 1 ]; then
-        TARGET_CONTAINER="${MATCHING_CONTAINERS[0]}"
-        DOCKER_EXEC_PREFIX=("${DOCKER_BIN}" exec -i "${TARGET_CONTAINER}")
-        TARGET_DESC="container:${TARGET_CONTAINER}"
-    elif [ "${#MATCHING_CONTAINERS[@]}" -gt 1 ]; then
-        log_error "Multiple PostgreSQL containers detected (${MATCHING_CONTAINERS[*]}). Specify -c/--container explicitly."
-        exit 1
-    else
-        log_error "No running PostgreSQL container found in ${COMPOSE_FILE} or Docker daemon."
-        exit 1
+    if [ -f "${COMPOSE_FILE}" ]; then
+        COMPOSE_BASE_CMD=()
+        if "${DOCKER_BIN}" compose version >/dev/null 2>&1; then
+            COMPOSE_BASE_CMD=("${DOCKER_BIN}" compose)
+        elif command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE_BASE_CMD=("docker-compose")
+        fi
+
+        if [ "${#COMPOSE_BASE_CMD[@]}" -gt 0 ]; then
+            if [ -n "${COMPOSE_PROJECT_NAME}" ]; then
+                COMPOSE_BASE_CMD+=(-p "${COMPOSE_PROJECT_NAME}")
+            fi
+            if [ -n "${ENV_FILE}" ] && [ -f "${ENV_FILE}" ]; then
+                COMPOSE_BASE_CMD+=(--env-file "${ENV_FILE}")
+            fi
+            COMPOSE_BASE_CMD+=(-f "${COMPOSE_FILE}")
+
+            for svc in postgres db; do
+                if "${COMPOSE_BASE_CMD[@]}" ps -q "${svc}" 2>/dev/null | grep -q .; then
+                    DOCKER_EXEC_PREFIX=("${COMPOSE_BASE_CMD[@]}" exec -T "${svc}")
+                    TARGET_DESC="compose:${COMPOSE_FILE}#${svc}"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    if [ "${#DOCKER_EXEC_PREFIX[@]}" -eq 0 ]; then
+        mapfile -t MATCHING_CONTAINERS < <("${DOCKER_BIN}" ps --filter "name=postgres" --filter "name=db" --format "{{.Names}}" | awk 'NF' | sort -u)
+        if [ "${#MATCHING_CONTAINERS[@]}" -eq 1 ]; then
+            TARGET_CONTAINER="${MATCHING_CONTAINERS[0]}"
+            DOCKER_EXEC_PREFIX=("${DOCKER_BIN}" exec -i "${TARGET_CONTAINER}")
+            TARGET_DESC="container:${TARGET_CONTAINER}"
+        elif [ "${#MATCHING_CONTAINERS[@]}" -gt 1 ]; then
+            log_error "Multiple PostgreSQL containers detected (${MATCHING_CONTAINERS[*]}). Specify -c/--container explicitly."
+            exit 1
+        else
+            log_error "No running PostgreSQL container found in ${COMPOSE_FILE} or Docker daemon."
+            exit 1
+        fi
     fi
 fi
 
