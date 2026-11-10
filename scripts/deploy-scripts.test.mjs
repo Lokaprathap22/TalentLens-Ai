@@ -1984,3 +1984,139 @@ test('24. Remote env targeting stays isolated from local .env, preserves fail-cl
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('25. Stage 8 elevates only backup via sudo -n bash ./scripts/backup.sh, preserves args/validation, and rolls back snapshot cleanly on failure', () => {
+  const dir = makeTempDir('tl-prod-sudo-backup-');
+  try {
+    createFakeWorkspaceForDeploy(dir, { includeEnv: false });
+    const snapshotPath =
+      '/home/ubuntu/talentlens-release-staging-20261110/.release-previous/20261110T190000Z-abcdef123456';
+
+    // Happy path: Stage 8 invokes sudo -n bash ./scripts/backup.sh while other stages remain unprivileged
+    const okMock = createSshRolloutMock({ snapshotPath });
+    const okStreams = createBufferedStreams();
+    const okExit = runDeployProductionMain(
+      [
+        '--execute',
+        '--confirm-production',
+        '--ssh-host',
+        'ubuntu@140.245.226.85',
+        '--remote-dir',
+        '/home/ubuntu/talentlens-release-staging-20261110/source',
+        '--compose-file',
+        'docker-compose.oci.yml',
+        '--remote-env-file',
+        '../.env.candidate',
+        '--project-name',
+        'talentlens',
+      ],
+      { cwd: dir, execFn: okMock.execFn, stdout: okStreams.stdout, stderr: okStreams.stderr },
+    );
+    assert.equal(okExit, 0);
+
+    const backupCmd = okMock.sshCommands.find((c) => c.includes('scripts/backup.sh'));
+    assert.ok(backupCmd, 'Expected Stage 8 remote backup command');
+    assert.equal(
+      backupCmd,
+      "cd '/home/ubuntu/talentlens-release-staging-20261110/source' && chmod +x deploy.sh scripts/backup.sh scripts/restore.sh && sudo -n bash ./scripts/backup.sh -f 'docker-compose.oci.yml' --env-file '../.env.candidate' -p 'talentlens' --format custom",
+    );
+    assert.equal(backupCmd.includes(' -o '), false, 'Preserve default /var/backups/talentlens');
+    assert.equal(backupCmd.includes(' -r '), false, 'Preserve default retention days');
+
+    const nonBackupSshCmds = okMock.sshCommands.filter((c) => !c.includes('scripts/backup.sh'));
+    assert.equal(
+      nonBackupSshCmds.some((c) => /\bsudo\b/.test(c)),
+      false,
+      'Only Stage 8 backup operation may invoke sudo; do not run rollout stages as root',
+    );
+    assert.match(
+      okStreams.allOutput(),
+      /sudo bash \.\/scripts\/restore\.sh -f docker-compose\.oci\.yml --env-file \.\.\/\.env\.candidate -p talentlens --confirm-replace-existing/,
+    );
+
+    // Failure path: simulated chmod permission failure aborts before Stage 9 and restores snapshot
+    const failMock = createSshRolloutMock({ backupFail: true, snapshotPath });
+    const failStreams = createBufferedStreams();
+    const failExit = runDeployProductionMain(
+      [
+        '--execute',
+        '--confirm-production',
+        '--ssh-host',
+        'ubuntu@140.245.226.85',
+        '--remote-dir',
+        '/home/ubuntu/talentlens-release-staging-20261110/source',
+        '--compose-file',
+        'docker-compose.oci.yml',
+        '--remote-env-file',
+        '../.env.candidate',
+        '--project-name',
+        'talentlens',
+      ],
+      { cwd: dir, execFn: failMock.execFn, stdout: failStreams.stdout, stderr: failStreams.stderr },
+    );
+    assert.equal(failExit, 1);
+    assert.match(
+      failMock.sshCommands.find((c) => c.includes('scripts/backup.sh')) || '',
+      /&& sudo -n bash \.\/scripts\/backup\.sh /,
+    );
+    assert.equal(
+      failMock.sshCommands.some(
+        (c) => c.includes('RESTORE_SNAPSHOT_OK') && c.includes(snapshotPath),
+      ),
+      true,
+      'Backup failure must restore pre-mutation snapshot',
+    );
+    assert.equal(
+      failMock.sshCommands.some((c) => c.includes(':previous')),
+      false,
+      'No image retagging may occur before backup succeeds',
+    );
+    assert.equal(
+      failMock.sshCommands.some((c) => c.includes('bash deploy.sh')),
+      false,
+      'deploy.sh must not run when Stage 8 backup fails',
+    );
+    assert.equal(
+      failMock.sshCommands.some((c) => c.includes('.current-release.json.tmp')),
+      false,
+      'Release marker must not be updated when Stage 8 backup fails',
+    );
+
+    // --skip-backup remains rejected before any SSH/SCP actions
+    const skipMock = createSshRolloutMock({ snapshotPath });
+    const skipStreams = createBufferedStreams();
+    const skipExit = runDeployProductionMain(
+      [
+        '--execute',
+        '--confirm-production',
+        '--skip-backup',
+        '--ssh-host',
+        'ubuntu@140.245.226.85',
+        '--remote-dir',
+        '/home/ubuntu/talentlens-release-staging-20261110/source',
+        '--compose-file',
+        'docker-compose.oci.yml',
+        '--remote-env-file',
+        '../.env.candidate',
+        '--project-name',
+        'talentlens',
+      ],
+      { cwd: dir, execFn: skipMock.execFn, stdout: skipStreams.stdout, stderr: skipStreams.stderr },
+    );
+    assert.equal(skipExit, 1);
+    assert.equal(skipMock.sshCommands.length, 0);
+    assert.equal(skipMock.wasScpCalled(), false);
+    assert.match(skipStreams.allOutput(), /--skip-backup/);
+
+    // Verify backup.sh & restore.sh integrity checks remain intact on disk
+    const backupScriptText = fs.readFileSync(path.resolve('scripts/backup.sh'), 'utf8');
+    assert.match(backupScriptText, /chmod 700 "\$\{BACKUP_DIR\}"/);
+    assert.match(backupScriptText, /pg_restore --list/);
+    assert.match(backupScriptText, /Post-write SHA-256 self-verification/);
+    const restoreScriptText = fs.readFileSync(path.resolve('scripts/restore.sh'), 'utf8');
+    assert.match(restoreScriptText, /Mandatory SHA-256 checksum verified/);
+    assert.match(restoreScriptText, /--single-transaction/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

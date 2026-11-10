@@ -643,7 +643,7 @@ function printRollbackGuidance({
   }
   step += 1;
   stdout(
-    `  ${step}. Restore DB archive: ${composeStr} stop api worker && ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing ${backupArchive || '<backup_archive.dump>'} <target_db>`,
+    `  ${step}. Restore DB archive: ${composeStr} stop api worker && sudo bash ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing ${backupArchive || '<backup_archive.dump>'} <target_db>`,
   );
 }
 
@@ -1199,7 +1199,7 @@ function executeSshProductionDeploy({
     const backupCmd = [
       `cd ${shellQuotePosix(effectiveOptions.remoteDir)}`,
       'chmod +x deploy.sh scripts/backup.sh scripts/restore.sh',
-      `./scripts/backup.sh -f ${shellQuotePosix(effectiveOptions.composeFile)} --env-file ${shellQuotePosix(effectiveOptions.envFile)} -p ${shellQuotePosix(effectiveOptions.projectName)} --format custom`,
+      `sudo -n bash ./scripts/backup.sh -f ${shellQuotePosix(effectiveOptions.composeFile)} --env-file ${shellQuotePosix(effectiveOptions.envFile)} -p ${shellQuotePosix(effectiveOptions.projectName)} --format custom`,
     ].join(' && ');
     const backupRes = execFn('ssh', [...buildRemoteSshArgs(effectiveOptions.sshHost), backupCmd], {
       cwd,
@@ -1550,10 +1550,10 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     `  Deploy:   COMPOSE_FILE=${options.composeFile} ENV_FILE=${options.envFile} COMPOSE_PROJECT_NAME=${options.projectName} bash deploy.sh`,
   );
   stdout(
-    `  Backup:   ./scripts/backup.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --format custom`,
+    `  Backup:   sudo bash ./scripts/backup.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --format custom`,
   );
   stdout(
-    `  Rollback: docker compose${projectDirPart} -p ${options.projectName} --env-file ${options.envFile} -f ${options.composeFile} stop api worker && ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing <archive.dump> <db>`,
+    `  Rollback: docker compose${projectDirPart} -p ${options.projectName} --env-file ${options.envFile} -f ${options.composeFile} stop api worker && sudo bash ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing <archive.dump> <db>`,
   );
 
   if (guard.dryRun) {

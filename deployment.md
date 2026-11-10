@@ -191,8 +191,8 @@ node --test scripts/deploy-scripts.test.mjs
 
 - **Local setup & check (`scripts/deploy-local.mjs`):** Run `npm run deploy:local -- --dry-run` to preview checks without mutating Docker or files, or `npm run deploy:local` to inspect `.env` safely (fail-closed on `NODE_ENV=production` or remote non-local DB hosts, flagging placeholder AI keys unless `--skip-preflight`), auto-detect `docker compose` / `docker-compose`, start PostgreSQL (`db`) and poll `pg_isready`, run SHA-256 fingerprint-cached sequential library builds (`--force` to rebuild unchanged packages), and check migration status (`npx prisma migrate status`, or `--apply-migrations` / `--start`).
 - **Live provider diagnostics (opt-in):** Run `npm run test:gemini`, `npm run test:groq`, or `npm run diagnose:jd -- --provider=auto`.
-- **Production preflight & 10-stage OCI SSH controller (`scripts/deploy-production.mjs`):** Run `npm run deploy:production` (defaults strictly to safe dry-run mode). For local on-host validation, pass `-- --env-file <prod.env>` or `-- --strict`; for remote OCI rollouts from Windows/workstations where `../.env.candidate` only exists on the VM, pass `-- --ssh-host <user@host> --env-file ../.env.candidate` (protected from Node's native `--env-file` parser by `node --` in `package.json`) or `--remote-env-file ../.env.candidate` (also safe when invoking `node scripts/deploy-production.mjs` directly). Remote dry-runs never read local `.env` or require the remote file locally and explicitly state remote Stage 7–9 checks were not run. With `-- --execute --confirm-production --ssh-host <user@host> --remote-dir <path>`, executes the 10-stage OCI rollout (sanitized tarball + `.sha256`, SSH probe & server-only `docker-compose.oci.yml` auto-reuse, `.current-release.json` source/compose/env fingerprint + container/HTTP/HTTPS idempotency skip unless `--force`, `scp` + remote `sha256sum -c` before unpack, pre-rollout `.release-previous/` source/Compose snapshot + stale-file clean sync preserving `docker-compose.oci.yml`/`.env*`/`node_modules`, zero-dependency remote `preflight-env --strict-perms` + Compose validation using the remote env file with automatic snapshot restore if preflight/compose/backup fail, mandatory pre-rollout `--format custom` `.dump` backup where `--skip-backup` fails closed, `:previous` image tagging, `deploy.sh`, HTTPS check, and deterministic snapshot + container + DB rollback command output).
-- **Deploy automation tests:** Run `node --test scripts/deploy-scripts.test.mjs` (24 deterministic unit, tarball, stale-file clean-sync/snapshot-restore, remote env-file Windows regression, OCI overlay/idempotency/rollback, mock-SSH pipeline, and CLI tests).
+- **Production preflight & 10-stage OCI SSH controller (`scripts/deploy-production.mjs`):** Run `npm run deploy:production` (defaults strictly to safe dry-run mode). For local on-host validation, pass `-- --env-file <prod.env>` or `-- --strict`; for remote OCI rollouts from Windows/workstations where `../.env.candidate` only exists on the VM, pass `-- --ssh-host <user@host> --env-file ../.env.candidate` (protected from Node's native `--env-file` parser by `node --` in `package.json`) or `--remote-env-file ../.env.candidate` (also safe when invoking `node scripts/deploy-production.mjs` directly). Remote dry-runs never read local `.env` or require the remote file locally and explicitly state remote Stage 7–9 checks were not run. With `-- --execute --confirm-production --ssh-host <user@host> --remote-dir <path>`, executes the 10-stage OCI rollout (sanitized tarball + `.sha256`, SSH probe & server-only `docker-compose.oci.yml` auto-reuse, `.current-release.json` source/compose/env fingerprint + container/HTTP/HTTPS idempotency skip unless `--force`, `scp` + remote `sha256sum -c` before unpack, pre-rollout `.release-previous/` source/Compose snapshot + stale-file clean sync preserving `docker-compose.oci.yml`/`.env*`/`node_modules`, zero-dependency remote `preflight-env --strict-perms` + Compose validation using the remote env file with automatic snapshot restore if preflight/compose/backup fail, mandatory pre-rollout `sudo -n bash ./scripts/backup.sh ... --format custom` `.dump` backup where only backup runs elevated and `--skip-backup` fails closed, `:previous` image tagging, `deploy.sh`, HTTPS check, and deterministic snapshot + container + DB rollback command output).
+- **Deploy automation tests:** Run `node --test scripts/deploy-scripts.test.mjs` (25 deterministic unit, tarball, stale-file clean-sync/snapshot-restore, remote env-file Windows regression, isolated `sudo -n` Stage 8 backup/rollback, OCI overlay/idempotency, mock-SSH pipeline, and CLI tests).
 
 > [!TIP]
 > Avoid running `npm run build`, `npm run typecheck`, and `npm test` concurrently against the same working tree because `packages/*` share `dist/` artifacts. Run them sequentially.
@@ -458,9 +458,9 @@ Never deploy production by blindly running `git pull` inside the active director
    COMPOSE_FILE=docker-compose.oci.yml ENV_FILE=../.env.candidate COMPOSE_PROJECT_NAME=talentlens \
      docker compose -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config --quiet
    ```
-9. **Create and verify a pre-deployment PostgreSQL backup:** (see exact flags in [Section F](#f-backup-and-restore)):
+9. **Create and verify a pre-deployment PostgreSQL backup:** (use `sudo` on OCI because `/var/backups/talentlens` is `root:root` mode `700`; see [Section F](#f-backup-and-restore)):
    ```bash
-   ./scripts/backup.sh -f docker-compose.oci.yml --env-file ../.env.candidate
+   sudo bash ./scripts/backup.sh -f docker-compose.oci.yml --env-file ../.env.candidate --format custom
    ```
 10. **Pre-build application images (`web`, `api`, `worker`):** _(Note: `deploy.sh` also executes `build web api worker` automatically after preflight passes.)_
     ```bash
@@ -539,10 +539,10 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
         --env-file <file>       Optional env file for safe variable lookup (default: .env)
   ```
 
-  Example (OCI production):
+  Example (OCI production — `sudo` required because `/var/backups/talentlens` is `root:root` mode `700`; automated Stage 8 uses `sudo -n bash ./scripts/backup.sh ...`):
 
   ```bash
-  ./scripts/backup.sh -f docker-compose.oci.yml --env-file ../.env.candidate --format custom
+  sudo bash ./scripts/backup.sh -f docker-compose.oci.yml --env-file ../.env.candidate --format custom
   ```
 
 - **Windows PowerShell (`scripts/backup.ps1`):**
@@ -557,7 +557,7 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
 ### 2. Location, Permissions, Integrity & Retention Guarantees
 
 - **Location & Git Safety:** `.sh` defaults to `/var/backups/talentlens`; `.ps1` defaults to `./backups`. Both `.gitignore` and `.dockerignore` exclude `/backups/` and `*.sql`, `*.sql.gz`, `*.sql.gz.sha256`, `*.dump`, and `*.dump.sha256`.
-- **Host Permissions:** `backup.sh` sets `chmod 700` on the backup directory and `chmod 600` on every archive and `.sha256` sidecar. `backup.ps1` applies `icacls /inheritance:r` granting access strictly to the current user, `SYSTEM` (`S-1-5-18`), and `Administrators` (`S-1-5-32-544`).
+- **Host Permissions & Least-Privilege Elevation:** `backup.sh` sets `chmod 700` on `/var/backups/talentlens` (`root:root`) and `chmod 600` on every archive and `.sha256` sidecar. Because OCI backups are root-owned, Stage 8 of `deploy:production` elevates **only** the backup call via `sudo -n bash ./scripts/backup.sh ...` (leaving rollout stages unprivileged), and manual backup/restore commands operating on `/var/backups/talentlens` on OCI must likewise run under `sudo`. `backup.ps1` applies `icacls /inheritance:r` granting access strictly to the current user, `SYSTEM` (`S-1-5-18`), and `Administrators` (`S-1-5-32-544`).
 - **Archive Integrity Checks:**
   - `plain` (`.sql.gz`): Runs `gzip -t` (or `.NET GZipStream` decompression test in `.ps1`) and verifies decompressed payload size > 0 bytes.
   - `custom` (`.dump`): Verifies the `PGDMP` (`0x5047444d50`) magic header and validates archive contents with `pg_restore --list`.
@@ -586,8 +586,8 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
 **Recommended Verification Drill (Non-Destructive Staging Database):**
 
 ```bash
-# Bash (Linux / OCI)
-./scripts/restore.sh \
+# Bash (Linux / OCI — sudo required to access root-owned 700/600 archives in /var/backups/talentlens)
+sudo bash ./scripts/restore.sh \
   -f docker-compose.oci.yml \
   --env-file ../.env.candidate \
   --create-target \
@@ -604,7 +604,7 @@ TalentLens AI provides deterministic, checksum-verified backup and fail-closed r
   -CreateTarget
 ```
 
-**Production In-Place Disaster Recovery Preconditions:** Stop `api` and `worker` (`docker compose stop api worker`) before passing `--confirm-replace-existing` against the live database so active leases and connections do not race the single-transaction restore (`psql --single-transaction -v ON_ERROR_STOP=1` or `pg_restore --single-transaction --exit-on-error`).
+**Production In-Place Disaster Recovery Preconditions:** Stop `api` and `worker` (`docker compose stop api worker`) before passing `--confirm-replace-existing` against the live database (running `sudo bash ./scripts/restore.sh ...` when restoring root-owned `/var/backups/talentlens` archives) so active leases and connections do not race the single-transaction restore (`psql --single-transaction -v ON_ERROR_STOP=1` or `pg_restore --single-transaction --exit-on-error`).
 
 **Automated Post-Restore Checks:** Both restore scripts verify:
 
