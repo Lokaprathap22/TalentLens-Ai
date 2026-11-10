@@ -28,7 +28,11 @@ import { Tab, TabList, TabPanel, Tabs } from '../../components/ui/tabs.js';
 import { ConsentInvitationModal } from '../consent/ConsentInvitationModal.js';
 import { InterviewDeclineModal } from './InterviewDeclineModal.js';
 import { InterviewProposalModal } from './InterviewProposalModal.js';
-import { getReviewStatusLabel, getReviewStatusTone } from './types.js';
+import {
+  getConsentDisplayState,
+  getReviewStatusLabel,
+  getReviewStatusTone,
+} from './types.js';
 import type { ReviewDecision } from './types.js';
 import { useCandidateDetail } from './use-candidate-detail.js';
 
@@ -37,6 +41,7 @@ export interface CandidateDetailViewProps {
   candidateId: string;
   onClose?: () => void;
   headerAction?: ReactNode;
+  variant?: 'page' | 'drawer';
 }
 
 function formatBytes(bytes: number): string {
@@ -155,6 +160,7 @@ export function CandidateDetailView({
   candidateId,
   onClose,
   headerAction,
+  variant = 'page',
 }: CandidateDetailViewProps): React.JSX.Element {
   const {
     status,
@@ -276,6 +282,10 @@ export function CandidateDetailView({
     : 0;
 
   const isConsentActive = candidate.consent?.status === 'ACTIVE';
+  const consentDisplay = getConsentDisplayState({
+    consentStatus: candidate.consent?.status ?? 'NOT_GRANTED',
+    consentInvitation: candidate.consentInvitation ?? null,
+  });
   const parseStatus = resumeDetails?.parseStatus;
 
   let processingBadge: {
@@ -394,18 +404,19 @@ export function CandidateDetailView({
                 Consent {candidate.consent.status.toLowerCase()} (v{candidate.consent.policyVersion}
                 )
               </Badge>
-            ) : (
+            ) : null}
+            {!isConsentActive ? (
               <button
                 type="button"
                 onClick={() => setIsConsentModalOpen(true)}
                 className="inline-flex items-center cursor-pointer focus:outline-none"
-                title="Click to issue consent invitation"
+                title={`Click to ${consentDisplay.actionLabel.toLowerCase()}`}
               >
-                <Badge tone="danger" dot>
-                  Consent Pending &middot; Issue Invitation
+                <Badge tone={consentDisplay.badgeTone} dot>
+                  {consentDisplay.badgeLabel} &middot; {consentDisplay.actionLabel}
                 </Badge>
               </button>
-            )}
+            ) : null}
             {candidate.assessment ? (
               <Badge tone={candidate.assessment.status === 'COMPLETE' ? 'success' : 'warning'} dot>
                 Score: {candidate.assessment.score ?? '—'}% (
@@ -436,11 +447,11 @@ export function CandidateDetailView({
       ) : (
         <div
           role="status"
-          className="flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-200"
         >
-          <div className="flex items-center gap-3">
-            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
-            <p>
+          <div className="flex min-w-0 flex-1 items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <p className="min-w-0">
               <span className="font-semibold">Compliance requirement:</span> Recruiter inspection of
               the original CV file is required before submitting this candidate to the client.
             </p>
@@ -502,10 +513,16 @@ export function CandidateDetailView({
           </div>
         </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        <div
+          className={
+            variant === 'drawer'
+              ? 'grid grid-cols-1 lg:grid-cols-2 gap-6'
+              : 'grid grid-cols-1 xl:grid-cols-3 gap-6'
+          }
+        >
           {/* Column 1: Record Review Decision */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
+          <div className="min-w-0 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
               <h4 className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
                 1. Recruiter Review Decision
               </h4>
@@ -516,7 +533,7 @@ export function CandidateDetailView({
               ) : null}
             </div>
 
-            <div className="grid grid-cols-3 gap-2">
+            <div className="flex flex-wrap gap-2">
               <Button
                 type="button"
                 size="sm"
@@ -529,7 +546,7 @@ export function CandidateDetailView({
                   setReviewSuccessMessage('Review decision recorded as Reviewed.');
                   setTimeout(() => setReviewSuccessMessage(null), 4000);
                 }}
-                className="text-xs flex items-center justify-center gap-1"
+                className="text-xs inline-flex items-center justify-center gap-1"
               >
                 <Check className="h-3.5 w-3.5" />
                 Reviewed
@@ -546,7 +563,7 @@ export function CandidateDetailView({
                   setReviewSuccessMessage('Candidate flagged for further review.');
                   setTimeout(() => setReviewSuccessMessage(null), 4000);
                 }}
-                className="text-xs flex items-center justify-center gap-1"
+                className="text-xs inline-flex items-center justify-center gap-1"
               >
                 <AlertTriangle className="h-3.5 w-3.5" />
                 Flag / Needs Review
@@ -563,7 +580,7 @@ export function CandidateDetailView({
                   setReviewSuccessMessage('Candidate application marked as Closed.');
                   setTimeout(() => setReviewSuccessMessage(null), 4000);
                 }}
-                className="text-xs flex items-center justify-center gap-1"
+                className="text-xs inline-flex items-center justify-center gap-1"
               >
                 <XCircle className="h-3.5 w-3.5" />
                 Decline / Closed
@@ -1069,7 +1086,7 @@ export function CandidateDetailView({
       <Tabs defaultValue="extraction" className="space-y-4">
         <TabList
           label="Candidate Inspection Tabs"
-          className="w-full justify-start border-b border-border pb-px"
+          className="w-full flex-wrap justify-start border-b border-border pb-px"
         >
           <Tab value="extraction">
             <FileText className="mr-1.5 h-3.5 w-3.5" />
@@ -1148,12 +1165,12 @@ export function CandidateDetailView({
               </h3>
               <p className="mt-1 text-xs text-fg-subtle max-w-sm mx-auto">
                 Text extraction and automated analysis are suspended because candidate consent is
-                pending or has been withdrawn. Processing will resume automatically once valid
-                consent is authorized.
+                not yet active ({consentDisplay.badgeLabel.toLowerCase()}). Processing will resume
+                automatically once valid consent is authorized.
               </p>
               <div className="mt-4">
                 <Button size="sm" variant="primary" onClick={() => setIsConsentModalOpen(true)}>
-                  Issue Consent Invitation
+                  {consentDisplay.actionLabel}
                 </Button>
               </div>
             </Card>
@@ -1496,11 +1513,11 @@ export function CandidateDetailView({
               </h3>
               <p className="mt-1 text-xs text-fg-subtle max-w-sm mx-auto">
                 Candidate consent for hiring use is mandatory before automated scorecard assessment
-                can be performed.
+                can be performed ({consentDisplay.badgeLabel.toLowerCase()}).
               </p>
               <div className="mt-4">
                 <Button size="sm" variant="primary" onClick={() => setIsConsentModalOpen(true)}>
-                  Issue Consent Invitation
+                  {consentDisplay.actionLabel}
                 </Button>
               </div>
             </Card>
@@ -1552,14 +1569,14 @@ export function CandidateDetailView({
         {/* ----------------------------------------------------------------- */}
         <TabPanel value="metadata" className="space-y-4 pt-2">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Card className="p-4 space-y-2">
+            <Card className="p-4 space-y-2 min-w-0">
               <h4 className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
                 Candidate Consent Status
               </h4>
               {candidate.consent ? (
                 <div className="space-y-3 text-xs">
                   <div className="space-y-1">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="text-fg-subtle">Status:</span>
                       <Badge
                         tone={candidate.consent.status === 'ACTIVE' ? 'success' : 'warning'}
@@ -1568,16 +1585,24 @@ export function CandidateDetailView({
                         {candidate.consent.status}
                       </Badge>
                     </div>
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="text-fg-subtle">Policy Version:</span>
                       <span className="font-mono text-fg">{candidate.consent.policyVersion}</span>
                     </div>
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="text-fg-subtle">Captured At:</span>
                       <span className="text-fg">{formatDate(candidate.consent.capturedAt)}</span>
                     </div>
+                    {candidate.consentInvitation ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-fg-subtle">Latest Invitation:</span>
+                        <Badge tone={consentDisplay.badgeTone} dot>
+                          {consentDisplay.badgeLabel}
+                        </Badge>
+                      </div>
+                    ) : null}
                   </div>
-                  <div className="pt-2 border-t border-border flex items-center justify-between">
+                  <div className="pt-2 border-t border-border flex flex-wrap items-center justify-between gap-2">
                     <span className="text-[11px] text-fg-subtle">
                       {candidate.consent.status === 'ACTIVE'
                         ? 'Consent is active.'
@@ -1591,18 +1616,29 @@ export function CandidateDetailView({
                       onClick={() => setIsConsentModalOpen(true)}
                       className="text-xs h-7 px-2"
                     >
-                      Re-issue Invitation
+                      {consentDisplay.actionLabel}
                     </Button>
                   </div>
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <div className="rounded border border-warning/30 bg-warning/5 p-2.5 text-xs space-y-1">
-                    <p className="font-semibold text-warning">Consent Required</p>
+                  <div className="rounded border border-warning/30 bg-warning/5 p-2.5 text-xs space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="font-semibold text-warning">Consent Required</p>
+                      <Badge tone={consentDisplay.badgeTone} dot>
+                        {consentDisplay.badgeLabel}
+                      </Badge>
+                    </div>
                     <p className="text-fg-subtle">
                       No active consent record captured for this candidate. Screening and AI
-                      evaluations cannot proceed until consent is granted.
+                      evaluations remain held until consent is granted.
                     </p>
+                    {candidate.consentInvitation ? (
+                      <p className="text-[11px] text-fg-subtle">
+                        Sent {formatDate(candidate.consentInvitation.sentAt)} &middot; Expires{' '}
+                        {formatDate(candidate.consentInvitation.expiresAt)}
+                      </p>
+                    ) : null}
                   </div>
                   <Button
                     type="button"
@@ -1611,32 +1647,32 @@ export function CandidateDetailView({
                     className="w-full text-xs h-8 flex items-center justify-center gap-1.5"
                   >
                     <ShieldCheck className="h-4 w-4" />
-                    Issue Consent Invitation
+                    {consentDisplay.actionLabel}
                   </Button>
                 </div>
               )}
             </Card>
 
-            <Card className="p-4 space-y-2">
+            <Card className="p-4 space-y-2 min-w-0">
               <h4 className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
                 Resume Document Audit
               </h4>
               <div className="space-y-1 text-xs">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-fg-subtle">Document ID:</span>
-                  <span className="font-mono text-fg text-[11px] truncate max-w-[160px]">
+                  <span className="font-mono text-fg text-[11px] break-all">
                     {candidate.resume.id}
                   </span>
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-fg-subtle">Format:</span>
                   <span className="text-fg">{candidate.resume.fileType}</span>
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-fg-subtle">Size:</span>
                   <span className="text-fg">{formatBytes(candidate.resume.sizeBytes)}</span>
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-fg-subtle">Uploaded:</span>
                   <span className="text-fg">{formatDate(candidate.resume.uploadedAt)}</span>
                 </div>

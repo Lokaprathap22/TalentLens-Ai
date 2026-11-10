@@ -19,6 +19,17 @@ export function extractTokenFromHash(hash: string): string | null {
   return token?.trim() || null;
 }
 
+export function sanitizeUrlToken(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (window.location.hash || window.location.search) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  } catch {
+    // Gracefully ignore history manipulation failure in test/sandboxed envs
+  }
+}
+
 function formatDate(iso: string | null | undefined): string {
   if (!iso) return '—';
   try {
@@ -38,30 +49,22 @@ function formatDate(iso: string | null | undefined): string {
 export function ConsentPortalPage(): React.JSX.Element {
   const [token, setToken] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
-      return extractTokenFromHash(window.location.hash);
+      const extracted = extractTokenFromHash(window.location.hash);
+      if (extracted) {
+        sanitizeUrlToken();
+      }
+      return extracted;
     }
     return null;
   });
 
   const [status, setStatus] = useState<
     'idle' | 'inspecting' | 'ready' | 'accepting' | 'accepted' | 'declining' | 'declined' | 'error'
-  >(() => {
-    if (typeof window !== 'undefined') {
-      const initialToken = extractTokenFromHash(window.location.hash);
-      return initialToken ? 'inspecting' : 'error';
-    }
-    return 'error';
-  });
+  >(token ? 'inspecting' : 'error');
 
   const [errorType, setErrorType] = useState<
     'missing_token' | 'expired_or_invalid' | 'server_error' | null
-  >(() => {
-    if (typeof window !== 'undefined') {
-      const initialToken = extractTokenFromHash(window.location.hash);
-      return initialToken ? null : 'missing_token';
-    }
-    return 'missing_token';
-  });
+  >(token ? null : 'missing_token');
   const [actionError, setActionError] = useState<string | null>(null);
 
   const [notice, setNotice] = useState<ConsentNoticeDto | null>(null);
@@ -76,18 +79,17 @@ export function ConsentPortalPage(): React.JSX.Element {
   useEffect(() => {
     const handleHashChange = () => {
       const newToken = extractTokenFromHash(window.location.hash);
+      if (!newToken) {
+        return;
+      }
+      sanitizeUrlToken();
       setToken((prevToken) => {
         if (prevToken === newToken) {
           return prevToken;
         }
-        if (!newToken) {
-          setStatus('error');
-          setErrorType('missing_token');
-        } else {
-          setStatus('inspecting');
-          setErrorType(null);
-          setActionError(null);
-        }
+        setStatus('inspecting');
+        setErrorType(null);
+        setActionError(null);
         return newToken;
       });
     };

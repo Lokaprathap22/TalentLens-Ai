@@ -56,21 +56,21 @@ export function CandidateDetailDrawer({
       />
 
       {/* Slide-over container */}
-      <div className="fixed inset-y-0 right-0 flex max-w-full pl-6 sm:pl-10">
-        <div className="flex w-screen max-w-3xl flex-col border-l border-border bg-bg shadow-2xl overflow-y-auto animate-in slide-in-from-right duration-200">
+      <div className="fixed inset-y-0 right-0 flex max-w-full pl-4 sm:pl-8 lg:pl-12">
+        <div className="flex w-screen max-w-5xl min-w-0 flex-col border-l border-border bg-bg shadow-2xl overflow-y-auto animate-in slide-in-from-right duration-200">
           {/* Top drawer control bar */}
-          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-border bg-bg/95 px-4 py-3 backdrop-blur-xs sm:px-6">
+          <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-2 border-b border-border bg-bg/95 px-4 py-3 backdrop-blur-xs sm:px-6">
             <span className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
               Candidate Workspace &middot; Resume Inspection
             </span>
             <div className="flex items-center gap-2">
               <Link
                 to={`/requisitions/${encodeURIComponent(requisitionId)}/candidates/${encodeURIComponent(candidateId)}`}
-                className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-fg-subtle hover:bg-bg-subtle hover:text-fg focus:outline-none focus:ring-1 focus:ring-accent"
+                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs font-medium text-fg hover:bg-bg-subtle focus:outline-none focus:ring-1 focus:ring-accent"
                 title="Open dedicated inspection page"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
-                <span>Dedicated Page</span>
+                <span>Open dedicated page</span>
               </Link>
               <IconButton
                 icon={X}
@@ -82,11 +82,12 @@ export function CandidateDetailDrawer({
           </div>
 
           {/* Drawer content */}
-          <div className="flex-1">
+          <div className="flex-1 min-w-0">
             <CandidateDetailView
               requisitionId={requisitionId}
               candidateId={candidateId}
               onClose={onClose}
+              variant="drawer"
             />
           </div>
         </div>

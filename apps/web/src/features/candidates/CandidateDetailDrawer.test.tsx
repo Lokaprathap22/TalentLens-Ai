@@ -107,4 +107,41 @@ describe('CandidateDetailDrawer', () => {
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(handleClose).toHaveBeenCalledTimes(1);
   });
+
+  it('provides a dedicated page link, responsive review controls, and accurate consent invitation state', async () => {
+    vi.spyOn(candidateApi, 'getCandidateDetail').mockResolvedValueOnce({
+      ...MOCK_DETAIL,
+      consentInvitation: {
+        id: 'inv-drawer-1',
+        status: 'PENDING',
+        deliveryStatus: 'SENT',
+        sentAt: '2026-10-25T14:35:00.000Z',
+        expiresAt: '2026-11-01T14:35:00.000Z',
+        consumedAt: null,
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <CandidateDetailDrawer
+          open={true}
+          onClose={vi.fn()}
+          requisitionId={REQUISITION_ID}
+          candidateId={CANDIDATE_ID}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('CAN-8A4F1D92')).toBeInTheDocument();
+    const dedicatedLink = screen.getByRole('link', { name: /open dedicated page/i });
+    expect(dedicatedLink).toHaveAttribute(
+      'href',
+      `/requisitions/${REQUISITION_ID}/candidates/${CANDIDATE_ID}`,
+    );
+
+    expect(screen.getByRole('button', { name: /^Reviewed$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Flag \/ Needs Review/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Decline \/ Closed/i })).toBeInTheDocument();
+    expect(screen.getByText(/Invitation sent · Resend invitation/i)).toBeInTheDocument();
+  });
 });

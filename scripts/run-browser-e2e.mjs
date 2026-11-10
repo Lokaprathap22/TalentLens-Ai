@@ -856,13 +856,13 @@ async function run() {
     log(9, `Navigating into Candidate 1 (${candidate1.candidateCode}) inspection view...`);
     await page.goto(`${APP_ORIGIN}/requisitions/${requisitionId}/candidates/${candidate1.id}`);
     await page.waitForSelector(
-      'button[title="Click to issue consent invitation"], button:has-text("Issue Consent Invitation")',
+      'button[title="Click to send invitation"], button:has-text("Send invitation")',
       { timeout: 15000 },
     );
 
     log(9, 'Generating Consent Invitation for Candidate 1...');
     await page.click(
-      'button[title="Click to issue consent invitation"], button:has-text("Issue Consent Invitation")',
+      'button[title="Click to send invitation"], button:has-text("Send invitation")',
     );
     await page.waitForSelector('input[type="email"], input[placeholder*="@"]');
 
@@ -917,13 +917,13 @@ async function run() {
     log(10, `Navigating into Candidate 2 (${candidate2.candidateCode}) inspection view...`);
     await page.goto(`${APP_ORIGIN}/requisitions/${requisitionId}/candidates/${candidate2.id}`);
     await page.waitForSelector(
-      'button[title="Click to issue consent invitation"], button:has-text("Issue Consent Invitation")',
+      'button[title="Click to send invitation"], button:has-text("Send invitation")',
       { timeout: 15000 },
     );
 
     log(10, 'Generating Consent Invitation for Candidate 2...');
     await page.click(
-      'button[title="Click to issue consent invitation"], button:has-text("Issue Consent Invitation")',
+      'button[title="Click to send invitation"], button:has-text("Send invitation")',
     );
     await page.waitForSelector('input[type="email"], input[placeholder*="@"]');
 
@@ -1127,16 +1127,39 @@ async function run() {
     });
     log(13, 'Verified: Initial interview proposal notification delivered to recruiter in Mailpit.');
 
+    const candidate1Submission = await db.candidateSubmission.findFirst({
+      where: {
+        organizationId: org.id,
+        requisitionId,
+        candidateId: candidate1.id,
+        status: { not: 'WITHDRAWN' },
+      },
+      orderBy: { submittedAt: 'desc' },
+      select: { id: true },
+    });
+    if (!candidate1Submission) {
+      throw new Error(`Expected active candidateSubmission for ${candidate1.candidateCode}`);
+    }
+    const maskedClientCandidateRef = `CAND-SUB-${candidate1Submission.id.slice(0, 8).toUpperCase()}`;
+
     const clientListRes = await getJsonViaPage(clientPage, '/interviews');
     if (!clientListRes.ok || !Array.isArray(clientListRes.json?.items)) {
       throw new Error(`Client GET /interviews failed: HTTP ${clientListRes.status}`);
     }
     const clientProposal = clientListRes.json.items.find(
-      (item) => item.candidateCode === candidate1.candidateCode && item.status === 'PROPOSED',
+      (item) => item.submissionId === candidate1Submission.id && item.status === 'PROPOSED',
     );
     if (!clientProposal) {
       throw new Error(
-        `Proposed interview for ${candidate1.candidateCode} not found in client GET /interviews response`,
+        `Proposed interview for submission ${candidate1Submission.id} (${maskedClientCandidateRef}) not found in client GET /interviews response`,
+      );
+    }
+    if (
+      clientProposal.candidateCode !== maskedClientCandidateRef ||
+      clientProposal.candidateCode === candidate1.candidateCode
+    ) {
+      throw new Error(
+        `Expected client-masked interview reference "${maskedClientCandidateRef}" (not internal "${candidate1.candidateCode}"), got "${clientProposal.candidateCode}"`,
       );
     }
     if (
@@ -1305,7 +1328,7 @@ async function run() {
     log(14, 'Recruiter proposing alternative interview window via /interviews UI...');
     const clientNotifyBefore = await countMailpitMessages({
       toEmail: clientManagerEmail,
-      subjectIncludes: `Interview Update: ${candidate1.candidateCode}`,
+      subjectIncludes: `Interview Update: ${maskedClientCandidateRef}`,
     });
     const altDate = new Date(Date.now() + 3 * 86400_000).toISOString().slice(0, 10);
 
@@ -1347,7 +1370,7 @@ async function run() {
 
     await waitForMailpitMessage({
       toEmail: clientManagerEmail,
-      subjectIncludes: `Interview Update: ${candidate1.candidateCode}`,
+      subjectIncludes: `Interview Update: ${maskedClientCandidateRef}`,
       textIncludes: 'Format: VIDEO',
       minCount: clientNotifyBefore + 1,
       timeoutMs: 45000,
@@ -1372,7 +1395,7 @@ async function run() {
     await clientPage.click('[data-testid="interviews-desktop-table"] button:has-text("Accept")');
 
     await clientPage.waitForSelector(
-      `[role="alert"]:has-text("Interview proposal for ${candidate1.candidateCode} confirmed successfully.")`,
+      `[role="alert"]:has-text("Interview proposal for ${maskedClientCandidateRef} confirmed successfully.")`,
       { timeout: 10000 },
     );
     await clientPage.waitForSelector('[data-testid="interviews-desktop-table"] >> text=Confirmed', {

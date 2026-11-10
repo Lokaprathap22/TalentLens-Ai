@@ -287,13 +287,13 @@ describe('CandidateDetailView', () => {
     render(<CandidateDetailView requisitionId={REQUISITION_ID} candidateId={CANDIDATE_ID} />);
 
     expect(await screen.findByText('CAN-8A4F1D92')).toBeInTheDocument();
-    expect(screen.getByText(/Consent Pending · Issue Invitation/i)).toBeInTheDocument();
+    expect(screen.getByText(/Not sent · Send invitation/i)).toBeInTheDocument();
 
     const auditTab = screen.getByRole('tab', { name: /Consent & Audit/i });
     fireEvent.click(auditTab);
 
     expect(screen.getByText('Consent Required')).toBeInTheDocument();
-    const issueBtn = screen.getByRole('button', { name: /Issue Consent Invitation/i });
+    const issueBtn = screen.getByRole('button', { name: /^Send invitation$/i });
     expect(issueBtn).toBeInTheDocument();
 
     fireEvent.click(issueBtn);

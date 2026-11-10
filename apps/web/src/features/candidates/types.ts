@@ -35,6 +35,24 @@ export type SubmissionStatus =
   'SUBMITTED' | 'CLIENT_SHORTLISTED' | 'CLIENT_REJECTED' | 'INTERVIEW_PROPOSED' | 'WITHDRAWN';
 
 // ---------------------------------------------------------------------------
+// Consent & invitation summary statuses (mirrors workflow.dto.ts)
+// ---------------------------------------------------------------------------
+export type CandidateConsentSummaryStatus =
+  | 'ACTIVE'
+  | 'WITHDRAWN'
+  | 'EXPIRED'
+  | 'NOT_GRANTED';
+
+export interface ConsentInvitationSummary {
+  id: string;
+  status: 'PENDING' | 'ACCEPTED' | 'DECLINED' | 'EXPIRED' | 'SUPERSEDED';
+  deliveryStatus: string;
+  sentAt: string;
+  expiresAt: string;
+  consumedAt: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // Candidate summary DTO — from GET /api/v1/requisitions/:id/candidates
 // Mirrors RecruiterCandidateSummaryDto in workflow.dto.ts exactly.
 // ---------------------------------------------------------------------------
@@ -44,6 +62,9 @@ export interface CandidateSummary {
   resumeDocumentId: string;
   resumeFileName: string;
   parseStatus: string;
+  consentStatus?: CandidateConsentSummaryStatus;
+  consentInvitation?: ConsentInvitationSummary | null;
+  isHeldForConsent?: boolean;
   assessmentId: string | null;
   assessmentStatus: string | null;
   overallScore: number | null;
@@ -298,6 +319,103 @@ export function getReviewStatusTone(
   }
 }
 
+export interface ConsentDisplayState {
+  badgeLabel: string;
+  badgeTone: 'neutral' | 'info' | 'success' | 'warning' | 'danger';
+  heldHint: string;
+  canSendInvitation: boolean;
+  actionLabel: string;
+}
+
+/**
+ * Resolves recruiter-visible consent and invitation display metadata from
+ * actual backend consent & invitation state without fabricating consent.
+ */
+export function getConsentDisplayState(input: {
+  consentStatus?: CandidateConsentSummaryStatus | string | null | undefined;
+  consentInvitation?: ConsentInvitationSummary | null | undefined;
+}): ConsentDisplayState {
+  const status = input.consentStatus ?? 'NOT_GRANTED';
+  const invitation = input.consentInvitation ?? null;
+
+  if (status === 'ACTIVE') {
+    return {
+      badgeLabel: 'Consent active',
+      badgeTone: 'success',
+      heldHint: 'Queued · consent active',
+      canSendInvitation: false,
+      actionLabel: 'Re-issue invitation',
+    };
+  }
+
+  if (status === 'WITHDRAWN') {
+    return {
+      badgeLabel: 'Consent withdrawn',
+      badgeTone: 'danger',
+      heldHint: 'Held · consent withdrawn',
+      canSendInvitation: true,
+      actionLabel: 'Resend invitation',
+    };
+  }
+
+  if (status === 'EXPIRED') {
+    return {
+      badgeLabel: 'Consent expired',
+      badgeTone: 'warning',
+      heldHint: 'Held · consent expired',
+      canSendInvitation: true,
+      actionLabel: 'Resend invitation',
+    };
+  }
+
+  if (invitation) {
+    if (invitation.status === 'PENDING') {
+      return {
+        badgeLabel: 'Invitation sent',
+        badgeTone: 'info',
+        heldHint: 'Held · awaiting consent',
+        canSendInvitation: true,
+        actionLabel: 'Resend invitation',
+      };
+    }
+    if (invitation.status === 'EXPIRED') {
+      return {
+        badgeLabel: 'Invitation expired',
+        badgeTone: 'warning',
+        heldHint: 'Held · invitation expired',
+        canSendInvitation: true,
+        actionLabel: 'Resend invitation',
+      };
+    }
+    if (invitation.status === 'DECLINED') {
+      return {
+        badgeLabel: 'Invitation declined',
+        badgeTone: 'danger',
+        heldHint: 'Held · consent declined',
+        canSendInvitation: true,
+        actionLabel: 'Resend invitation',
+      };
+    }
+    if (invitation.status === 'ACCEPTED') {
+      return {
+        badgeLabel: 'Consent accepted',
+        badgeTone: 'success',
+        heldHint: 'Queued · consent active',
+        canSendInvitation: false,
+        actionLabel: 'Re-issue invitation',
+      };
+    }
+  }
+
+  return {
+    badgeLabel: 'Not sent',
+    badgeTone: 'warning',
+    heldHint: 'Held · invitation not sent',
+    canSendInvitation: true,
+    actionLabel: 'Send invitation',
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Candidate detail DTO — from GET /api/v1/requisitions/:id/candidates/:candidateId
 // Mirrors RecruiterCandidateDetailDto in workflow.dto.ts exactly.
@@ -405,6 +523,7 @@ export interface CandidateDetail {
   resume: CandidateResumeDetail;
   hasInspectedOriginalResume: boolean;
   consent: CandidateConsentDetail | null;
+  consentInvitation?: ConsentInvitationSummary | null;
   assessment: CandidateAssessmentDetail | null;
   review: CandidateReviewDetail | null;
   shortlist: CandidateShortlistDetail | null;

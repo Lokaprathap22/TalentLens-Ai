@@ -56,14 +56,20 @@ describe('ConsentPortalPage', () => {
   it('renders notice details when token is valid', async () => {
     window.location.hash = '#token=valid-token';
 
-    vi.spyOn(consentApi, 'inspectConsentNotice').mockResolvedValueOnce(MOCK_NOTICE);
+    const inspectSpy = vi
+      .spyOn(consentApi, 'inspectConsentNotice')
+      .mockResolvedValueOnce(MOCK_NOTICE);
 
     render(<ConsentPortalPage />);
+
+    expect(window.location.hash).toBe('');
+    expect(window.location.search).toBe('');
 
     await waitFor(() => {
       expect(screen.getByText('Consent for AI-Assisted Resume Screening')).toBeInTheDocument();
     });
 
+    expect(inspectSpy).toHaveBeenCalledWith('valid-token');
     expect(screen.getByText('Staff Security Engineer')).toBeInTheDocument();
     expect(screen.getByText('Acme Systems')).toBeInTheDocument();
     expect(screen.getByText('Candidate: CAN-8899')).toBeInTheDocument();

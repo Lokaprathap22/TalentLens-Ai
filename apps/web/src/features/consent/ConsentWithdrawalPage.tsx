@@ -18,6 +18,17 @@ export function extractTokenFromHash(hash: string): string | null {
   return token?.trim() || null;
 }
 
+export function sanitizeUrlToken(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (window.location.hash || window.location.search) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  } catch {
+    // Gracefully ignore history manipulation failure in test/sandboxed envs
+  }
+}
+
 function formatDate(iso: string | null | undefined): string {
   if (!iso) return '—';
   try {
@@ -37,7 +48,11 @@ function formatDate(iso: string | null | undefined): string {
 export function ConsentWithdrawalPage(): React.JSX.Element {
   const [token, setToken] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
-      return extractTokenFromHash(window.location.hash);
+      const extracted = extractTokenFromHash(window.location.hash);
+      if (extracted) {
+        sanitizeUrlToken();
+      }
+      return extracted;
     }
     return null;
   });
@@ -61,7 +76,10 @@ export function ConsentWithdrawalPage(): React.JSX.Element {
   useEffect(() => {
     const handleHashChange = () => {
       const newToken = extractTokenFromHash(window.location.hash);
-      setToken(newToken);
+      if (newToken) {
+        sanitizeUrlToken();
+        setToken(newToken);
+      }
     };
 
     window.addEventListener('hashchange', handleHashChange);

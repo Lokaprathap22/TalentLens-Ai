@@ -54,10 +54,12 @@ describe('ConsentWithdrawalPage', () => {
   });
 
   describe('Confirm Flow (hash token present)', () => {
-    it('renders confirmation prompt when hash token is present', () => {
+    it('renders confirmation prompt when hash token is present and scrubs URL fragment', () => {
       window.location.hash = '#token=withdraw-token-123';
       render(<ConsentWithdrawalPage />);
 
+      expect(window.location.hash).toBe('');
+      expect(window.location.search).toBe('');
       expect(screen.getByText('Confirm Consent Withdrawal')).toBeInTheDocument();
       expect(
         screen.getByText(/withdrawing your consent halts all automated screening/i),

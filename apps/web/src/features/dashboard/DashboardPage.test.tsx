@@ -381,4 +381,70 @@ describe('DashboardPage Component', () => {
     await user.click(signOutBtn);
     expect(mockLogout).toHaveBeenCalledTimes(1);
   });
+
+  it('renders Recent workflow activity inside a bounded scrollable feed with event count and wrapped descriptions', () => {
+    const longDescription =
+      'Consent withdrawn and downstream automated assessment paused for candidate CAN-99887766 across requisition Principal Distributed Systems Architect with extended audit context';
+    const manyEvents = [
+      {
+        id: 'act-latest',
+        kind: 'consent_withdrawn' as const,
+        summary: longDescription,
+        actor: 'Candidate Self-Service Portal',
+        createdAt: '2026-11-07T16:55:00.000Z',
+      },
+      ...Array.from({ length: 12 }, (_, idx) => ({
+        id: `act-${idx + 1}`,
+        kind: 'review_recorded' as const,
+        summary: `Audit event #${idx + 1} recorded`,
+        actor: 'Alex Morgan',
+        createdAt: `2026-11-07T15:${String(50 - idx).padStart(2, '0')}:00.000Z`,
+      })),
+    ];
+
+    vi.mocked(useAuthOptional).mockReturnValue({
+      state: {
+        status: 'authenticated',
+        user: {
+          userId: 'u1',
+          organizationId: 'o1',
+          organizationName: 'Org',
+          email: 'recruiter@example.com',
+          role: 'RECRUITER',
+        },
+      },
+      isInitializing: false,
+      isLoggingOut: false,
+      logoutError: null,
+      clearLogoutError: vi.fn(),
+      login: vi.fn(),
+      logout: mockLogout,
+      retryInitialization: vi.fn(),
+      updateUser: vi.fn(),
+    });
+
+    vi.mocked(useDashboardData).mockReturnValue({
+      state: {
+        status: 'ready',
+        data: {
+          ...mockRecruiterData,
+          activity: manyEvents,
+        },
+      },
+      isSample: false,
+      reload: vi.fn(),
+    });
+
+    render(
+      <MemoryRouter>
+        <DashboardPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('13 events')).toBeInTheDocument();
+    const scrollRegion = screen.getByLabelText('Recent workflow activity feed');
+    expect(scrollRegion).toHaveClass('overflow-y-auto');
+    expect(within(scrollRegion).getByText(longDescription)).toBeInTheDocument();
+    expect(within(scrollRegion).getByText('Audit event #12 recorded')).toBeInTheDocument();
+  });
 });

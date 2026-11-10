@@ -42,6 +42,7 @@ import {
 } from '../../components/ui/index.js';
 import { PageHeader } from '../../layouts/PageHeader.js';
 import { formatShortDate } from '../../lib/format.js';
+import { ConsentInvitationModal } from '../consent/ConsentInvitationModal.js';
 import { useRequisitionDetail } from '../requisitions/use-requisition-detail.js';
 import { CandidateDetailDrawer } from './CandidateDetailDrawer.js';
 import type {
@@ -51,6 +52,7 @@ import type {
   ResumeBatchUploadResult,
 } from './types.js';
 import {
+  getConsentDisplayState,
   getParseStatusLabel,
   getParseStatusTone,
   getReviewStatusLabel,
@@ -91,7 +93,10 @@ const SUBMISSION_FILTER_OPTIONS: Array<{ value: SubmissionFilter; label: string 
 // Candidate table columns
 // ---------------------------------------------------------------------------
 
-function candidateColumns(onInspect: (candidateId: string) => void): Array<{
+function candidateColumns(
+  onInspect: (candidateId: string) => void,
+  onOpenConsentModal: (candidate: { candidateId: string; candidateCode: string }) => void,
+): Array<{
   id: string;
   header: string;
   cell: (row: CandidateSummary) => React.JSX.Element;
@@ -122,20 +127,71 @@ function candidateColumns(onInspect: (candidateId: string) => void): Array<{
       ),
     },
     {
+      id: 'consent',
+      header: 'Consent',
+      showFrom: 'sm',
+      cell: (row) => {
+        const consentDisplay = getConsentDisplayState({
+          consentStatus: row.consentStatus,
+          consentInvitation: row.consentInvitation,
+        });
+        return (
+          <div className="space-y-1">
+            <Badge tone={consentDisplay.badgeTone} dot>
+              {consentDisplay.badgeLabel}
+            </Badge>
+            {consentDisplay.canSendInvitation ? (
+              <div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onOpenConsentModal({
+                      candidateId: row.candidateId,
+                      candidateCode: row.candidateCode,
+                    })
+                  }
+                  className="text-[11px] font-medium text-accent hover:underline cursor-pointer focus:outline-none focus:underline"
+                >
+                  {consentDisplay.actionLabel}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        );
+      },
+    },
+    {
       id: 'processing',
       header: 'Processing',
       cell: (row) => {
         const tone = getParseStatusTone(row.parseStatus);
         const label = getParseStatusLabel(row.parseStatus);
-        // Consent-aware: PENDING means job may be HELD_FOR_AUTHORIZATION (awaiting consent).
-        // We show the parse status label as-is; the UI does not misrepresent this as active processing.
-        const isHeld = row.parseStatus === 'PENDING' && !row.assessmentId;
+        const hasConsentMetadata =
+          row.consentStatus !== undefined ||
+          row.consentInvitation !== undefined ||
+          row.isHeldForConsent !== undefined;
+        const consentDisplay = getConsentDisplayState({
+          consentStatus: row.consentStatus,
+          consentInvitation: row.consentInvitation,
+        });
+        const isHeld =
+          row.isHeldForConsent ?? (row.parseStatus === 'PENDING' && !row.assessmentId);
+
+        let subLabel: string | null = null;
+        if (row.parseStatus === 'PENDING') {
+          if (hasConsentMetadata) {
+            subLabel = isHeld ? consentDisplay.heldHint : 'Queued · consent active';
+          } else if (isHeld) {
+            subLabel = 'May be awaiting consent';
+          }
+        }
+
         return (
           <div className="space-y-1">
             <Badge tone={tone} dot>
               {label}
             </Badge>
-            {isHeld ? <p className="text-[10px] text-fg-subtle">May be awaiting consent</p> : null}
+            {subLabel ? <p className="text-[10px] text-fg-subtle">{subLabel}</p> : null}
           </div>
         );
       },
@@ -289,6 +345,10 @@ export function CandidatesPage(): React.JSX.Element {
 
   const [currentPage, setCurrentPage] = useState(1);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
+  const [consentModalTarget, setConsentModalTarget] = useState<{
+    candidateId: string;
+    candidateCode: string;
+  } | null>(null);
 
   const serverQuery = useMemo<ListCandidatesQuery>(
     () => ({
@@ -338,7 +398,8 @@ export function CandidatesPage(): React.JSX.Element {
       next.delete('candidateId');
       return next;
     });
-  }, [setSearchParams]);
+    void reload();
+  }, [setSearchParams, reload]);
 
   const handleUploadSuccess = useCallback(
     (accepted: AcceptedUploadItem[], _result: ResumeBatchUploadResult): void => {
@@ -352,6 +413,9 @@ export function CandidatesPage(): React.JSX.Element {
         resumeDocumentId: item.resumeDocumentId,
         resumeFileName: item.fileName,
         parseStatus: 'PENDING',
+        consentStatus: 'NOT_GRANTED',
+        consentInvitation: null,
+        isHeldForConsent: true,
         assessmentId: null,
         assessmentStatus: null,
         overallScore: null,
@@ -387,7 +451,7 @@ export function CandidatesPage(): React.JSX.Element {
     : filteredCandidates.slice(pageStart, pageEnd);
   const paginationTotal = isServerPaginated ? total : filteredCandidates.length;
 
-  const columns = candidateColumns(handleInspectCandidate);
+  const columns = candidateColumns(handleInspectCandidate, setConsentModalTarget);
 
   // -------------------------------------------------------------------------
   // Loading / error states for requisition
@@ -688,9 +752,11 @@ export function CandidatesPage(): React.JSX.Element {
               className="inline-block align-text-bottom text-info-solid"
             />
           </span>
-          <strong className="text-fg">Processing held candidates:</strong> Candidates shown with
-          "Queued" status may be awaiting consent. Processing will not begin until candidate consent
-          is active. Consent invitation management arrives in a later milestone.
+          <strong className="text-fg">Consent-gated processing:</strong> Candidates without active
+          hiring consent remain held in <strong className="text-fg">Queued</strong> status until
+          they accept a consent invitation. Use <strong className="text-fg">Send invitation</strong>{' '}
+          or <strong className="text-fg">Resend invitation</strong> to issue a candidate consent
+          link.
         </div>
       ) : null}
 
@@ -703,6 +769,20 @@ export function CandidatesPage(): React.JSX.Element {
         }}
         onUploadSuccess={handleUploadSuccess}
       />
+
+      {/* Consent invitation dialog */}
+      {consentModalTarget ? (
+        <ConsentInvitationModal
+          open={Boolean(consentModalTarget)}
+          onClose={() => {
+            setConsentModalTarget(null);
+            void reload();
+          }}
+          requisitionId={safeRequisitionId}
+          candidateId={consentModalTarget.candidateId}
+          candidateCode={consentModalTarget.candidateCode}
+        />
+      ) : null}
 
       {/* Candidate detail & resume inspection drawer */}
       <CandidateDetailDrawer

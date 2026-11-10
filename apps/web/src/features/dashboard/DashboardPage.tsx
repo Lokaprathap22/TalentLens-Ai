@@ -670,6 +670,13 @@ function ActivityCard({
         title="Recent workflow activity"
         titleId="activity-heading"
         description="Audit-logged consent, assessment, review, and client events"
+        actions={
+          activity.length > 0 ? (
+            <span className="text-xs tabular text-fg-subtle">
+              {activity.length} {activity.length === 1 ? 'event' : 'events'}
+            </span>
+          ) : undefined
+        }
       />
       {activity.length === 0 ? (
         <EmptyState
@@ -678,31 +685,39 @@ function ActivityCard({
           description="Consent changes, completed assessments, recruiter reviews, and client decisions are logged here."
         />
       ) : (
-        <CardBody className="pt-1">
-          <ol className="divide-y divide-border">
-            {activity.map((entry) => {
-              const descriptor = ACTIVITY_ICONS[entry.kind] ?? ACTIVITY_ICONS.general;
-              return (
-                <li key={entry.id} className="flex items-start gap-3 py-3 first:pt-1 last:pb-0">
-                  <span
-                    className={`mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md border ${descriptor.tone}`}
-                  >
-                    <Icon icon={descriptor.icon} size="sm" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm text-fg">{entry.summary}</p>
-                    <p className="mt-0.5 text-xs text-fg-subtle">
-                      <span>{entry.actor}</span>
-                      <span className="mx-1.5">·</span>
-                      <span className="tabular">
-                        {formatRelative(entry.createdAt, generatedAt)}
-                      </span>
-                    </p>
-                  </div>
-                </li>
-              );
-            })}
-          </ol>
+        <CardBody className="pt-1 pr-2">
+          <div
+            tabIndex={0}
+            aria-label="Recent workflow activity feed"
+            className="max-h-[24rem] overflow-y-auto pr-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          >
+            <ol className="divide-y divide-border">
+              {activity.map((entry) => {
+                const descriptor = ACTIVITY_ICONS[entry.kind] ?? ACTIVITY_ICONS.general;
+                return (
+                  <li key={entry.id} className="flex items-start gap-3 py-3 first:pt-1 last:pb-1">
+                    <span
+                      className={`mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md border ${descriptor.tone}`}
+                    >
+                      <Icon icon={descriptor.icon} size="sm" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm text-fg break-words [overflow-wrap:anywhere]">
+                        {entry.summary}
+                      </p>
+                      <p className="mt-0.5 text-xs text-fg-subtle break-words">
+                        <span>{entry.actor}</span>
+                        <span className="mx-1.5">·</span>
+                        <span className="tabular">
+                          {formatRelative(entry.createdAt, generatedAt)}
+                        </span>
+                      </p>
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
         </CardBody>
       )}
     </Card>

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -149,7 +149,7 @@ describe('CandidatesPage', () => {
 
     // PENDING parse status is labeled "Queued" with note "May be awaiting consent", NOT "Processing"
     expect(screen.getAllByText(/May be awaiting consent/i).length).toBeGreaterThan(0);
-    expect(screen.getByText(/Processing held candidates:/i)).toBeInTheDocument();
+    expect(screen.getByText(/Consent-gated processing:/i)).toBeInTheDocument();
   });
 
   it('4. filters candidate table by text search (code or filename)', async () => {
@@ -264,9 +264,74 @@ describe('CandidatesPage', () => {
       expect(screen.getByRole('heading', { level: 1, name: 'Candidates' })).toBeInTheDocument();
     });
 
+    // Navigate back to requisition detail and scorecards views
     const scorecardsBtn = screen.getByRole('button', { name: /Scorecards/i });
     await user.click(scorecardsBtn);
 
     expect(screen.getByText('Scorecards View')).toBeInTheDocument();
+  });
+
+  it('10. displays real consent and invitation statuses and opens ConsentInvitationModal without placeholder text', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(candidateApi, 'listCandidates').mockResolvedValueOnce({
+      items: [
+        {
+          ...mockCandidates[0]!,
+          consentStatus: 'ACTIVE',
+          consentInvitation: {
+            id: 'inv-1',
+            status: 'ACCEPTED',
+            deliveryStatus: 'SENT',
+            sentAt: '2026-11-05T09:00:00.000Z',
+            expiresAt: '2026-11-12T09:00:00.000Z',
+            consumedAt: '2026-11-05T09:15:00.000Z',
+          },
+          isHeldForConsent: false,
+        },
+        {
+          ...mockCandidates[1]!,
+          consentStatus: 'NOT_GRANTED',
+          consentInvitation: {
+            id: 'inv-2',
+            status: 'PENDING',
+            deliveryStatus: 'SENT',
+            sentAt: '2026-11-05T10:00:00.000Z',
+            expiresAt: '2026-11-12T10:00:00.000Z',
+            consumedAt: null,
+          },
+          isHeldForConsent: true,
+        },
+        {
+          ...mockCandidates[2]!,
+          candidateId: 'cand-4',
+          candidateCode: 'CAN-44444444',
+          parseStatus: 'PENDING',
+          assessmentId: null,
+          assessmentStatus: null,
+          consentStatus: 'NOT_GRANTED',
+          consentInvitation: null,
+          isHeldForConsent: true,
+        },
+      ],
+      total: 3,
+    });
+
+    renderCandidatesPage();
+
+    await waitFor(() => {
+      expect(screen.getByText('CAN-11111111')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText(/arrives in a later milestone/i)).not.toBeInTheDocument();
+    expect(screen.getByText('Consent active')).toBeInTheDocument();
+    expect(screen.getByText('Invitation sent')).toBeInTheDocument();
+    expect(screen.getByText('Not sent')).toBeInTheDocument();
+    expect(screen.getByText('Held · awaiting consent')).toBeInTheDocument();
+    expect(screen.getByText('Held · invitation not sent')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /^Send invitation$/i }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByText(/CAN-44444444/)).toBeInTheDocument();
   });
 });
