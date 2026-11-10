@@ -312,6 +312,28 @@ describe('scorecard.api', () => {
       expect(msg).toContain('The AI requirement extraction provider is currently unreachable');
     });
 
+    it('distinguishes provider_invalid_response, provider_invalid_request, and provider_content_blocked from provider_unavailable', () => {
+      const invalidResponseMsg = resolveScorecardErrorMessage(
+        new ApiError({ status: 502, code: 'provider_invalid_response', message: '' }),
+        'Fallback',
+      );
+      expect(invalidResponseMsg).toContain('invalid or incomplete structured response');
+      expect(invalidResponseMsg).not.toContain('currently unreachable');
+
+      const invalidRequestMsg = resolveScorecardErrorMessage(
+        new ApiError({ status: 502, code: 'provider_invalid_request', message: '' }),
+        'Fallback',
+      );
+      expect(invalidRequestMsg).toContain('request or schema was rejected');
+      expect(invalidRequestMsg).not.toContain('currently unreachable');
+
+      const blockedMsg = resolveScorecardErrorMessage(
+        new ApiError({ status: 422, code: 'provider_content_blocked', message: '' }),
+        'Fallback',
+      );
+      expect(blockedMsg).toContain('safety or content policy block');
+    });
+
     it('returns custom message for 504 AI provider timeout', () => {
       const err = new ApiError({ status: 504, code: 'provider_timeout', message: '' });
       const msg = resolveScorecardErrorMessage(err, 'Fallback');

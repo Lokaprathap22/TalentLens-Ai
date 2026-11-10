@@ -12,9 +12,16 @@ import {
 } from './parser.js';
 import { WorkerStorageService } from './storage.js';
 import {
+  AssessmentProviderAuthError,
+  AssessmentProviderConfigurationError,
+  AssessmentProviderContentBlockedError,
+  AssessmentProviderInvalidRequestError,
+  AssessmentProviderNotConfiguredError,
+  AssessmentProviderRateLimitError,
   type AssessmentProvider,
   createAssessmentProvider,
   redactResumeText,
+  sanitizeAssessmentProviderErrorMessage,
   verifyCriterionAssessments,
   calculateAssessmentSummary,
   type ScorecardCriterionDefinition,
@@ -59,7 +66,10 @@ function reconstructWorkerError(errorName: string | undefined, message: string):
 
 function formatWorkerErrorCode(err: unknown): string {
   const rawMessage = err instanceof Error ? err.message : String(err ?? 'Processing failed');
-  const safeMessage = rawMessage.replace(/\s+/g, ' ').trim() || 'Processing failed';
+  const sanitized = sanitizeAssessmentProviderErrorMessage(
+    rawMessage.replace(/postgres(?:ql)?:\/\/[^\s'"]+/gi, 'postgresql://[redacted]'),
+  );
+  const safeMessage = sanitized.replace(/\s+/g, ' ').trim() || 'Processing failed';
 
   if (err instanceof SecurityLimitExceededError) {
     return `DOCUMENT_SECURITY_LIMIT_EXCEEDED: ${safeMessage}`.slice(0, 500);
@@ -75,6 +85,24 @@ function formatWorkerErrorCode(err: unknown): string {
   }
   if (err instanceof OcrRuntimeUnavailableError) {
     return `OCR_RUNTIME_UNAVAILABLE: ${safeMessage}`.slice(0, 500);
+  }
+  if (err instanceof AssessmentProviderConfigurationError) {
+    return `ASSESSMENT_PROVIDER_CONFIGURATION_ERROR: ${safeMessage}`.slice(0, 500);
+  }
+  if (err instanceof AssessmentProviderNotConfiguredError) {
+    return `ASSESSMENT_PROVIDER_NOT_CONFIGURED: ${safeMessage}`.slice(0, 500);
+  }
+  if (err instanceof AssessmentProviderAuthError) {
+    return `ASSESSMENT_PROVIDER_AUTH_ERROR: ${safeMessage}`.slice(0, 500);
+  }
+  if (err instanceof AssessmentProviderRateLimitError) {
+    return `ASSESSMENT_PROVIDER_RATE_LIMIT: ${safeMessage}`.slice(0, 500);
+  }
+  if (err instanceof AssessmentProviderContentBlockedError) {
+    return `ASSESSMENT_PROVIDER_CONTENT_BLOCKED: ${safeMessage}`.slice(0, 500);
+  }
+  if (err instanceof AssessmentProviderInvalidRequestError) {
+    return `ASSESSMENT_PROVIDER_INVALID_REQUEST: ${safeMessage}`.slice(0, 500);
   }
   return safeMessage.slice(0, 500);
 }
@@ -113,7 +141,34 @@ export class WorkerJobProcessor {
     this.leaseDurationSeconds = options.leaseDurationSeconds ?? 300; // 5 minutes default
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 60000; // 60 seconds default
     this.workerFactory = options.workerFactory ?? ((script, opts) => new Worker(script, opts));
-    this.assessmentProvider = options.assessmentProvider ?? createAssessmentProvider();
+    this.assessmentProvider =
+      options.assessmentProvider ??
+      createAssessmentProvider({
+        onFallback: (event) => {
+          console.warn(
+            JSON.stringify({
+              msg: 'Worker resume assessment switched to Gemini fallback model',
+              fromModel: event.fromModel,
+              toModel: event.toModel,
+              reasonKind: event.reasonKind,
+              primaryAttempts: event.primaryAttempts,
+            }),
+          );
+        },
+        onProviderFailover: (event) => {
+          console.warn(
+            JSON.stringify({
+              msg: 'Worker resume assessment failed over to alternate AI provider',
+              fromProvider: event.fromProvider,
+              toProvider: event.toProvider,
+              fromModel: event.fromModel ?? null,
+              toModel: event.toModel ?? null,
+              reasonKind: event.reasonKind,
+              skippedUnconfigured: Boolean(event.skippedUnconfigured),
+            }),
+          );
+        },
+      });
   }
 
   private async parseInWorkerThread(
@@ -445,11 +500,16 @@ export class WorkerJobProcessor {
 
       // 4. Phase 4 — Short Transaction: Fenced failure recording and retry scheduling
       const errorCode = formatWorkerErrorCode(err);
-      const isPermanentDocError =
+      const isPermanentError =
         err instanceof SecurityLimitExceededError ||
         err instanceof InvalidDocumentFormatError ||
-        err instanceof EncryptedDocumentError;
-      const willFail = isPermanentDocError || claimed.attempts >= 3;
+        err instanceof EncryptedDocumentError ||
+        err instanceof AssessmentProviderNotConfiguredError ||
+        err instanceof AssessmentProviderConfigurationError ||
+        err instanceof AssessmentProviderAuthError ||
+        err instanceof AssessmentProviderContentBlockedError ||
+        (err instanceof AssessmentProviderInvalidRequestError && err.isUserInputError);
+      const willFail = isPermanentError || claimed.attempts >= 3;
       const nextStatus = willFail ? 'FAILED' : 'RETRYABLE_FAILURE';
 
       await this.database.$transaction(async (tx) => {
@@ -1485,17 +1545,29 @@ export class WorkerJobProcessor {
       let assessmentText = await tx.assessmentText.findFirst({
         where: {
           resumeDocumentId: resumeDoc.id,
-          version: 1,
+          organizationId: resumeDoc.organizationId,
+          documentExtractionId: extraction.id,
         },
+        orderBy: { version: 'desc' },
       });
 
       if (!assessmentText) {
+        const latestVersionRecord = await tx.assessmentText.findFirst({
+          where: {
+            resumeDocumentId: resumeDoc.id,
+            organizationId: resumeDoc.organizationId,
+          },
+          orderBy: { version: 'desc' },
+          select: { version: true },
+        });
+        const nextVersion = (latestVersionRecord?.version ?? 0) + 1;
+
         assessmentText = await tx.assessmentText.create({
           data: {
             organizationId: resumeDoc.organizationId,
             documentExtractionId: extraction.id,
             resumeDocumentId: resumeDoc.id,
-            version: 1,
+            version: nextVersion,
             redactedText: redacted.redactedText,
             pageMapJson: extraction.pageMapJson as Prisma.InputJsonValue,
             redactionMapJson: redacted.redactionMap as unknown as Prisma.InputJsonValue,
@@ -1506,8 +1578,17 @@ export class WorkerJobProcessor {
 
       const assessmentId = randomUUID();
       const metadata = {
-        provider: 'openai-compatible',
+        provider: aiOutput.provider ?? 'gemini',
         model: aiOutput.model,
+        ...(aiOutput.primaryModel !== undefined ? { primaryModel: aiOutput.primaryModel } : {}),
+        ...(aiOutput.fallbackUsed !== undefined ? { fallbackUsed: aiOutput.fallbackUsed } : {}),
+        ...(aiOutput.failoverUsed !== undefined ? { failoverUsed: aiOutput.failoverUsed } : {}),
+        ...(aiOutput.attemptedProviders !== undefined
+          ? { attemptedProviders: aiOutput.attemptedProviders }
+          : {}),
+        ...(aiOutput.attemptedModels !== undefined
+          ? { attemptedModels: aiOutput.attemptedModels }
+          : {}),
         promptVersion: aiOutput.promptVersion,
         inputHash: aiOutput.inputHash,
         outputHash: aiOutput.outputHash,

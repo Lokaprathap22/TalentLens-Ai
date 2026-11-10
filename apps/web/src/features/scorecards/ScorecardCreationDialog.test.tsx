@@ -201,8 +201,84 @@ describe('ScorecardCreationDialog', () => {
       expect(
         screen.getByText(/the ai requirement extraction provider is currently unreachable/i),
       ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /retry ai extraction/i })).toBeInTheDocument();
       expect(onCreated).not.toHaveBeenCalled();
       expect(onClose).not.toHaveBeenCalled();
     });
+  });
+
+  it('retries AI extraction from the error alert and succeeds on recovery', async () => {
+    const user = userEvent.setup();
+    const createSpy = vi
+      .spyOn(scorecardApi, 'createScorecardDraft')
+      .mockRejectedValueOnce(
+        new ApiError({
+          status: 504,
+          code: 'provider_timeout',
+          message: 'Timed out',
+        }),
+      )
+      .mockResolvedValueOnce({
+        ...mockExistingScorecard,
+        id: 'recovered-ai-draft',
+        version: 2,
+        status: 'DRAFT',
+      });
+
+    render(
+      <ScorecardCreationDialog
+        open={true}
+        onClose={onClose}
+        requisitionId={requisitionId}
+        requisitionTitle={requisitionTitle}
+        onCreated={onCreated}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /generate draft criteria/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole('button', { name: /retry ai extraction/i }));
+
+    expect(createSpy).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(onCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'recovered-ai-draft', version: 2 }),
+      );
+      expect(onClose).toHaveBeenCalled();
+    });
+  });
+
+  it('surfaces missing GEMINI_API_KEY configuration error and lets user switch to manual draft', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(scorecardApi, 'createScorecardDraft').mockRejectedValueOnce(
+      new ApiError({
+        status: 503,
+        code: 'provider_not_configured',
+        message: 'GEMINI_API_KEY missing',
+      }),
+    );
+
+    render(
+      <ScorecardCreationDialog
+        open={true}
+        onClose={onClose}
+        requisitionId={requisitionId}
+        requisitionTitle={requisitionTitle}
+        onCreated={onCreated}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /generate draft criteria/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/missing GEMINI_API_KEY/i)).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole('button', { name: /switch to manual draft/i }));
+    expect(screen.getByRole('button', { name: /create empty draft/i })).toBeInTheDocument();
   });
 });

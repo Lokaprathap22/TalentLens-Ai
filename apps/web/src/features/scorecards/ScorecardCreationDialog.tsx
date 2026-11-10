@@ -1,4 +1,4 @@
-import { AlertCircle, Bot, Copy, FilePlus, Sparkles } from 'lucide-react';
+import { AlertCircle, Bot, Copy, FilePlus, RefreshCw, Sparkles } from 'lucide-react';
 import { useState } from 'react';
 
 import { Button, Dialog, Field, Icon, Select } from '../../components/ui/index.js';
@@ -77,13 +77,39 @@ export function ScorecardCreationDialog({
             className="flex items-start gap-3 rounded-lg border border-danger/30 bg-danger/10 p-3.5 text-sm text-danger"
           >
             <Icon icon={AlertCircle} size="sm" className="mt-0.5 shrink-0" />
-            <div className="space-y-1">
-              <p className="font-medium text-danger">{error}</p>
+            <div className="min-w-0 flex-1 space-y-2">
+              <p className="font-medium text-danger break-words">{error}</p>
               {mode === 'ai' ? (
-                <p className="text-xs text-danger/80">
-                  Tip: If AI extraction is currently unavailable or unconfigured, you can create a
-                  manual draft instead.
-                </p>
+                <>
+                  <p className="text-xs text-danger/85">
+                    AI-generated criteria remain advisory drafts requiring recruiter verification.
+                    You can retry AI extraction or switch to a manual draft.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => void handleCreate()}
+                      disabled={loading}
+                    >
+                      <Icon icon={RefreshCw} size="xs" />
+                      Retry AI extraction
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setMode('manual');
+                        setError(null);
+                      }}
+                      disabled={loading}
+                    >
+                      Switch to manual draft
+                    </Button>
+                  </div>
+                </>
               ) : null}
             </div>
           </div>
@@ -240,8 +266,8 @@ export function ScorecardCreationDialog({
               )
             ) : mode === 'ai' ? (
               <>
-                <Icon icon={Sparkles} size="sm" />
-                Generate draft criteria
+                <Icon icon={error ? RefreshCw : Sparkles} size="sm" />
+                {error ? 'Retry extraction' : 'Generate draft criteria'}
               </>
             ) : mode === 'clone' ? (
               <>

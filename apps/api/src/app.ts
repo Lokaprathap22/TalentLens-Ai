@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { healthResponseSchema } from '@talentlens/shared';
 
 import { createDatabaseHealthChecker, type DatabaseHealthChecker } from './database/readiness.js';
+import { createRequestCorrelationMiddleware } from './middleware/request-context.js';
 import { createAuthRouter, type AuthRouterDependencies } from './modules/auth/auth.routes.js';
 import {
   createRequisitionRouter,
@@ -120,6 +121,7 @@ export function createApp(dependencies: AppDependencies = {}): Express {
         ? createTrustProxyEvaluator(dependencies.trustedProxyIps, dependencies.maxProxyHops ?? 2)
         : 1;
   app.set('trust proxy', trustProxySetting);
+  app.use(createRequestCorrelationMiddleware());
   app.use(helmet());
   app.use(express.json({ limit: '100kb' }));
   if (dependencies.auth) {

@@ -3,6 +3,20 @@ import path from 'node:path';
 
 import dotenv from 'dotenv';
 import { z } from 'zod';
+import {
+  CANONICAL_GEMINI_FALLBACK_MODEL,
+  CANONICAL_GEMINI_MODEL,
+  CANONICAL_GROQ_MODEL,
+  DEFAULT_AI_PROVIDER_ORDER,
+  DEFAULT_GEMINI_TIMEOUT_MS,
+  DEFAULT_GROQ_BASE_URL,
+  parseAiProviderOrder,
+  resolveGeminiModelPair,
+  validateGeminiModelId,
+  validateGroqBaseUrl,
+  validateGroqModelId,
+  type AiProviderId,
+} from '@talentlens/assessment-engine';
 import { parseApprovedPolicies } from '../modules/consent/consent.policy.js';
 
 const emptyStringToUndefined = (value: unknown): unknown =>
@@ -44,37 +58,50 @@ const environmentSchema = z
     ),
     GEMINI_API_KEY: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
     GEMINI_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GEMINI_FALLBACK_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
     GEMINI_TIMEOUT_MS: z
       .preprocess(
-        (value) => {
-          const cleaned = emptyStringToUndefined(value);
-          return cleaned ?? '30000';
-        },
+        emptyStringToUndefined,
         z
           .string()
           .regex(/^\d+$/)
           .transform(Number)
-          .refine((value) => value >= 1_000 && value <= 120_000),
+          .refine((value) => value >= 1_000 && value <= 120_000)
+          .optional(),
       )
       .optional(),
     AI_API_KEY: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
     AI_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    AI_FALLBACK_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
     AI_TIMEOUT_MS: z
       .preprocess(
-        (value) => {
-          const cleaned = emptyStringToUndefined(value);
-          return cleaned ?? '30000';
-        },
+        emptyStringToUndefined,
         z
           .string()
           .regex(/^\d+$/)
           .transform(Number)
-          .refine((value) => value >= 1_000 && value <= 120_000),
+          .refine((value) => value >= 1_000 && value <= 120_000)
+          .optional(),
+      )
+      .optional(),
+    AI_PROVIDER_ORDER: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GROQ_API_KEY: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GROQ_MODEL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GROQ_BASE_URL: z.preprocess(emptyStringToUndefined, z.string().min(1).optional()),
+    GROQ_TIMEOUT_MS: z
+      .preprocess(
+        emptyStringToUndefined,
+        z
+          .string()
+          .regex(/^\d+$/)
+          .transform(Number)
+          .refine((value) => value >= 1_000 && value <= 120_000)
+          .optional(),
       )
       .optional(),
     ASSESSMENT_PROVIDER: z.preprocess(
       emptyStringToUndefined,
-      z.enum(['gemini', 'fake']).optional(),
+      z.enum(['gemini', 'groq', 'auto', 'fake']).optional(),
     ),
     TRUSTED_PROXY_IPS: z.preprocess(emptyStringToUndefined, z.string().optional()),
     RESUME_STORAGE_ROOT: z.string().min(1).default('./storage/resumes'),
@@ -199,13 +226,88 @@ const environmentSchema = z
     if (
       value.NODE_ENV === 'production' &&
       value.ASSESSMENT_PROVIDER &&
-      value.ASSESSMENT_PROVIDER !== 'gemini'
+      value.ASSESSMENT_PROVIDER !== 'gemini' &&
+      value.ASSESSMENT_PROVIDER !== 'groq' &&
+      value.ASSESSMENT_PROVIDER !== 'auto'
     ) {
       context.addIssue({
         code: 'custom',
         path: ['ASSESSMENT_PROVIDER'],
-        message: 'ASSESSMENT_PROVIDER must be "gemini" in production',
+        message: 'ASSESSMENT_PROVIDER must be "gemini", "groq", or "auto" in production',
       });
+    }
+    if (value.AI_PROVIDER_ORDER !== undefined) {
+      const parsedOrder = parseAiProviderOrder(value.AI_PROVIDER_ORDER);
+      if (!parsedOrder.ok) {
+        context.addIssue({
+          code: 'custom',
+          path: ['AI_PROVIDER_ORDER'],
+          message: parsedOrder.reason,
+        });
+      }
+    }
+    if (value.GROQ_MODEL !== undefined) {
+      const check = validateGroqModelId(value.GROQ_MODEL);
+      if (!check.valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['GROQ_MODEL'],
+          message: check.reason,
+        });
+      }
+    }
+    if (value.GROQ_BASE_URL !== undefined) {
+      const allowInsecure = value.NODE_ENV === 'development' || value.NODE_ENV === 'test';
+      const check = validateGroqBaseUrl(value.GROQ_BASE_URL, {
+        allowInsecureHttp: allowInsecure,
+      });
+      if (!check.valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['GROQ_BASE_URL'],
+          message: check.reason,
+        });
+      }
+    }
+    if (value.GEMINI_MODEL !== undefined) {
+      const check = validateGeminiModelId(value.GEMINI_MODEL, 'primary');
+      if (!check.valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['GEMINI_MODEL'],
+          message: check.reason,
+        });
+      }
+    }
+    if (value.AI_MODEL !== undefined) {
+      const check = validateGeminiModelId(value.AI_MODEL, 'primary');
+      if (!check.valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['AI_MODEL'],
+          message: check.reason,
+        });
+      }
+    }
+    if (value.GEMINI_FALLBACK_MODEL !== undefined) {
+      const check = validateGeminiModelId(value.GEMINI_FALLBACK_MODEL, 'fallback');
+      if (!check.valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['GEMINI_FALLBACK_MODEL'],
+          message: check.reason,
+        });
+      }
+    }
+    if (value.AI_FALLBACK_MODEL !== undefined) {
+      const check = validateGeminiModelId(value.AI_FALLBACK_MODEL, 'fallback');
+      if (!check.valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['AI_FALLBACK_MODEL'],
+          message: check.reason,
+        });
+      }
     }
   })
   .transform(
@@ -216,10 +318,17 @@ const environmentSchema = z
       APP_ORIGIN,
       GEMINI_API_KEY,
       GEMINI_MODEL,
+      GEMINI_FALLBACK_MODEL,
       GEMINI_TIMEOUT_MS,
       AI_API_KEY,
       AI_MODEL,
+      AI_FALLBACK_MODEL,
       AI_TIMEOUT_MS,
+      AI_PROVIDER_ORDER,
+      GROQ_API_KEY,
+      GROQ_MODEL,
+      GROQ_BASE_URL,
+      GROQ_TIMEOUT_MS,
       ASSESSMENT_PROVIDER,
       RESUME_STORAGE_ROOT,
       CONSENT_APPROVED_POLICIES,
@@ -234,19 +343,54 @@ const environmentSchema = z
       EMAIL_OUTBOX_IDEMPOTENCY_SECRET,
     }) => {
       const canonicalGeminiKey = GEMINI_API_KEY ?? AI_API_KEY;
-      const canonicalGeminiModel = GEMINI_MODEL ?? AI_MODEL ?? 'gemini-3.8-flash';
-      const canonicalGeminiTimeout = GEMINI_TIMEOUT_MS ?? AI_TIMEOUT_MS ?? 30_000;
+      const modelPair = resolveGeminiModelPair({
+        primaryModel: GEMINI_MODEL ?? AI_MODEL ?? CANONICAL_GEMINI_MODEL,
+        fallbackModel:
+          GEMINI_FALLBACK_MODEL ?? AI_FALLBACK_MODEL ?? CANONICAL_GEMINI_FALLBACK_MODEL,
+      });
+      const canonicalGeminiModel = modelPair.ok
+        ? modelPair.value.primaryModel
+        : CANONICAL_GEMINI_MODEL;
+      const canonicalGeminiFallbackModel = modelPair.ok ? modelPair.value.fallbackModel : null;
+      const canonicalGeminiTimeout =
+        GEMINI_TIMEOUT_MS ?? AI_TIMEOUT_MS ?? DEFAULT_GEMINI_TIMEOUT_MS;
+      const orderCheck = parseAiProviderOrder(
+        AI_PROVIDER_ORDER ?? (ASSESSMENT_PROVIDER === 'groq' ? 'groq' : undefined),
+      );
+      const aiProviderOrder: AiProviderId[] = orderCheck.ok
+        ? orderCheck.order
+        : [...DEFAULT_AI_PROVIDER_ORDER];
+      const groqModelCheck = GROQ_MODEL ? validateGroqModelId(GROQ_MODEL) : undefined;
+      const groqModel =
+        groqModelCheck && groqModelCheck.valid ? groqModelCheck.model : CANONICAL_GROQ_MODEL;
+      const groqBaseUrlCheck = GROQ_BASE_URL
+        ? validateGroqBaseUrl(GROQ_BASE_URL, {
+            allowInsecureHttp: NODE_ENV === 'development' || NODE_ENV === 'test',
+          })
+        : undefined;
+      const groqBaseUrl =
+        groqBaseUrlCheck && groqBaseUrlCheck.valid
+          ? groqBaseUrlCheck.baseUrl
+          : DEFAULT_GROQ_BASE_URL;
+      const groqTimeoutMs = GROQ_TIMEOUT_MS ?? AI_TIMEOUT_MS ?? canonicalGeminiTimeout;
       return {
         nodeEnv: NODE_ENV,
         apiPort: API_PORT,
         databaseUrl: DATABASE_URL,
         appOrigin: APP_ORIGIN ?? 'http://localhost:5173',
+        aiProviderOrder,
         geminiApiKey: canonicalGeminiKey,
         geminiModel: canonicalGeminiModel,
+        geminiFallbackModel: canonicalGeminiFallbackModel,
         geminiTimeoutMs: canonicalGeminiTimeout,
+        groqApiKey: GROQ_API_KEY,
+        groqModel,
+        groqBaseUrl,
+        groqTimeoutMs,
         // Canonical AI settings
         aiApiKey: canonicalGeminiKey,
         aiModel: canonicalGeminiModel,
+        aiFallbackModel: canonicalGeminiFallbackModel,
         aiTimeoutMs: canonicalGeminiTimeout,
         assessmentProvider: ASSESSMENT_PROVIDER ?? (NODE_ENV === 'test' ? 'fake' : 'gemini'),
         assessmentOpenAiApiKey: canonicalGeminiKey,

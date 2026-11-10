@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import zlib from 'node:zlib';
 import type { GoogleGenAI } from '@google/genai';
 import type { PrismaClient } from '@talentlens/database';
-import { createAssessmentProvider } from './assessment.js';
+import {
+  AssessmentProviderAuthError,
+  AssessmentProviderConfigurationError,
+  createAssessmentProvider,
+  createGeminiAssessmentProvider,
+} from './assessment.js';
 import { WorkerJobProcessor } from './processor.js';
 import type { WorkerStorageService } from './storage.js';
 
@@ -645,6 +651,10 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
             status: 'COMPLETE',
             organizationId: 'org-1',
             candidateId: 'cand-1',
+            modelMetadataJson: expect.objectContaining({
+              provider: 'gemini',
+              model: 'test-model',
+            }),
           }),
         }),
       );
@@ -1000,7 +1010,8 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
         process.env['NODE_ENV'] = 'development';
         process.env['ASSESSMENT_PROVIDER'] = 'gemini';
         process.env['GEMINI_API_KEY'] = 'test-worker-key';
-        process.env['GEMINI_MODEL'] = 'gemini-3.8-flash';
+        process.env['GEMINI_MODEL'] = 'gemini-3.6-flash';
+        process.env['GEMINI_FALLBACK_MODEL'] = 'gemini-3.5-flash';
 
         const provider = createAssessmentProvider({
           client: mockClient,
@@ -1025,11 +1036,296 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
           resumeText: 'Experienced in TypeScript.',
         });
 
-        expect(output.model).toBe('gemini-3.8-flash');
+        expect(output.provider).toBe('gemini');
+        expect(output.model).toBe('gemini-3.6-flash');
+        expect(output.primaryModel).toBe('gemini-3.6-flash');
+        expect(output.fallbackUsed).toBe(false);
         expect(output.criteria[0]?.score).toBe(0.9);
         expect(mockGenerateContent).toHaveBeenCalledTimes(1);
       } finally {
         process.env = prevEnv;
+      }
+    });
+
+    it('persists actual fallback model (gemini-3.5-flash) and telemetry in CandidateAssessment.modelMetadataJson when primary returns 503 x3', async () => {
+      const critId = randomUUID();
+      const leakedKey = 'AIzaSyWorkerFallbackTestKey123456';
+      const mockJob = {
+        id: 'assess-job-fallback-1',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-fallback-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const mockClaimedRecord = {
+        id: 'assess-job-fallback-1',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-fallback-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: { requisitionId: 'req-1' },
+        resumeDocument: {
+          id: 'doc-fallback-1',
+          candidateId: 'cand-1',
+          objectKey: '2026-11/resume.pdf',
+          fileType: 'PDF' as const,
+          organizationId: 'org-1',
+        },
+      };
+
+      const upsertMock = vi.fn(
+        async (_args: { create?: { modelMetadataJson?: Record<string, unknown> } }) => ({
+          id: 'cand-assess-fallback-1',
+        }),
+      );
+      let txCount = 0;
+      const mockTx1 = {
+        $queryRaw: vi.fn(async () => [mockJob]),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-1',
+            candidateId: 'cand-1',
+            confirmationName: 'Jane Doe',
+            noticeTextHash: 'notice-hash-1',
+            candidate: { id: 'cand-1', candidateCode: 'CAN-111', profiles: [] },
+          })),
+        },
+        $executeRaw: vi.fn(async () => 1),
+        processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+      };
+
+      const mockTx2 = {
+        $queryRaw: vi.fn(async () => [{ id: 'assess-job-fallback-1', record_status: 'ACTIVE' }]),
+        $executeRaw: vi.fn(async () => 1),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-1',
+            candidateId: 'cand-1',
+            noticeTextHash: 'notice-hash-1',
+          })),
+        },
+        candidateAssessment: { upsert: upsertMock },
+        assessmentText: {
+          findFirst: vi.fn(async () => null),
+          create: vi.fn(async () => ({ id: 'assess-text-fallback-1' })),
+        },
+        criterionAssessment: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'crit-assess-fallback-1' })),
+        },
+        evidenceSnippet: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'snip-fallback-1' })),
+        },
+        auditLog: { create: vi.fn(async () => ({ id: 'audit-fallback-1' })) },
+      };
+
+      const resumeText =
+        'Senior Backend Engineer with 6 years of PostgreSQL and TypeScript experience.';
+      const mockDb = {
+        $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+          txCount += 1;
+          if (txCount === 1) return cb(mockTx1);
+          return cb(mockTx2);
+        }),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-1',
+            candidateId: 'cand-1',
+            confirmationName: 'Jane Doe',
+            noticeTextHash: 'notice-hash-1',
+            candidate: { id: 'cand-1', candidateCode: 'CAN-111', profiles: [] },
+          })),
+        },
+        documentExtraction: {
+          findFirst: vi.fn(async () => ({
+            id: 'ext-fallback-1',
+            extractedText: resumeText,
+            pageMapJson: [{ pageNumber: 1, startOffset: 0, endOffset: resumeText.length }],
+          })),
+        },
+        scorecardVersion: {
+          findFirst: vi.fn(async () => ({
+            id: 'scorecard-v1',
+            requisition: { title: 'Backend Engineer' },
+            criteria: [
+              {
+                id: critId,
+                key: 'postgresql',
+                label: 'PostgreSQL',
+                category: 'EXPERIENCE',
+                requirementType: 'MUST_HAVE',
+                weight: 100,
+                active: true,
+                displayOrder: 1,
+              },
+            ],
+          })),
+        },
+      } as unknown as PrismaClient;
+
+      const calledModels: string[] = [];
+      const mockGenerateContent = vi.fn().mockImplementation(async (req: { model: string }) => {
+        calledModels.push(req.model);
+        if (req.model === 'gemini-3.6-flash') {
+          throw new Error('503 UNAVAILABLE: temporary model overload');
+        }
+        return {
+          text: JSON.stringify({
+            criteria: [
+              {
+                criterionId: critId,
+                status: 'MATCH',
+                score: 1.0,
+                explanation: 'Verified PostgreSQL experience via fallback model.',
+                evidenceQuotes: ['6 years of PostgreSQL and TypeScript experience'],
+              },
+            ],
+          }),
+          usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 35, totalTokenCount: 125 },
+        };
+      });
+
+      const onFallback = vi.fn();
+      const provider = createGeminiAssessmentProvider({
+        apiKey: leakedKey,
+        model: 'gemini-3.6-flash',
+        fallbackModel: 'gemini-3.5-flash',
+        maxRetries: 2,
+        sleep: async () => undefined,
+        onFallback,
+        client: { models: { generateContent: mockGenerateContent } } as unknown as GoogleGenAI,
+      });
+
+      const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+        workerId: 'worker-fallback-test',
+        heartbeatIntervalMs: 0,
+        assessmentProvider: provider,
+      });
+
+      const processed = await processor.processNextJob();
+      expect(processed).toBe(true);
+      expect(calledModels).toEqual([
+        'gemini-3.6-flash',
+        'gemini-3.6-flash',
+        'gemini-3.6-flash',
+        'gemini-3.5-flash',
+      ]);
+      expect(onFallback).toHaveBeenCalledTimes(1);
+      expect(upsertMock).toHaveBeenCalledTimes(1);
+
+      const upsertArg = upsertMock.mock.calls[0]?.[0];
+      expect(upsertArg?.create?.modelMetadataJson).toMatchObject({
+        provider: 'gemini',
+        model: 'gemini-3.5-flash',
+        primaryModel: 'gemini-3.6-flash',
+        fallbackUsed: true,
+        attemptedModels: ['gemini-3.6-flash', 'gemini-3.5-flash'],
+      });
+      expect(JSON.stringify(upsertArg)).not.toContain(leakedKey);
+      expect(mockTx2.auditLog.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('marks ASSESS_CANDIDATE job FAILED immediately without retry on permanent AI config/auth errors and sanitizes leaked secrets', async () => {
+      const leakedKey = 'AIzaSyWorkerSecretKey9876543210';
+      const mockJob = {
+        id: 'assess-job-perm-auth',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const mockClaimedRecord = {
+        id: 'assess-job-perm-auth',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: { requisitionId: 'req-1' },
+        resumeDocument: {
+          id: 'doc-1',
+          candidateId: 'cand-1',
+          objectKey: '2026-11/test.pdf',
+          fileType: 'PDF' as const,
+          organizationId: 'org-1',
+        },
+      };
+
+      for (const permanentError of [
+        new AssessmentProviderConfigurationError(
+          `Configured model invalid for https://generativelanguage.googleapis.com?key=${leakedKey}`,
+        ),
+        new AssessmentProviderAuthError(`Invalid key ${leakedKey}`),
+      ]) {
+        let txCount = 0;
+        const mockTx1 = {
+          $queryRaw: vi.fn(async () => [mockJob]),
+          candidateConsent: { findFirst: vi.fn(async () => ({ id: 'consent-1' })) },
+          $executeRaw: vi.fn(async () => 1),
+          processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+        };
+
+        const mockTx2 = {
+          $executeRaw: vi.fn(async (_query?: unknown) => 1),
+        };
+
+        const mockDb = {
+          $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+            txCount += 1;
+            if (txCount === 1) return cb(mockTx1);
+            return cb(mockTx2);
+          }),
+          documentExtraction: {
+            findFirst: vi.fn(async () => ({
+              id: 'ext-1',
+              extractedText: 'Engineer text',
+              pageMapJson: [],
+            })),
+          },
+          scorecardVersion: {
+            findFirst: vi.fn(async () => ({
+              id: 'scorecard-v1',
+              requisition: { title: 'Backend Engineer' },
+              criteria: [
+                {
+                  id: 'crit-ts',
+                  key: 'ts',
+                  label: 'TS',
+                  category: 'EXPERIENCE',
+                  requirementType: 'MUST_HAVE',
+                  weight: 1.0,
+                  active: true,
+                },
+              ],
+            })),
+          },
+        } as unknown as PrismaClient;
+
+        const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+          heartbeatIntervalMs: 0,
+          assessmentProvider: {
+            assess: vi.fn().mockRejectedValue(permanentError),
+          },
+        });
+
+        const processed = await processor.processNextJob();
+        expect(processed).toBe(true);
+        const sqlCall = mockTx2.$executeRaw.mock.calls[0]?.[0] as
+          { values?: unknown[] } | undefined;
+        expect(sqlCall?.values).toContain('FAILED');
+        const serializedValues = JSON.stringify(sqlCall?.values ?? []);
+        expect(serializedValues).not.toContain(leakedKey);
+        expect(serializedValues).not.toContain('RETRYABLE_FAILURE');
       }
     });
 
@@ -2399,6 +2695,491 @@ describe('WorkerJobProcessor — Lease Claiming, Heartbeats, Fencing & Authoriza
         where: { id: 'doc-bomb-1' },
         data: { parseStatus: 'FAILED' },
       });
+    });
+
+    it('fails over WorkerJobProcessor ASSESS_CANDIDATE from Gemini 503 to Groq and persists multi-provider modelMetadataJson', async () => {
+      const prevNodeEnv = process.env['NODE_ENV'];
+      process.env['NODE_ENV'] = 'development';
+      try {
+        const critUuid = randomUUID();
+        const mockJob = {
+          id: 'assess-job-failover',
+          status: 'QUEUED',
+          attempts: 0,
+          resume_document_id: 'doc-1',
+          organization_id: 'org-1',
+          job_type: 'ASSESS_CANDIDATE',
+          requisition_id: 'req-1',
+        };
+        const mockClaimedRecord = {
+          id: 'assess-job-failover',
+          batchId: 'batch-1',
+          organizationId: 'org-1',
+          resumeDocumentId: 'doc-1',
+          jobType: 'ASSESS_CANDIDATE',
+          attempts: 1,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          batch: { requisitionId: 'req-1' },
+          resumeDocument: {
+            id: 'doc-1',
+            candidateId: 'cand-1',
+            objectKey: '2026-11/test.pdf',
+            fileType: 'PDF' as const,
+            organizationId: 'org-1',
+          },
+        };
+
+        let txCount = 0;
+        const mockTx1 = {
+          $queryRaw: vi.fn(async () => [mockJob]),
+          candidateConsent: { findFirst: vi.fn(async () => ({ id: 'consent-1' })) },
+          $executeRaw: vi.fn(async () => 1),
+          processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+        };
+
+        const mockTx2 = {
+          $queryRaw: vi
+            .fn()
+            .mockResolvedValueOnce([{ id: 'cand-1', record_status: 'ACTIVE' }])
+            .mockResolvedValueOnce([{ id: 'assess-job-failover' }])
+            .mockResolvedValueOnce([{ id: 'assess-job-failover' }]),
+          $executeRaw: vi.fn(async () => 1),
+          candidateConsent: {
+            findFirst: vi.fn(async () => ({
+              id: 'consent-1',
+              candidateId: 'cand-1',
+              confirmationName: 'Alice Candidate',
+              noticeTextHash: 'notice-hash-1',
+            })),
+          },
+          candidateAssessment: { upsert: vi.fn(async () => ({ id: 'cand-assess-failover' })) },
+          assessmentText: {
+            findFirst: vi.fn(async () => null),
+            create: vi.fn(async () => ({ id: 'assess-text-1' })),
+          },
+          criterionAssessment: { deleteMany: vi.fn(async () => ({ count: 0 })), create: vi.fn() },
+          evidenceSnippet: { deleteMany: vi.fn(async () => ({ count: 0 })), create: vi.fn() },
+          auditLog: { create: vi.fn() },
+        };
+
+        const mockDb = {
+          $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+            txCount += 1;
+            if (txCount === 1) return cb(mockTx1);
+            return cb(mockTx2);
+          }),
+          documentExtraction: {
+            findFirst: vi.fn(async () => ({
+              id: 'ext-1',
+              extractedText: 'Senior engineer experienced in TypeScript microservices.',
+              pageMapJson: { pages: [{ pageNumber: 1, startOffset: 0, endOffset: 55 }] },
+            })),
+          },
+          scorecardVersion: {
+            findFirst: vi.fn(async () => ({
+              id: 'scorecard-v1',
+              requisition: { title: 'Backend Engineer' },
+              criteria: [
+                {
+                  id: critUuid,
+                  key: 'ts',
+                  label: 'TypeScript',
+                  category: 'SKILL',
+                  requirementType: 'MUST_HAVE',
+                  weight: 100,
+                  active: true,
+                },
+              ],
+            })),
+          },
+          candidateConsent: {
+            findFirst: vi.fn(async () => ({
+              id: 'consent-1',
+              candidateId: 'cand-1',
+              confirmationName: 'Alice Candidate',
+              noticeTextHash: 'notice-hash-1',
+              candidate: { id: 'cand-1', candidateCode: 'CAN-101', profiles: [] },
+            })),
+          },
+        } as unknown as PrismaClient;
+
+        const groqFetch = vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                model: 'openai/gpt-oss-120b',
+                choices: [
+                  {
+                    finish_reason: 'stop',
+                    message: {
+                      content: JSON.stringify({
+                        criteria: [
+                          {
+                            criterionId: critUuid,
+                            status: 'MATCH',
+                            score: 1.0,
+                            explanation: 'Verified TypeScript microservices',
+                            evidenceQuotes: ['TypeScript microservices'],
+                          },
+                        ],
+                      }),
+                    },
+                  },
+                ],
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            ),
+        );
+
+        const failoverProvider = createAssessmentProvider({
+          providerOrder: 'gemini,groq',
+          apiKey: 'AIzaSyPrimaryKey',
+          groqApiKey: 'gsk_worker_backup_key_123',
+          maxRetries: 0,
+          sleep: async () => undefined,
+          client: {
+            models: {
+              generateContent: vi.fn().mockRejectedValue(new Error('503 UNAVAILABLE')),
+            },
+          } as unknown as GoogleGenAI,
+          fetchFn: groqFetch,
+        });
+
+        const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+          workerId: 'worker-failover-1',
+          heartbeatIntervalMs: 0,
+          assessmentProvider: failoverProvider,
+        });
+
+        const processed = await processor.processNextJob();
+        expect(processed).toBe(true);
+        expect(groqFetch).toHaveBeenCalledTimes(1);
+        expect(mockTx2.candidateAssessment.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({
+              modelMetadataJson: expect.objectContaining({
+                provider: 'groq',
+                model: 'openai/gpt-oss-120b',
+                fallbackUsed: true,
+                failoverUsed: true,
+                attemptedProviders: ['gemini', 'groq'],
+              }),
+            }),
+          }),
+        );
+      } finally {
+        if (prevNodeEnv === undefined) {
+          delete process.env['NODE_ENV'];
+        } else {
+          process.env['NODE_ENV'] = prevNodeEnv;
+        }
+      }
+    });
+
+    it('marks ASSESS_CANDIDATE permanently FAILED without calling Groq when Gemini triggers CONTENT_SAFETY', async () => {
+      const prevNodeEnv = process.env['NODE_ENV'];
+      process.env['NODE_ENV'] = 'development';
+      try {
+        const critUuid = randomUUID();
+        const mockJob = {
+          id: 'assess-job-safety-stop',
+          status: 'QUEUED',
+          attempts: 0,
+          resume_document_id: 'doc-1',
+          organization_id: 'org-1',
+          job_type: 'ASSESS_CANDIDATE',
+          requisition_id: 'req-1',
+        };
+        const mockClaimedRecord = {
+          id: 'assess-job-safety-stop',
+          batchId: 'batch-1',
+          organizationId: 'org-1',
+          resumeDocumentId: 'doc-1',
+          jobType: 'ASSESS_CANDIDATE',
+          attempts: 1,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          batch: { requisitionId: 'req-1' },
+          resumeDocument: {
+            id: 'doc-1',
+            candidateId: 'cand-1',
+            objectKey: '2026-11/test.pdf',
+            fileType: 'PDF' as const,
+            organizationId: 'org-1',
+          },
+        };
+
+        let txCount = 0;
+        const recordedFailureValues: unknown[] = [];
+        const mockTx1 = {
+          $queryRaw: vi.fn(async () => [mockJob]),
+          candidateConsent: { findFirst: vi.fn(async () => ({ id: 'consent-1' })) },
+          $executeRaw: vi.fn(async () => 1),
+          processingJob: { findUnique: vi.fn(async () => mockClaimedRecord) },
+        };
+        const mockTxFailure = {
+          $executeRaw: vi.fn(async (sqlQuery: { values?: unknown[] }) => {
+            recordedFailureValues.push(...(sqlQuery?.values ?? []));
+            return 1;
+          }),
+        };
+
+        const mockDb = {
+          $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+            txCount += 1;
+            if (txCount === 1) return cb(mockTx1);
+            return cb(mockTxFailure);
+          }),
+          documentExtraction: {
+            findFirst: vi.fn(async () => ({
+              id: 'ext-1',
+              extractedText: 'Engineer with TypeScript.',
+              pageMapJson: [],
+            })),
+          },
+          scorecardVersion: {
+            findFirst: vi.fn(async () => ({
+              id: 'scorecard-v1',
+              requisition: { title: 'Backend Engineer' },
+              criteria: [
+                {
+                  id: critUuid,
+                  key: 'ts',
+                  label: 'TypeScript',
+                  category: 'SKILL',
+                  requirementType: 'MUST_HAVE',
+                  weight: 100,
+                  active: true,
+                },
+              ],
+            })),
+          },
+          candidateConsent: {
+            findFirst: vi.fn(async () => ({
+              id: 'consent-1',
+              candidateId: 'cand-1',
+              confirmationName: 'Alice Candidate',
+              noticeTextHash: 'notice-hash-1',
+              candidate: { id: 'cand-1', candidateCode: 'CAN-101', profiles: [] },
+            })),
+          },
+        } as unknown as PrismaClient;
+
+        const groqNotCalled = vi.fn();
+        const provider = createAssessmentProvider({
+          providerOrder: 'gemini,groq',
+          apiKey: 'AIzaSyPrimaryKey',
+          groqApiKey: 'gsk_worker_backup_key_123',
+          client: {
+            models: {
+              generateContent: vi.fn().mockResolvedValue({
+                promptFeedback: { blockReason: 'SAFETY' },
+                text: '',
+              }),
+            },
+          } as unknown as GoogleGenAI,
+          fetchFn: groqNotCalled,
+        });
+
+        const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+          workerId: 'worker-safety-stop',
+          heartbeatIntervalMs: 0,
+          assessmentProvider: provider,
+        });
+
+        const processed = await processor.processNextJob();
+        expect(processed).toBe(true);
+        expect(groqNotCalled).not.toHaveBeenCalled();
+        expect(recordedFailureValues[0]).toBe('FAILED');
+        expect(String(recordedFailureValues[1])).toMatch(/^ASSESSMENT_PROVIDER_CONTENT_BLOCKED:/);
+      } finally {
+        if (prevNodeEnv === undefined) {
+          delete process.env['NODE_ENV'];
+        } else {
+          process.env['NODE_ENV'] = prevNodeEnv;
+        }
+      }
+    });
+
+    it('creates incremented AssessmentText version on re-extraction instead of overwriting or colliding on version 1', async () => {
+      const mockJob = {
+        id: 'assess-job-reextract',
+        status: 'QUEUED',
+        attempts: 0,
+        resume_document_id: 'doc-1',
+        organization_id: 'org-1',
+        job_type: 'ASSESS_CANDIDATE',
+        requisition_id: 'req-1',
+      };
+
+      const critUuid = randomUUID();
+      const mockClaimedRecord = {
+        id: 'assess-job-reextract',
+        batchId: 'batch-1',
+        organizationId: 'org-1',
+        resumeDocumentId: 'doc-1',
+        jobType: 'ASSESS_CANDIDATE',
+        attempts: 1,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        batch: {
+          requisitionId: 'req-1',
+        },
+        resumeDocument: {
+          id: 'doc-1',
+          organizationId: 'org-1',
+          candidateId: 'cand-1',
+          objectKey: '2026-11/reextract.pdf',
+          fileType: 'PDF' as const,
+        },
+      };
+
+      let txCount = 0;
+      const mockTx1 = {
+        $queryRaw: vi.fn(async () => [mockJob]),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({ id: 'consent-1' })),
+        },
+        $executeRaw: vi.fn(async () => 1),
+        processingJob: {
+          findUnique: vi.fn(async () => mockClaimedRecord),
+        },
+      };
+
+      const assessmentTextFindFirst = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ version: 1 });
+      const assessmentTextCreate = vi.fn(async () => ({ id: 'assess-text-v2' }));
+
+      const mockTx2 = {
+        $queryRaw: vi.fn(async () => [{ id: 'assess-job-reextract', record_status: 'ACTIVE' }]),
+        $executeRaw: vi.fn(async () => 1),
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-1',
+            candidateId: 'cand-1',
+            noticeTextHash: 'notice-hash-1',
+          })),
+        },
+        candidateAssessment: {
+          upsert: vi.fn(async () => ({ id: 'cand-assess-v2' })),
+        },
+        assessmentText: {
+          findFirst: assessmentTextFindFirst,
+          create: assessmentTextCreate,
+        },
+        criterionAssessment: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'crit-assess-1' })),
+        },
+        evidenceSnippet: {
+          deleteMany: vi.fn(async () => ({ count: 0 })),
+          create: vi.fn(async () => ({ id: 'snip-1' })),
+        },
+        auditLog: {
+          create: vi.fn(async () => ({ id: 'audit-1' })),
+        },
+      };
+
+      const mockDb = {
+        $transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => {
+          txCount += 1;
+          if (txCount === 1) return cb(mockTx1);
+          return cb(mockTx2);
+        }),
+        documentExtraction: {
+          findFirst: vi.fn(async () => ({
+            id: 'ext-2',
+            extractedText:
+              'Senior Engineer with 8 years of TypeScript and Node.js production experience.',
+            pageMapJson: { pages: [{ pageNumber: 1, startOffset: 0, endOffset: 77 }] },
+          })),
+        },
+        scorecardVersion: {
+          findFirst: vi.fn(async () => ({
+            id: 'scorecard-v1',
+            requisition: { title: 'Senior Backend Engineer' },
+            criteria: [
+              {
+                id: critUuid,
+                key: 'typescript',
+                label: 'TypeScript',
+                category: 'EXPERIENCE',
+                requirementType: 'MUST_HAVE',
+                weight: 100,
+                active: true,
+                displayOrder: 1,
+              },
+            ],
+          })),
+        },
+        candidateConsent: {
+          findFirst: vi.fn(async () => ({
+            id: 'consent-1',
+            candidateId: 'cand-1',
+            confirmationName: 'Alice Candidate',
+            noticeTextHash: 'notice-hash-1',
+            candidate: { id: 'cand-1', candidateCode: 'CAN-101', profiles: [] },
+          })),
+        },
+      } as unknown as PrismaClient;
+
+      const mockProvider = {
+        assess: vi.fn(async () => ({
+          model: 'test-model',
+          promptVersion: '2026-11-assessment-v1',
+          inputHash: 'input-hash-1',
+          outputHash: 'output-hash-1',
+          criteria: [
+            {
+              criterionId: critUuid,
+              status: 'MATCH' as const,
+              score: 1.0,
+              explanation: 'Candidate has 8 years of TypeScript production experience.',
+              evidenceQuotes: ['8 years of TypeScript and Node.js production experience'],
+            },
+          ],
+        })),
+      };
+
+      const processor = new WorkerJobProcessor(mockDb, {} as WorkerStorageService, {
+        heartbeatIntervalMs: 0,
+        assessmentProvider: mockProvider,
+      });
+
+      const processed = await processor.processNextJob();
+
+      expect(processed).toBe(true);
+      expect(assessmentTextFindFirst).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: {
+            resumeDocumentId: 'doc-1',
+            organizationId: 'org-1',
+            documentExtractionId: 'ext-2',
+          },
+        }),
+      );
+      expect(assessmentTextFindFirst).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: {
+            resumeDocumentId: 'doc-1',
+            organizationId: 'org-1',
+          },
+          orderBy: { version: 'desc' },
+          select: { version: true },
+        }),
+      );
+      expect(assessmentTextCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            organizationId: 'org-1',
+            documentExtractionId: 'ext-2',
+            resumeDocumentId: 'doc-1',
+            version: 2,
+          }),
+        }),
+      );
     });
   });
 });

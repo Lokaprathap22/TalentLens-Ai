@@ -13,7 +13,7 @@ import { loadEnvironment } from './config/env.js';
 import { createShutdownHandler } from './lifecycle.js';
 import { createRequisitionRepository } from './modules/requisitions/requisition.repository.js';
 import { createRequisitionService } from './modules/requisitions/requisition.service.js';
-import { createGeminiJdExtractionProvider } from './modules/scorecards/jd-extraction.provider.js';
+import { createMultiProviderJdExtractionProvider } from './modules/scorecards/jd-extraction.provider.js';
 import { createScorecardRepository } from './modules/scorecards/scorecard.repository.js';
 import { createScorecardService } from './modules/scorecards/scorecard.service.js';
 import { createResumeRepository } from './modules/resumes/resume.repository.js';
@@ -67,10 +67,26 @@ const emailDeliveryService = environment.smtpHost
   : new TransactionalEmailService({
       provider: new NullEmailProvider(),
     });
-const extractionProvider = createGeminiJdExtractionProvider({
-  apiKey: environment.geminiApiKey,
-  model: environment.geminiModel,
-  timeoutMs: environment.geminiTimeoutMs,
+const extractionProvider = createMultiProviderJdExtractionProvider({
+  providerOrder: environment.aiProviderOrder,
+  geminiApiKey: environment.geminiApiKey,
+  geminiModel: environment.geminiModel,
+  geminiFallbackModel: environment.geminiFallbackModel,
+  geminiTimeoutMs: environment.geminiTimeoutMs,
+  groqApiKey: environment.groqApiKey,
+  groqModel: environment.groqModel,
+  groqBaseUrl: environment.groqBaseUrl,
+  groqTimeoutMs: environment.groqTimeoutMs,
+  onGeminiFallback: (event) => {
+    console.warn(
+      `[api-jd-fallback] from=${event.fromModel} to=${event.toModel} reason=${event.reasonKind} primaryAttempts=${event.primaryAttempts}`,
+    );
+  },
+  onProviderFailover: (event) => {
+    console.warn(
+      `[api-jd-failover] from=${event.fromProvider} to=${event.toProvider} reason=${event.reasonKind} skippedUnconfigured=${Boolean(event.skippedUnconfigured)}`,
+    );
+  },
 });
 const lazySessionService: SessionService = {
   createSession: (...args) => {

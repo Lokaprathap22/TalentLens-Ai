@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { GoogleGenAI } from '@google/genai';
+import { ThinkingLevel, type GoogleGenAI } from '@google/genai';
 import {
+  AssessmentProviderAuthError,
+  AssessmentProviderConfigurationError,
   AssessmentProviderNotConfiguredError,
+  AssessmentProviderRateLimitError,
   AssessmentProviderRequestError,
   AssessmentProviderResponseError,
   AssessmentProviderTimeoutError,
+  CANONICAL_GEMINI_FALLBACK_MODEL,
+  CANONICAL_GEMINI_MODEL,
   createAssessmentProvider,
   createDeterministicFakeAssessmentProvider,
   createGeminiAssessmentProvider,
@@ -170,8 +175,9 @@ describe('assessment.provider', () => {
 
     const provider = createGeminiAssessmentProvider({
       apiKey: 'test-key',
-      model: 'gemini-3.8-flash',
+      model: 'gemini-3.6-flash',
       maxRetries: 2,
+      sleep: async () => undefined,
       client: mockClient,
     });
 
@@ -181,26 +187,75 @@ describe('assessment.provider', () => {
     expect(result.criteria[0]!.score).toBe(0.95);
   });
 
-  it('performs bounded retries on 503 upstream error and exhausts retries cleanly', async () => {
-    let callCount = 0;
-    const mockClient = {
+  it('performs bounded retries on 503 upstream error and falls back once to gemini-3.5-flash when fallback is enabled', async () => {
+    const calledModels: string[] = [];
+    const mockClientNoFallback = {
       models: {
-        generateContent: vi.fn().mockImplementation(async () => {
-          callCount++;
+        generateContent: vi.fn().mockImplementation(async (req: { model: string }) => {
+          calledModels.push(req.model);
           throw new Error('503 UNAVAILABLE: backend service temporarily unavailable');
         }),
       },
     } as unknown as GoogleGenAI;
 
-    const provider = createGeminiAssessmentProvider({
+    const providerNoFallback = createGeminiAssessmentProvider({
       apiKey: 'test-key',
-      model: 'gemini-3.8-flash',
+      model: 'gemini-3.6-flash',
+      fallbackModel: null,
       maxRetries: 2,
-      client: mockClient,
+      sleep: async () => undefined,
+      client: mockClientNoFallback,
     });
 
-    await expect(provider.assess(sampleInput)).rejects.toThrow(AssessmentProviderRequestError);
-    expect(callCount).toBe(3); // Initial try + 2 retries
+    await expect(providerNoFallback.assess(sampleInput)).rejects.toThrow(
+      AssessmentProviderRequestError,
+    );
+    expect(calledModels).toEqual(['gemini-3.6-flash', 'gemini-3.6-flash', 'gemini-3.6-flash']);
+
+    const fallbackModels: string[] = [];
+    const fallbackClient = {
+      models: {
+        generateContent: vi.fn().mockImplementation(async (req: { model: string }) => {
+          fallbackModels.push(req.model);
+          if (req.model === 'gemini-3.6-flash') {
+            throw new Error('503 UNAVAILABLE: capacity squeeze');
+          }
+          return {
+            text: JSON.stringify({
+              criteria: [
+                {
+                  criterionId: '11111111-1111-4111-8111-111111111111',
+                  status: 'MATCH',
+                  score: 0.9,
+                  explanation: 'Fallback succeeded',
+                  evidenceQuotes: ['Python and Django'],
+                },
+              ],
+            }),
+          };
+        }),
+      },
+    } as unknown as GoogleGenAI;
+
+    const providerWithFallback = createGeminiAssessmentProvider({
+      apiKey: 'test-key',
+      model: CANONICAL_GEMINI_MODEL,
+      fallbackModel: CANONICAL_GEMINI_FALLBACK_MODEL,
+      maxRetries: 2,
+      sleep: async () => undefined,
+      client: fallbackClient,
+    });
+
+    const fallbackRes = await providerWithFallback.assess(sampleInput);
+    expect(fallbackModels).toEqual([
+      'gemini-3.6-flash',
+      'gemini-3.6-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash',
+    ]);
+    expect(fallbackRes.model).toBe('gemini-3.5-flash');
+    expect(fallbackRes.primaryModel).toBe('gemini-3.6-flash');
+    expect(fallbackRes.fallbackUsed).toBe(true);
   });
 
   it('deterministic fake provider matches keywords and returns exact excerpts', async () => {
@@ -246,7 +301,7 @@ describe('assessment.provider', () => {
 
     const provider = createGeminiAssessmentProvider({
       apiKey: 'test-key',
-      model: 'gemini-3.8-flash',
+      model: 'gemini-3.6-flash',
       client: mockClient,
     });
 
@@ -258,10 +313,16 @@ describe('assessment.provider', () => {
       model?: string;
       config?: Record<string, unknown>;
     };
-    expect(callReq.model).toBe('gemini-3.8-flash');
+    expect(callReq.model).toBe('gemini-3.6-flash');
     expect(callReq.config?.responseMimeType).toBe('application/json');
     expect(callReq.config?.responseSchema).toBeDefined();
     expect(callReq.config?.systemInstruction).toBeDefined();
+    expect(callReq.config?.thinkingConfig).toEqual({ thinkingLevel: ThinkingLevel.LOW });
+    const thinkingConfig = callReq.config?.thinkingConfig as Record<string, unknown> | undefined;
+    expect(thinkingConfig?.thinkingBudget).toBeUndefined();
+    expect(thinkingConfig?.thinking_budget).toBeUndefined();
+    expect(callReq.config?.candidateCount).toBeUndefined();
+    expect(callReq.config?.candidate_count).toBeUndefined();
     expect(callReq.config?.temperature).toBeUndefined();
     expect(callReq.config?.topP).toBeUndefined();
     expect(callReq.config?.top_p).toBeUndefined();
@@ -280,14 +341,14 @@ describe('assessment.provider', () => {
 
     const provider = createGeminiAssessmentProvider({
       apiKey: 'test-key',
-      model: 'gemini-3.8-flash',
+      model: 'gemini-3.6-flash',
       client: mockClient,
     });
 
     await expect(provider.assess(sampleInput)).rejects.toThrow(AssessmentProviderResponseError);
   });
 
-  it('falls back past empty strings to subsequent API keys and models', async () => {
+  it('falls back past empty strings to subsequent API keys and resolves Free-Tier GEMINI_MODEL / AI_FALLBACK_MODEL env vars', async () => {
     const originalEnv = { ...process.env };
     try {
       process.env['NODE_ENV'] = 'production';
@@ -295,10 +356,15 @@ describe('assessment.provider', () => {
       process.env['GEMINI_API_KEY'] = '   ';
       process.env['AI_API_KEY'] = 'gemini-secret-key';
       process.env['GEMINI_MODEL'] = '';
-      process.env['AI_MODEL'] = 'gemini-2.5-pro';
+      process.env['AI_MODEL'] = 'gemini-3.6-flash';
+      process.env['GEMINI_FALLBACK_MODEL'] = '';
+      process.env['AI_FALLBACK_MODEL'] = 'gemini-3.5-flash';
 
       const mockGenerateContent = vi.fn().mockImplementation(async (req) => {
-        expect(req.model).toBe('gemini-2.5-pro');
+        if (req.model === 'gemini-3.6-flash') {
+          throw new Error('503 UNAVAILABLE');
+        }
+        expect(req.model).toBe('gemini-3.5-flash');
         return {
           text: JSON.stringify({
             criteria: [
@@ -321,14 +387,78 @@ describe('assessment.provider', () => {
       } as unknown as GoogleGenAI;
 
       const provider = createAssessmentProvider({
+        sleep: async () => undefined,
         client: mockClient,
       });
 
       const result = await provider.assess(sampleInput);
       expect(result.criteria[0]!.status).toBe('MATCH');
-      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(result.provider).toBe('gemini');
+      expect(result.model).toBe('gemini-3.5-flash');
+      expect(result.fallbackUsed).toBe(true);
+      expect(mockGenerateContent).toHaveBeenCalledTimes(4);
     } finally {
       process.env = originalEnv;
     }
+  });
+
+  it('rejects disallowed Gemini models (3.8, Flash-Lite) and classifies 401/403 auth, 404 model, and project-quota 429 errors without retry or fallback', async () => {
+    for (const disallowedModel of ['gemini-3.8-flash', 'gemini-3.6-flash-lite', 'gemini-2.5-pro']) {
+      const deprecatedProvider = createGeminiAssessmentProvider({
+        apiKey: 'valid-key',
+        model: disallowedModel,
+      });
+      await expect(deprecatedProvider.assess(sampleInput)).rejects.toThrow(
+        AssessmentProviderConfigurationError,
+      );
+    }
+
+    const authGenerate = vi
+      .fn()
+      .mockRejectedValue(new Error('401 UNAUTHENTICATED: API_KEY_INVALID'));
+    const authProvider = createGeminiAssessmentProvider({
+      apiKey: 'bad-key',
+      model: 'gemini-3.6-flash',
+      fallbackModel: 'gemini-3.5-flash',
+      maxRetries: 2,
+      sleep: async () => undefined,
+      client: { models: { generateContent: authGenerate } } as unknown as GoogleGenAI,
+    });
+    await expect(authProvider.assess(sampleInput)).rejects.toThrow(AssessmentProviderAuthError);
+    expect(authGenerate).toHaveBeenCalledTimes(1);
+
+    const modelNotFoundGenerate = vi
+      .fn()
+      .mockRejectedValue(new Error('404 NOT_FOUND: model not found'));
+    const modelNotFoundProvider = createGeminiAssessmentProvider({
+      apiKey: 'valid-key',
+      model: 'gemini-3.6-flash',
+      fallbackModel: 'gemini-3.5-flash',
+      maxRetries: 2,
+      sleep: async () => undefined,
+      client: { models: { generateContent: modelNotFoundGenerate } } as unknown as GoogleGenAI,
+    });
+    await expect(modelNotFoundProvider.assess(sampleInput)).rejects.toThrow(
+      AssessmentProviderConfigurationError,
+    );
+    expect(modelNotFoundGenerate).toHaveBeenCalledTimes(1);
+
+    const projectQuotaGenerate = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('429 RESOURCE_EXHAUSTED: GenerateRequestsPerDayPerProjectPerModel exhausted'),
+      );
+    const projectQuotaProvider = createGeminiAssessmentProvider({
+      apiKey: 'valid-key',
+      model: 'gemini-3.6-flash',
+      fallbackModel: 'gemini-3.5-flash',
+      maxRetries: 2,
+      sleep: async () => undefined,
+      client: { models: { generateContent: projectQuotaGenerate } } as unknown as GoogleGenAI,
+    });
+    await expect(projectQuotaProvider.assess(sampleInput)).rejects.toThrow(
+      AssessmentProviderRateLimitError,
+    );
+    expect(projectQuotaGenerate).toHaveBeenCalledTimes(1);
   });
 });

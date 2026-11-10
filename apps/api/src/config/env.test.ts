@@ -18,15 +18,17 @@ describe('parseEnvironment', () => {
       databaseUrl: validDatabaseUrl,
       appOrigin: 'http://localhost:5173',
       geminiApiKey: undefined,
-      geminiModel: 'gemini-3.8-flash',
-      geminiTimeoutMs: 30_000,
+      geminiModel: 'gemini-3.6-flash',
+      geminiFallbackModel: 'gemini-3.5-flash',
+      geminiTimeoutMs: 90_000,
       aiApiKey: undefined,
-      aiModel: 'gemini-3.8-flash',
-      aiTimeoutMs: 30_000,
+      aiModel: 'gemini-3.6-flash',
+      aiFallbackModel: 'gemini-3.5-flash',
+      aiTimeoutMs: 90_000,
       assessmentProvider: 'gemini',
       assessmentOpenAiApiKey: undefined,
-      assessmentOpenAiModel: 'gemini-3.8-flash',
-      assessmentTimeoutMs: 30_000,
+      assessmentOpenAiModel: 'gemini-3.6-flash',
+      assessmentTimeoutMs: 90_000,
       resumeStorageRoot: expect.stringContaining('storage'),
       approvedPolicies: [],
       approvedPolicyVersions: [],
@@ -225,12 +227,59 @@ describe('parseEnvironment', () => {
       DATABASE_URL: validDatabaseUrl,
       ASSESSMENT_PROVIDER: 'gemini',
       GEMINI_API_KEY: 'test-gemini-key',
-      GEMINI_MODEL: 'gemini-2.5-pro',
+      GEMINI_MODEL: 'models/GEMINI-3.6-FLASH',
+      GEMINI_FALLBACK_MODEL: 'gemini-3.5-flash',
       GEMINI_TIMEOUT_MS: '45000',
     });
     expect(geminiEnv.assessmentProvider).toBe('gemini');
-    expect(geminiEnv.geminiModel).toBe('gemini-2.5-pro');
+    expect(geminiEnv.geminiModel).toBe('gemini-3.6-flash');
+    expect(geminiEnv.geminiFallbackModel).toBe('gemini-3.5-flash');
     expect(geminiEnv.geminiTimeoutMs).toBe(45_000);
+
+    // Falls back to AI_TIMEOUT_MS cleanly when GEMINI_TIMEOUT_MS is unset
+    const aiTimeoutEnv = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      AI_TIMEOUT_MS: '60000',
+    });
+    expect(aiTimeoutEnv.geminiTimeoutMs).toBe(60_000);
+    expect(aiTimeoutEnv.aiTimeoutMs).toBe(60_000);
+
+    // Deduplicates fallback to null if normalized primary equals fallback
+    const dedupedEnv = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      GEMINI_MODEL: 'models/gemini-3.5-flash',
+      GEMINI_FALLBACK_MODEL: 'GEMINI-3.5-FLASH',
+    });
+    expect(dedupedEnv.geminiModel).toBe('gemini-3.5-flash');
+    expect(dedupedEnv.geminiFallbackModel).toBeNull();
+    expect(dedupedEnv.aiFallbackModel).toBeNull();
+
+    // Rejects Flash-Lite, 3.8, legacy, and unknown models in primary and fallback
+    for (const badModel of [
+      'gemini-3.8-flash',
+      'gemini-3.6-flash-lite',
+      'gemini-3.5-flash-lite',
+      'gemini-2.5-pro',
+      'gpt-4o',
+    ]) {
+      expect(() =>
+        parseEnvironment({
+          NODE_ENV: 'development',
+          DATABASE_URL: validDatabaseUrl,
+          GEMINI_MODEL: badModel,
+        }),
+      ).toThrow(EnvironmentValidationError);
+
+      expect(() =>
+        parseEnvironment({
+          NODE_ENV: 'development',
+          DATABASE_URL: validDatabaseUrl,
+          GEMINI_FALLBACK_MODEL: badModel,
+        }),
+      ).toThrow(EnvironmentValidationError);
+    }
   });
 
   it('enforces SCANNER_FAIL_CLOSED and ClamAV configuration in production and staging', () => {
@@ -317,11 +366,13 @@ describe('parseEnvironment', () => {
     });
 
     expect(env.geminiApiKey).toBeUndefined();
-    expect(env.geminiModel).toBe('gemini-3.8-flash');
-    expect(env.geminiTimeoutMs).toBe(30_000);
+    expect(env.geminiModel).toBe('gemini-3.6-flash');
+    expect(env.geminiFallbackModel).toBe('gemini-3.5-flash');
+    expect(env.geminiTimeoutMs).toBe(90_000);
     expect(env.aiApiKey).toBeUndefined();
-    expect(env.aiModel).toBe('gemini-3.8-flash');
-    expect(env.aiTimeoutMs).toBe(30_000);
+    expect(env.aiModel).toBe('gemini-3.6-flash');
+    expect(env.aiFallbackModel).toBe('gemini-3.5-flash');
+    expect(env.aiTimeoutMs).toBe(90_000);
     expect(env.trustedProxyIps).toEqual(['127.0.0.1', '10.0.0.5']);
   });
 
@@ -354,7 +405,7 @@ describe('parseEnvironment', () => {
       }),
     ).toThrow('STORAGE_DRIVER=s3 is strictly required in production');
 
-    // Rejects non-gemini provider in production
+    // Rejects fake provider in production
     expect(() =>
       parseEnvironment({
         NODE_ENV: 'production',
@@ -369,5 +420,82 @@ describe('parseEnvironment', () => {
         TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
       }),
     ).toThrow('strictly forbidden outside NODE_ENV=test');
+  });
+
+  it('validates multi-provider AI order and Groq env configuration without breaking Gemini-only setups', () => {
+    // Gemini-only defaults succeed without GROQ_API_KEY
+    const geminiOnly = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      GEMINI_API_KEY: 'AIzaSyGeminiOnlyKey',
+      GROQ_API_KEY: '',
+      GROQ_MODEL: '',
+      GROQ_BASE_URL: '',
+      GROQ_TIMEOUT_MS: '',
+      AI_PROVIDER_ORDER: '',
+    });
+    expect(geminiOnly.aiProviderOrder).toEqual(['gemini', 'groq']);
+    expect(geminiOnly.groqApiKey).toBeUndefined();
+    expect(geminiOnly.groqModel).toBe('openai/gpt-oss-120b');
+    expect(geminiOnly.groqBaseUrl).toBe('https://api.groq.com/openai/v1');
+    expect(geminiOnly.groqTimeoutMs).toBe(90_000);
+
+    // Custom provider order and Groq settings normalize properly
+    const custom = parseEnvironment({
+      NODE_ENV: 'development',
+      DATABASE_URL: validDatabaseUrl,
+      AI_PROVIDER_ORDER: 'groq, gemini',
+      GROQ_API_KEY: 'gsk_custom_key_123',
+      GROQ_MODEL: 'openai/gpt-oss-120b',
+      GROQ_BASE_URL: 'https://api.groq.com/openai/v1/',
+      GROQ_TIMEOUT_MS: '45000',
+    });
+    expect(custom.aiProviderOrder).toEqual(['groq', 'gemini']);
+    expect(custom.groqApiKey).toBe('gsk_custom_key_123');
+    expect(custom.groqBaseUrl).toBe('https://api.groq.com/openai/v1');
+    expect(custom.groqTimeoutMs).toBe(45_000);
+
+    // Rejects invalid AI_PROVIDER_ORDER
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'development',
+        DATABASE_URL: validDatabaseUrl,
+        AI_PROVIDER_ORDER: 'gemini,unknown',
+      }),
+    ).toThrow('AI_PROVIDER_ORDER');
+
+    // Rejects insecure http GROQ_BASE_URL in production
+    expect(() =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        API_PORT: '443',
+        APP_ORIGIN: 'https://app.example.com',
+        DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+        STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'talentlens-prod-resumes',
+        S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+        S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+        TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+        GROQ_BASE_URL: 'http://api.groq.com/openai/v1',
+      }),
+    ).toThrow('GROQ_BASE_URL');
+
+    // Allows ASSSESMENT_PROVIDER=auto or groq in production
+    const prodAuto = parseEnvironment({
+      NODE_ENV: 'production',
+      API_PORT: '443',
+      APP_ORIGIN: 'https://app.example.com',
+      DATABASE_URL: 'postgres://runtime-user:runtime-password@db.example:5432/app',
+      STORAGE_DRIVER: 's3',
+      S3_BUCKET: 'talentlens-prod-resumes',
+      S3_ACCESS_KEY_ID: 'AKIA_PROD_TEST',
+      S3_SECRET_ACCESS_KEY: 'secret_prod_test_key_123',
+      TRUSTED_PROXY_IPS: '172.28.0.10,172.28.0.1,127.0.0.1',
+      ASSESSMENT_PROVIDER: 'auto',
+      AI_PROVIDER_ORDER: 'gemini,groq',
+      GROQ_API_KEY: 'gsk_prod_backup_123',
+    });
+    expect(prodAuto.assessmentProvider).toBe('auto');
+    expect(prodAuto.aiProviderOrder).toEqual(['gemini', 'groq']);
   });
 });

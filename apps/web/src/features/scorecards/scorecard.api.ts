@@ -196,6 +196,38 @@ export function resolveScorecardErrorMessage(
     return 'The requested scorecard or requisition could not be found.';
   }
 
+  if (error.code === 'provider_not_configured') {
+    return 'AI scorecard extraction is not configured on the server (missing GEMINI_API_KEY / GROQ_API_KEY). You can create a manual draft instead.';
+  }
+
+  if (error.code === 'provider_configuration_error') {
+    return 'AI scorecard extraction configuration or model is invalid. Verify GEMINI_MODEL / GROQ_MODEL and API keys, or create a manual draft.';
+  }
+
+  if (error.code === 'provider_auth_error') {
+    return 'AI provider authentication failed. Please verify the configured Gemini / Groq API keys and permissions, then retry or create a manual draft.';
+  }
+
+  if (
+    error.status === 429 ||
+    error.code === 'provider_rate_limited' ||
+    error.code === 'too_many_requests'
+  ) {
+    return 'The AI extraction service is temporarily rate-limited or over quota. Wait a moment and retry, or create a manual draft.';
+  }
+
+  if (error.code === 'provider_content_blocked') {
+    return 'AI extraction could not process this job description due to a safety or content policy block. Review the job description text or create a manual draft.';
+  }
+
+  if (error.code === 'provider_invalid_response') {
+    return 'AI requirement extraction returned an invalid or incomplete structured response. You can retry or create a manual draft.';
+  }
+
+  if (error.code === 'provider_invalid_request') {
+    return 'The AI extraction request or schema was rejected by the upstream provider. You can retry or create a manual draft.';
+  }
+
   if (error.status === 502 || error.code === 'provider_unavailable') {
     return 'The AI requirement extraction provider is currently unreachable. You can retry or create a manual draft.';
   }

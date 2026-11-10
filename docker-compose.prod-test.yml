@@ -94,7 +94,14 @@ services:
       SMTP_REQUIRE_TLS: 'false'
       EMAIL_FROM: no-reply@talentlens.ai
       GEMINI_API_KEY: mock-test-key
-      GEMINI_MODEL: gemini-3.8-flash
+      GEMINI_MODEL: gemini-3.6-flash
+      GEMINI_FALLBACK_MODEL: gemini-3.5-flash
+      GEMINI_TIMEOUT_MS: 90000
+      AI_PROVIDER_ORDER: gemini,groq
+      GROQ_API_KEY: ''
+      GROQ_MODEL: openai/gpt-oss-120b
+      GROQ_BASE_URL: https://api.groq.com/openai/v1
+      GROQ_TIMEOUT_MS: 90000
       ASSESSMENT_PROVIDER: fake
       CONSENT_APPROVED_POLICY_VERSIONS: 2026-11-v1
     depends_on:
@@ -139,7 +146,14 @@ services:
       SMTP_REQUIRE_TLS: 'false'
       EMAIL_FROM: no-reply@talentlens.ai
       GEMINI_API_KEY: mock-test-key
-      GEMINI_MODEL: gemini-3.8-flash
+      GEMINI_MODEL: gemini-3.6-flash
+      GEMINI_FALLBACK_MODEL: gemini-3.5-flash
+      GEMINI_TIMEOUT_MS: 90000
+      AI_PROVIDER_ORDER: gemini,groq
+      GROQ_API_KEY: ''
+      GROQ_MODEL: openai/gpt-oss-120b
+      GROQ_BASE_URL: https://api.groq.com/openai/v1
+      GROQ_TIMEOUT_MS: 90000
       ASSESSMENT_PROVIDER: fake
     depends_on:
       postgres:

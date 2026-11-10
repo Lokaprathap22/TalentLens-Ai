@@ -33,7 +33,13 @@ export interface AssessmentCriterionOutput {
 
 export interface AssessmentProviderOutput {
   criteria: AssessmentCriterionOutput[];
+  provider?: string | undefined;
   model: string;
+  primaryModel?: string | undefined;
+  fallbackUsed?: boolean | undefined;
+  attemptedModels?: string[] | undefined;
+  attemptedProviders?: string[] | undefined;
+  failoverUsed?: boolean | undefined;
   promptVersion: string;
   inputHash: string;
   outputHash: string;
@@ -81,6 +87,11 @@ export interface CalculatedAssessmentSummary {
 export interface AssessmentModelMetadata {
   provider: string;
   model: string;
+  primaryModel?: string | undefined;
+  fallbackUsed?: boolean | undefined;
+  attemptedModels?: string[] | undefined;
+  attemptedProviders?: string[] | undefined;
+  failoverUsed?: boolean | undefined;
   promptVersion: string;
   inputHash: string;
   outputHash: string;
