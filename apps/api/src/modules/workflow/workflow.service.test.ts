@@ -1268,4 +1268,99 @@ describe('workflow.service', () => {
       );
     });
   });
+
+  describe('Consent & invitation summary projection', () => {
+    it('projects consentStatus, consentInvitation, and isHeldForConsent in candidate list and detail without PII', async () => {
+      const now = new Date('2026-11-10T08:00:00.000Z');
+      const invitationSummary = {
+        id: 'inv-100',
+        status: 'PENDING' as const,
+        deliveryStatus: 'SENT',
+        sentAt: '2026-11-10T08:00:00.000Z',
+        expiresAt: '2026-11-17T08:00:00.000Z',
+        consumedAt: null,
+      };
+
+      const mockRepo: Partial<WorkflowRepository> = {
+        findAuthorizedRequisition: vi.fn().mockResolvedValue({
+          id: requisitionId,
+          title: 'Principal Backend Engineer',
+          status: 'OPEN',
+          clientId,
+          client: { id: clientId, name: 'Acme Corp', status: 'ACTIVE' },
+        }),
+        listCandidatesForRequisition: vi.fn().mockResolvedValue({
+          items: [
+            {
+              candidateId,
+              candidateCode: 'CAN-1001',
+              resumeDocumentId: 'doc-1001',
+              resumeFileName: 'candidate.pdf',
+              parseStatus: 'PENDING',
+              consentStatus: 'NOT_GRANTED',
+              consentInvitation: invitationSummary,
+              isHeldForConsent: true,
+              assessment: null,
+              review: null,
+              shortlist: null,
+              submission: null,
+              lastActivityAt: now,
+            },
+          ],
+          total: 1,
+        }),
+        getCandidateDetail: vi.fn().mockResolvedValue({
+          candidate: { id: candidateId, candidateCode: 'CAN-1001' },
+          requisition: {
+            id: requisitionId,
+            title: 'Principal Backend Engineer',
+            client: { id: clientId, name: 'Acme Corp' },
+          },
+          resume: {
+            id: 'doc-1001',
+            fileName: 'candidate.pdf',
+            fileType: 'PDF',
+            sizeBytes: BigInt(1024),
+            uploadedAt: now,
+          },
+          hasInspectedOriginalResume: false,
+          consent: null,
+          consentInvitation: invitationSummary,
+          assessment: null,
+          review: null,
+          shortlist: null,
+          submission: null,
+          clientFeedback: [],
+          interviews: [],
+        }),
+      };
+
+      const service = createWorkflowService(mockRepo as WorkflowRepository);
+
+      const listResult = await service.listCandidatesForRequisition(
+        recruiterPrincipal,
+        requisitionId,
+        { limit: 20, offset: 0 },
+      );
+      expect(listResult.items[0]).toEqual(
+        expect.objectContaining({
+          candidateCode: 'CAN-1001',
+          consentStatus: 'NOT_GRANTED',
+          consentInvitation: invitationSummary,
+          isHeldForConsent: true,
+        }),
+      );
+      expect(JSON.stringify(listResult)).not.toContain('email');
+      expect(JSON.stringify(listResult)).not.toContain('tokenHash');
+
+      const detailResult = await service.getCandidateDetail(
+        recruiterPrincipal,
+        requisitionId,
+        candidateId,
+      );
+      expect(detailResult.consentInvitation).toEqual(invitationSummary);
+      expect(JSON.stringify(detailResult)).not.toContain('email');
+      expect(JSON.stringify(detailResult)).not.toContain('tokenHash');
+    });
+  });
 });

@@ -1,11 +1,18 @@
 import type { AuthenticatedPrincipal } from '../auth/session.service.js';
 import type { ScorecardDto } from './scorecard.dto.js';
 import {
-  JdProviderNotConfiguredError,
+  JdProviderAuthError,
   JdProviderConfigurationError,
+  JdProviderContentBlockedError,
+  JdProviderError,
+  JdProviderInvalidRequestError,
+  JdProviderNotConfiguredError,
+  JdProviderRateLimitError,
   JdProviderRequestError,
+  JdProviderResponseError,
   JdProviderTimeoutError,
   type JdExtractionProvider,
+  type JdProviderDiagnostics,
 } from './jd-extraction.provider.js';
 import type { JdExtractionOutput } from './jd-extraction.types.js';
 import type { ExtractedEvidence, ExtractedRequirement } from './jd-extraction.types.js';
@@ -93,8 +100,8 @@ function toDto(record: ScorecardRecord): ScorecardDto {
       active: criterion.active,
       evidence:
         typeof criterion.ruleJson.evidence === 'object' &&
-        criterion.ruleJson.evidence !== null &&
-        !Array.isArray(criterion.ruleJson.evidence)
+          criterion.ruleJson.evidence !== null &&
+          !Array.isArray(criterion.ruleJson.evidence)
           ? (criterion.ruleJson.evidence as ScorecardDto['criteria'][number]['evidence'])
           : null,
     })),
@@ -219,8 +226,8 @@ function validateApproval(record: ScorecardRecord): void {
           typeof criterion.ruleJson.description === 'string' ? criterion.ruleJson.description : '',
         evidence:
           typeof criterion.ruleJson.evidence === 'object' &&
-          criterion.ruleJson.evidence !== null &&
-          !Array.isArray(criterion.ruleJson.evidence)
+            criterion.ruleJson.evidence !== null &&
+            !Array.isArray(criterion.ruleJson.evidence)
             ? (criterion.ruleJson.evidence as { sourceQuote?: string })
             : undefined,
       }),
@@ -240,10 +247,27 @@ function validateApproval(record: ScorecardRecord): void {
 
 function validateCriterionKeys(input: UpdateScorecardInput): void {
   if (!input.criteria) return;
-  const keys = input.criteria
-    .map((criterion, index) => criterion.key ?? `manual-${index + 1}`)
-    .map((key) => key.toLowerCase());
-  if (new Set(keys).size !== keys.length) throw new ScorecardInvalidError();
+  const seenIds = new Set<string>();
+  const seenExplicitKeys = new Set<string>();
+
+  for (const criterion of input.criteria) {
+    if (criterion.id !== undefined) {
+      const normalizedId = criterion.id.trim().toLowerCase();
+      if (seenIds.has(normalizedId)) {
+        throw new ScorecardInvalidError();
+      }
+      seenIds.add(normalizedId);
+    }
+
+    const explicitKey = criterion.key?.trim();
+    if (explicitKey) {
+      const normalizedKey = explicitKey.toLowerCase();
+      if (seenExplicitKeys.has(normalizedKey)) {
+        throw new ScorecardInvalidError();
+      }
+      seenExplicitKeys.add(normalizedKey);
+    }
+  }
 }
 
 export function createScorecardService(dependencies: ScorecardServiceDependencies) {
@@ -418,8 +442,15 @@ export function createScorecardService(dependencies: ScorecardServiceDependencie
 
 export type ScorecardService = ReturnType<typeof createScorecardService>;
 export {
+  JdProviderAuthError,
   JdProviderConfigurationError,
+  JdProviderContentBlockedError,
+  JdProviderError,
+  JdProviderInvalidRequestError,
   JdProviderNotConfiguredError,
+  JdProviderRateLimitError,
   JdProviderRequestError,
+  JdProviderResponseError,
   JdProviderTimeoutError,
+  type JdProviderDiagnostics,
 };

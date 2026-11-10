@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   clearWorkerReadinessState,
   evaluateWorkerReadiness,
+  startWorkerHeartbeatRefresher,
   verifyWorkerStartupDependencies,
   writeWorkerReadinessState,
   type WorkerReadinessState,
@@ -152,6 +153,36 @@ describe('Worker Readiness & Healthcheck', () => {
           EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
           EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
           SMTP_HOST: 'smtp.example.internal',
+          GEMINI_MODEL: 'gemini-3.8-flash',
+        } as NodeJS.ProcessEnv,
+        checkDatabase: async () => undefined,
+        verifyStorage: () => undefined,
+      }),
+    ).rejects.toThrow(/Unsupported Gemini model/);
+
+    await expect(
+      verifyWorkerStartupDependencies({
+        env: {
+          NODE_ENV: 'production',
+          EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
+          EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
+          SMTP_HOST: 'smtp.example.internal',
+          GEMINI_FALLBACK_MODEL: 'gemini-3.6-flash-lite',
+        } as NodeJS.ProcessEnv,
+        checkDatabase: async () => undefined,
+        verifyStorage: () => undefined,
+      }),
+    ).rejects.toThrow(/Flash-Lite/);
+
+    await expect(
+      verifyWorkerStartupDependencies({
+        env: {
+          NODE_ENV: 'production',
+          EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
+          EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
+          SMTP_HOST: 'smtp.example.internal',
+          GEMINI_MODEL: 'gemini-3.6-flash',
+          GEMINI_FALLBACK_MODEL: 'gemini-3.5-flash',
         } as NodeJS.ProcessEnv,
         checkDatabase: async () => {
           throw new Error('DB unreachable');
@@ -159,5 +190,135 @@ describe('Worker Readiness & Healthcheck', () => {
         verifyStorage: () => undefined,
       }),
     ).rejects.toThrow(/DB unreachable/);
+
+    // Rejects invalid AI_PROVIDER_ORDER, insecure http GROQ_BASE_URL in prod, and invalid GROQ_TIMEOUT_MS
+    await expect(
+      verifyWorkerStartupDependencies({
+        env: {
+          NODE_ENV: 'production',
+          EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
+          EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
+          SMTP_HOST: 'smtp.example.internal',
+          AI_PROVIDER_ORDER: 'gemini,unknown_ai',
+        } as NodeJS.ProcessEnv,
+        checkDatabase: async () => undefined,
+        verifyStorage: () => undefined,
+      }),
+    ).rejects.toThrow(/AI_PROVIDER_ORDER/);
+
+    await expect(
+      verifyWorkerStartupDependencies({
+        env: {
+          NODE_ENV: 'production',
+          EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
+          EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
+          SMTP_HOST: 'smtp.example.internal',
+          GROQ_BASE_URL: 'http://api.groq.com/openai/v1',
+        } as NodeJS.ProcessEnv,
+        checkDatabase: async () => undefined,
+        verifyStorage: () => undefined,
+      }),
+    ).rejects.toThrow(/GROQ_BASE_URL/);
+
+    await expect(
+      verifyWorkerStartupDependencies({
+        env: {
+          NODE_ENV: 'production',
+          EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
+          EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
+          SMTP_HOST: 'smtp.example.internal',
+          GROQ_TIMEOUT_MS: '50',
+        } as NodeJS.ProcessEnv,
+        checkDatabase: async () => undefined,
+        verifyStorage: () => undefined,
+      }),
+    ).rejects.toThrow(/GROQ_TIMEOUT_MS/);
+
+    // Gemini-only configuration without GROQ_API_KEY still starts cleanly when DB is ready
+    await expect(
+      verifyWorkerStartupDependencies({
+        env: {
+          NODE_ENV: 'production',
+          EMAIL_OUTBOX_IDEMPOTENCY_SECRET: 'a'.repeat(64),
+          EMAIL_OUTBOX_ENCRYPTION_KEY: 'b'.repeat(64),
+          SMTP_HOST: 'smtp.example.internal',
+          AI_PROVIDER_ORDER: 'gemini,groq',
+          GROQ_MODEL: 'openai/gpt-oss-120b',
+          GROQ_BASE_URL: 'https://api.groq.com/openai/v1',
+        } as NodeJS.ProcessEnv,
+        checkDatabase: async () => undefined,
+        verifyStorage: () => undefined,
+      }),
+    ).resolves.toEqual({
+      emailCryptoInitialized: true,
+      storageConfigured: true,
+      databaseConnected: true,
+    });
+  });
+
+  it('refreshes heartbeat periodically only while ready and stops cleanly', async () => {
+    vi.useFakeTimers();
+    try {
+      const filePath = trackFile();
+      let state = validReadyState({
+        status: 'starting',
+        pollCount: 0,
+        lastHeartbeatAt: '2026-11-10T00:00:00.000Z',
+      });
+      writeWorkerReadinessState(filePath, state);
+
+      let tickMs = Date.parse('2026-11-10T00:00:10.000Z');
+      const refresher = startWorkerHeartbeatRefresher({
+        filePath,
+        intervalMs: 10_000,
+        getState: () => state,
+        now: () => new Date(tickMs),
+        onStateUpdated: (next) => {
+          state = next;
+        },
+      });
+
+      // Does not refresh while starting
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(state.lastHeartbeatAt).toBe('2026-11-10T00:00:00.000Z');
+
+      // Refreshes while ready with fresh poll
+      state = {
+        ...state,
+        status: 'ready',
+        pollCount: 1,
+        fatalError: null,
+      };
+      tickMs = Date.parse('2026-11-10T00:00:25.000Z');
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(state.lastHeartbeatAt).toBe('2026-11-10T00:00:25.000Z');
+
+      const diskPayload = JSON.parse(fs.readFileSync(filePath, 'utf8')) as WorkerReadinessState;
+      expect(diskPayload.lastHeartbeatAt).toBe('2026-11-10T00:00:25.000Z');
+
+      // Does not overwrite unhealthy/fatal states
+      state = {
+        ...state,
+        status: 'unhealthy',
+        fatalError: 'Connection lost',
+      };
+      tickMs = Date.parse('2026-11-10T00:00:40.000Z');
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(state.lastHeartbeatAt).toBe('2026-11-10T00:00:25.000Z');
+
+      // Stops cleanly and ignores further ticks
+      state = {
+        ...state,
+        status: 'ready',
+        fatalError: null,
+      };
+      refresher.stop();
+      tickMs = Date.parse('2026-11-10T00:00:55.000Z');
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(state.lastHeartbeatAt).toBe('2026-11-10T00:00:25.000Z');
+      expect(refresher.tick()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

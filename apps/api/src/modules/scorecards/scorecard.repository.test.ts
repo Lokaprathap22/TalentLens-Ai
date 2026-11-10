@@ -9,6 +9,7 @@ import type {
   JdExtractionOutput,
 } from './jd-extraction.types.js';
 import {
+  ScorecardCriterionKeyConflictError,
   ScorecardCriterionScopeError,
   createScorecardRepository,
   isRetryableConcurrencyError,
@@ -346,11 +347,99 @@ describe('scorecard repository — queries and transactions', () => {
       expect.objectContaining({
         where: { id: 'criterion-a', scorecardVersionId: 'scorecard-a' },
         data: expect.objectContaining({
+          key: 'skill-1',
           ruleJson: { description: 'updated description', evidence: { keep: true } },
         }),
       }),
     );
     expect(transaction.scorecardCriterion.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects conflicting explicit criterion key against untouched criteria without overwriting existing keys', async () => {
+    const transaction = {
+      scorecardVersion: {
+        findFirst: vi.fn(async () => ({ id: 'scorecard-a', weightsJson: {} })),
+      },
+      scorecardCriterion: {
+        findMany: vi.fn(async () => [
+          { id: 'criterion-a', key: 'skill-1', ruleJson: {} },
+          { id: 'criterion-b', key: 'skill-2', ruleJson: {} },
+        ]),
+        updateMany: vi.fn(),
+        create: vi.fn(),
+      },
+    };
+    const database = {
+      $transaction: vi.fn(async (callback: (client: typeof transaction) => Promise<unknown>) =>
+        callback(transaction),
+      ),
+    } as unknown as PrismaClient;
+    const repository = createScorecardRepository(database);
+
+    await expect(
+      repository.updateDraft(principal, 'requisition-a', 'scorecard-a', {
+        criteria: [
+          {
+            id: 'criterion-a',
+            key: 'SKILL-2',
+            label: 'TypeScript',
+            description: 'TypeScript',
+            category: 'SKILL',
+            requirementType: 'MUST_HAVE',
+            weight: 100,
+            displayOrder: 0,
+            active: true,
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ScorecardCriterionKeyConflictError);
+
+    expect(transaction.scorecardCriterion.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('maps P2002 criterion key constraint violation in updateDraft to ScorecardCriterionKeyConflictError', async () => {
+    const p2002Error = new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+      code: 'P2002',
+      clientVersion: '6.0.0',
+      meta: { target: ['scorecard_version_id', 'key'] },
+    });
+    const transaction = {
+      scorecardVersion: {
+        findFirst: vi.fn(async () => ({ id: 'scorecard-a', weightsJson: {} })),
+      },
+      scorecardCriterion: {
+        findMany: vi.fn(async () => [
+          { id: 'criterion-a', key: 'skill-1', ruleJson: {} },
+        ]),
+        updateMany: vi.fn(async () => {
+          throw p2002Error;
+        }),
+        create: vi.fn(),
+      },
+    };
+    const database = {
+      $transaction: vi.fn(async (callback: (client: typeof transaction) => Promise<unknown>) =>
+        callback(transaction),
+      ),
+    } as unknown as PrismaClient;
+    const repository = createScorecardRepository(database);
+
+    await expect(
+      repository.updateDraft(principal, 'requisition-a', 'scorecard-a', {
+        criteria: [
+          {
+            id: 'criterion-a',
+            label: 'TypeScript',
+            description: 'TypeScript',
+            category: 'SKILL',
+            requirementType: 'MUST_HAVE',
+            weight: 100,
+            displayOrder: 0,
+            active: true,
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ScorecardCriterionKeyConflictError);
   });
 
   it('allocates unique manual keys without collision when manual-1 already exists', async () => {

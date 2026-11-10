@@ -7,12 +7,30 @@ import type {
   UserRole,
 } from './workflow.types.js';
 
+export type CandidateConsentSummaryStatus =
+  | 'ACTIVE'
+  | 'WITHDRAWN'
+  | 'EXPIRED'
+  | 'NOT_GRANTED';
+
+export interface ConsentInvitationSummaryDto {
+  id: string;
+  status: 'PENDING' | 'ACCEPTED' | 'DECLINED' | 'EXPIRED' | 'SUPERSEDED';
+  deliveryStatus: string;
+  sentAt: string;
+  expiresAt: string;
+  consumedAt: string | null;
+}
+
 export interface RecruiterCandidateSummaryDto {
   candidateId: string;
   candidateCode: string;
   resumeDocumentId: string;
   resumeFileName: string;
   parseStatus: string;
+  consentStatus?: CandidateConsentSummaryStatus;
+  consentInvitation?: ConsentInvitationSummaryDto | null;
+  isHeldForConsent?: boolean;
   assessmentId: string | null;
   assessmentStatus: string | null;
   overallScore: number | null;
@@ -80,6 +98,7 @@ export interface RecruiterCandidateDetailDto {
     policyVersion: string;
     capturedAt: string;
   } | null;
+  consentInvitation?: ConsentInvitationSummaryDto | null;
   assessment: {
     id: string;
     status: string;

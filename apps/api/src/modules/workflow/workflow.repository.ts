@@ -28,11 +28,13 @@ import type {
   ListInterviewsInput,
 } from './workflow.schemas.js';
 import type {
+  CandidateConsentSummaryStatus,
   ClientCandidateReviewItemDto,
   ClientDashboardSummaryDto,
   ClientMemberDto,
   ClientRecentDecisionItemDto,
   ClientRequisitionSummaryDto,
+  ConsentInvitationSummaryDto,
   DashboardActivityItemDto,
   GlobalCandidateStatusCategory,
   GlobalCandidateSummaryDto,
@@ -64,6 +66,10 @@ function normalizeClientLookupName(name: string): string {
   return normalizeClientDisplayName(name).toLocaleLowerCase('en-US');
 }
 
+function maskClientSubmissionRef(submissionId: string): string {
+  return `CAND-SUB-${submissionId.slice(0, 8).toUpperCase()}`;
+}
+
 function isUniqueConstraintError(error: unknown): boolean {
   return (
     typeof error === 'object' &&
@@ -71,6 +77,54 @@ function isUniqueConstraintError(error: unknown): boolean {
     'code' in error &&
     (error as { code?: unknown }).code === 'P2002'
   );
+}
+
+function mapConsentInvitationSummary(
+  invitation: {
+    id: string;
+    status: string;
+    deliveryStatus: string;
+    createdAt: Date;
+    expiresAt: Date;
+    consumedAt: Date | null;
+  } | null | undefined,
+  nowMs: number = Date.now(),
+): ConsentInvitationSummaryDto | null {
+  if (!invitation) {
+    return null;
+  }
+  const normalizedStatus =
+    invitation.status === 'PENDING' && invitation.expiresAt.getTime() <= nowMs
+      ? 'EXPIRED'
+      : (invitation.status as ConsentInvitationSummaryDto['status']);
+
+  return {
+    id: invitation.id,
+    status: normalizedStatus,
+    deliveryStatus: invitation.deliveryStatus,
+    sentAt: invitation.createdAt.toISOString(),
+    expiresAt: invitation.expiresAt.toISOString(),
+    consumedAt: invitation.consumedAt ? invitation.consumedAt.toISOString() : null,
+  };
+}
+
+function resolveCandidateConsentSummaryStatus(
+  records: Array<{ status: string; withdrawnAt: Date | null }>,
+): CandidateConsentSummaryStatus {
+  if (records.some((c) => c.status === 'ACTIVE' && c.withdrawnAt === null)) {
+    return 'ACTIVE';
+  }
+  const latest = records[0];
+  if (!latest) {
+    return 'NOT_GRANTED';
+  }
+  if (latest.status === 'WITHDRAWN' || latest.withdrawnAt !== null) {
+    return 'WITHDRAWN';
+  }
+  if (latest.status === 'EXPIRED') {
+    return 'EXPIRED';
+  }
+  return 'NOT_GRANTED';
 }
 
 export interface WorkflowRepository {
@@ -131,6 +185,9 @@ export interface WorkflowRepository {
       resumeDocumentId: string;
       resumeFileName: string;
       parseStatus: string;
+      consentStatus?: CandidateConsentSummaryStatus;
+      consentInvitation?: ConsentInvitationSummaryDto | null;
+      isHeldForConsent?: boolean;
       assessment: {
         id: string;
         status: string;
@@ -185,6 +242,7 @@ export interface WorkflowRepository {
       policyVersion: string;
       capturedAt: Date;
     } | null;
+    consentInvitation?: ConsentInvitationSummaryDto | null;
     assessment: {
       id: string;
       status: string;
@@ -617,17 +675,20 @@ export interface WorkflowRepository {
   ): Promise<ClientDashboardSummaryDto>;
 }
 
-function formatAuditLogToActivityItem(log: {
-  id: string;
-  action: string;
-  resourceType: string;
-  createdAt: Date;
-  metadataJson: unknown;
-  actor: { email: string; role: string } | null;
-  candidate: { candidateCode: string } | null;
-  requisition: { title: string } | null;
-  client: { name: string } | null;
-}): DashboardActivityItemDto {
+function formatAuditLogToActivityItem(
+  log: {
+    id: string;
+    action: string;
+    resourceType: string;
+    createdAt: Date;
+    metadataJson: unknown;
+    actor: { role: string; email?: string | null } | null;
+    candidate?: { candidateCode: string } | null;
+    requisition: { title: string } | null;
+    client: { name: string } | null;
+  },
+  options?: { maskCandidate?: boolean },
+): DashboardActivityItemDto {
   const actorRole = log.actor?.role;
   const actorName =
     actorRole === 'RECRUITER'
@@ -636,11 +697,21 @@ function formatAuditLogToActivityItem(log: {
         ? 'Client Hiring Manager'
         : actorRole === 'DELIVERY_HEAD'
           ? 'Delivery Head'
-          : log.actor?.email
+          : log.actor
             ? 'User'
             : 'System';
 
-  const candCode = log.candidate?.candidateCode ?? 'Candidate';
+  const meta =
+    typeof log.metadataJson === 'object' &&
+    log.metadataJson !== null &&
+    !Array.isArray(log.metadataJson)
+      ? (log.metadataJson as Record<string, unknown>)
+      : null;
+  const candCode = options?.maskCandidate
+    ? typeof meta?.['submissionId'] === 'string' && meta['submissionId'].trim().length > 0
+      ? maskClientSubmissionRef(meta['submissionId'].trim())
+      : 'Candidate'
+    : (log.candidate?.candidateCode ?? 'Candidate');
   const reqTitle = log.requisition?.title ?? 'Requisition';
   const clientName = log.client?.name ?? 'Client';
 
@@ -829,6 +900,49 @@ export function createWorkflowRepository(
                   shortlistedAt: true,
                 },
               },
+              consents: {
+                where: {
+                  requisitionId,
+                  organizationId,
+                  purpose: 'HIRING_USE',
+                  status: { in: ['ACTIVE', 'WITHDRAWN', 'EXPIRED'] },
+                  policyVersion: { not: '' },
+                },
+                orderBy: [{ capturedAt: 'desc' }, { updatedAt: 'desc' }],
+                take: 5,
+                select: {
+                  status: true,
+                  withdrawnAt: true,
+                },
+              },
+              consentInvitations: {
+                where: {
+                  requisitionId,
+                  organizationId,
+                },
+                orderBy: { createdAt: 'desc' },
+                take: 1,
+                select: {
+                  id: true,
+                  status: true,
+                  deliveryStatus: true,
+                  createdAt: true,
+                  expiresAt: true,
+                  consumedAt: true,
+                },
+              },
+            },
+          },
+          processingJobs: {
+            where: {
+              batch: {
+                requisitionId,
+              },
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            select: {
+              status: true,
             },
           },
           assessments: {
@@ -931,12 +1045,22 @@ export function createWorkflowRepository(
 
       const total = filtered.length;
       const paginated = filtered.slice(options.offset, options.offset + options.limit);
+      const nowMs = Date.now();
 
       const items = paginated.map((r) => {
         const assessment = r.assessments[0] ?? null;
         const review = r.reviews[0] ?? null;
         const shortlist = r.candidate.shortlists[0] ?? null;
         const submission = r.candidateSubmissions[0] ?? null;
+        const consentStatus = resolveCandidateConsentSummaryStatus(r.candidate.consents ?? []);
+        const consentInvitation = mapConsentInvitationSummary(
+          r.candidate.consentInvitations?.[0],
+          nowMs,
+        );
+        const latestJobStatus = r.processingJobs?.[0]?.status;
+        const isHeldForConsent =
+          latestJobStatus === 'HELD_FOR_AUTHORIZATION' ||
+          (r.parseStatus === 'PENDING' && consentStatus !== 'ACTIVE');
 
         const criteriaCount = assessment?.criterionAssessments.length ?? 0;
         const criteriaMetCount =
@@ -948,36 +1072,39 @@ export function createWorkflowRepository(
           resumeDocumentId: r.id,
           resumeFileName: r.objectKey.split('/').pop() || 'resume',
           parseStatus: r.parseStatus,
+          consentStatus,
+          consentInvitation,
+          isHeldForConsent,
           assessment: assessment
             ? {
-                id: assessment.id,
-                status: assessment.status,
-                score: assessment.score !== null ? Number(assessment.score) : null,
-                coverage: Number(assessment.coverage),
-                formulaVersion: assessment.formulaVersion,
-                criteriaCount,
-                criteriaMetCount,
-              }
+              id: assessment.id,
+              status: assessment.status,
+              score: assessment.score !== null ? Number(assessment.score) : null,
+              coverage: Number(assessment.coverage),
+              formulaVersion: assessment.formulaVersion,
+              criteriaCount,
+              criteriaMetCount,
+            }
             : null,
           review: review
             ? {
-                id: review.id,
-                decision: review.decision,
-                reviewedAt: review.reviewedAt,
-              }
+              id: review.id,
+              decision: review.decision,
+              reviewedAt: review.reviewedAt,
+            }
             : null,
           shortlist: shortlist
             ? {
-                id: shortlist.id,
-                shortlistedAt: shortlist.shortlistedAt,
-              }
+              id: shortlist.id,
+              shortlistedAt: shortlist.shortlistedAt,
+            }
             : null,
           submission: submission
             ? {
-                id: submission.id,
-                status: submission.status,
-                submittedAt: submission.submittedAt,
-              }
+              id: submission.id,
+              status: submission.status,
+              submittedAt: submission.submittedAt,
+            }
             : null,
           lastActivityAt: r.updatedAt,
         };
@@ -1018,11 +1145,11 @@ export function createWorkflowRepository(
 
       const hasInspected = resume
         ? await this.hasRecruiterInspectedResume(
-            organizationId,
-            recruiterId,
-            requisitionId,
-            resume.id,
-          )
+          organizationId,
+          recruiterId,
+          requisitionId,
+          resume.id,
+        )
         : false;
 
       const consentRecords = await database.candidateConsent.findMany({
@@ -1051,12 +1178,30 @@ export function createWorkflowRepository(
       const selectedConsentRecord = activeConsentRecord ?? consentRecords[0] ?? null;
       const consent = selectedConsentRecord
         ? {
-            id: selectedConsentRecord.id,
-            status: selectedConsentRecord.status,
-            policyVersion: selectedConsentRecord.policyVersion,
-            capturedAt: selectedConsentRecord.capturedAt,
-          }
+          id: selectedConsentRecord.id,
+          status: selectedConsentRecord.status,
+          policyVersion: selectedConsentRecord.policyVersion,
+          capturedAt: selectedConsentRecord.capturedAt,
+        }
         : null;
+
+      const latestInvitationRecord = await database.consentInvitation.findFirst({
+        where: {
+          candidateId,
+          requisitionId,
+          organizationId,
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          status: true,
+          deliveryStatus: true,
+          createdAt: true,
+          expiresAt: true,
+          consumedAt: true,
+        },
+      });
+      const consentInvitation = mapConsentInvitationSummary(latestInvitationRecord);
 
       const assessmentRecord = await database.candidateAssessment.findFirst({
         where: {
@@ -1086,31 +1231,31 @@ export function createWorkflowRepository(
 
       const assessment = assessmentRecord
         ? {
-            id: assessmentRecord.id,
-            status: assessmentRecord.status,
-            score: assessmentRecord.score !== null ? Number(assessmentRecord.score) : null,
-            coverage: Number(assessmentRecord.coverage),
-            formulaVersion: assessmentRecord.formulaVersion,
-            criteria: assessmentRecord.criterionAssessments.map((c) => ({
-              id: c.criterion.id,
-              key: c.criterion.key,
-              label: c.criterion.label,
-              category: c.criterion.category,
-              requirementType: c.criterion.requirementType,
-              weight: Number(c.criterion.weight),
-              status: c.status,
-              confidence: 'VERIFIED',
-              score: c.normalizedValue !== null ? Number(c.normalizedValue) : null,
-              reasoning: c.explanation ?? '',
-              evidence: c.evidence.map((e) => ({
-                quote: e.quote,
-                pageNumber: e.pageNumber,
-                startOffset: e.startOffset,
-                endOffset: e.endOffset,
-                verified: e.verified,
-              })),
+          id: assessmentRecord.id,
+          status: assessmentRecord.status,
+          score: assessmentRecord.score !== null ? Number(assessmentRecord.score) : null,
+          coverage: Number(assessmentRecord.coverage),
+          formulaVersion: assessmentRecord.formulaVersion,
+          criteria: assessmentRecord.criterionAssessments.map((c) => ({
+            id: c.criterion.id,
+            key: c.criterion.key,
+            label: c.criterion.label,
+            category: c.criterion.category,
+            requirementType: c.criterion.requirementType,
+            weight: Number(c.criterion.weight),
+            status: c.status,
+            confidence: 'VERIFIED',
+            score: c.normalizedValue !== null ? Number(c.normalizedValue) : null,
+            reasoning: c.explanation ?? '',
+            evidence: c.evidence.map((e) => ({
+              quote: e.quote,
+              pageNumber: e.pageNumber,
+              startOffset: e.startOffset,
+              endOffset: e.endOffset,
+              verified: e.verified,
             })),
-          }
+          })),
+        }
         : null;
 
       const review = await database.candidateReview.findFirst({
@@ -1169,12 +1314,12 @@ export function createWorkflowRepository(
 
       const interviews = submission
         ? await database.interviewProposal.findMany({
-            where: {
-              submissionId: submission.id,
-              organizationId,
-            },
-            orderBy: { createdAt: 'desc' },
-          })
+          where: {
+            submissionId: submission.id,
+            organizationId,
+          },
+          orderBy: { createdAt: 'desc' },
+        })
         : [];
 
       return {
@@ -1182,25 +1327,26 @@ export function createWorkflowRepository(
         requisition,
         resume: resume
           ? {
-              id: resume.id,
-              fileName: resume.objectKey.split('/').pop() || 'resume',
-              fileType: resume.fileType,
-              sizeBytes: resume.sizeBytes,
-              uploadedAt: resume.uploadedAt,
-            }
+            id: resume.id,
+            fileName: resume.objectKey.split('/').pop() || 'resume',
+            fileType: resume.fileType,
+            sizeBytes: resume.sizeBytes,
+            uploadedAt: resume.uploadedAt,
+          }
           : null,
         hasInspectedOriginalResume: hasInspected,
         consent,
+        consentInvitation,
         assessment,
         review,
         shortlist,
         submission: submission
           ? {
-              id: submission.id,
-              status: submission.status,
-              submittedAt: submission.submittedAt,
-              submittedById: submission.submittedById,
-            }
+            id: submission.id,
+            status: submission.status,
+            submittedAt: submission.submittedAt,
+            submittedById: submission.submittedById,
+          }
           : null,
         clientFeedback: submission?.decisions ?? [],
         interviews,
@@ -1472,22 +1618,16 @@ export function createWorkflowRepository(
         });
 
         if (clientManagers.length > 0) {
-          const [cand, req] = await Promise.all([
-            tx.candidate.findUnique({
-              where: { id: candidateId },
-              select: { candidateCode: true },
-            }),
-            tx.requisition.findUnique({
-              where: { id: requisitionId },
-              select: { title: true, client: { select: { name: true } } },
-            }),
-          ]);
+          const req = await tx.requisition.findUnique({
+            where: { id: requisitionId },
+            select: { title: true, client: { select: { name: true } } },
+          });
 
           const appOrigin = process.env['APP_ORIGIN'] ?? 'http://localhost:5173';
           const rendered = renderClientSubmission({
             clientName: req?.client?.name ?? 'Client',
             requisitionTitle: req?.title ?? 'Requisition',
-            candidateRef: cand?.candidateCode ?? 'Candidate',
+            candidateRef: maskClientSubmissionRef(submission.id),
             portalUrl: `${appOrigin}/portal/submissions/${submission.id}`,
           });
 
@@ -2520,7 +2660,7 @@ export function createWorkflowRepository(
             );
             const rendered = renderInterviewNotification({
               recipientRole: 'CLIENT_HIRING_MANAGER',
-              candidateCode: submission.candidate?.candidateCode ?? 'Candidate',
+              candidateCode: maskClientSubmissionRef(submission.id),
               requisitionTitle: requisition.title,
               format: proposal.format,
               scheduledAt: proposal.startAt.toISOString(),
@@ -2724,7 +2864,7 @@ export function createWorkflowRepository(
             );
             const rendered = renderInterviewNotification({
               recipientRole: 'CLIENT_HIRING_MANAGER',
-              candidateCode: submission.candidate?.candidateCode ?? 'Candidate',
+              candidateCode: maskClientSubmissionRef(submission.id),
               requisitionTitle: requisition.title,
               format: altProposal.format,
               scheduledAt: altProposal.startAt.toISOString(),
@@ -4051,35 +4191,33 @@ export function createWorkflowRepository(
         authorizedClientIds = memberships.map((m) => m.clientId);
       }
 
+      const isClientRole = principal.role === 'CLIENT_HIRING_MANAGER';
       const baseWhere: Prisma.InterviewProposalWhereInput = {
         organizationId: principal.organizationId,
       };
 
       if (authorizedClientIds !== null) {
-        if (options.clientId) {
-          if (!authorizedClientIds.includes(options.clientId)) {
-            return {
-              items: [],
-              total: 0,
-              page: options.page ?? 1,
-              pageSize: options.pageSize ?? 20,
-              totalPages: 0,
-              counts: { total: 0, upcoming: 0, pendingAction: 0, completed: 0, rejected: 0 },
-            };
-          }
-          baseWhere.submission = {
-            clientId: options.clientId,
-            status: { not: 'WITHDRAWN' },
-          };
-        } else {
-          baseWhere.submission = {
-            clientId: { in: authorizedClientIds },
-            status: { not: 'WITHDRAWN' },
+        if (options.clientId && !authorizedClientIds.includes(options.clientId)) {
+          return {
+            items: [],
+            total: 0,
+            page: options.page ?? 1,
+            pageSize: options.pageSize ?? 20,
+            totalPages: 0,
+            counts: { total: 0, upcoming: 0, pendingAction: 0, completed: 0, rejected: 0 },
           };
         }
-      } else if (options.clientId) {
         baseWhere.submission = {
-          clientId: options.clientId,
+          organizationId: principal.organizationId,
+          clientId: options.clientId ?? { in: authorizedClientIds },
+          status: { not: 'WITHDRAWN' },
+          candidate: { recordStatus: 'ACTIVE' },
+        };
+      } else {
+        baseWhere.submission = {
+          organizationId: principal.organizationId,
+          ...(options.clientId ? { clientId: options.clientId } : {}),
+          candidate: { recordStatus: 'ACTIVE' },
         };
       }
 
@@ -4108,28 +4246,59 @@ export function createWorkflowRepository(
         { id: 'asc' },
       ];
 
-      const proposals = await database.interviewProposal.findMany({
-        where: baseWhere,
-        include: {
-          submission: {
-            select: {
-              id: true,
-              candidateId: true,
-              clientId: true,
-              status: true,
-              candidate: { select: { candidateCode: true } },
-              client: { select: { name: true } },
+      const proposals = isClientRole
+        ? await database.interviewProposal.findMany({
+            where: baseWhere,
+            include: {
+              submission: {
+                select: {
+                  id: true,
+                  candidateId: true,
+                  clientId: true,
+                  status: true,
+                  candidate: { select: { id: true } },
+                  client: { select: { name: true } },
+                },
+              },
+              requisition: {
+                select: {
+                  id: true,
+                  title: true,
+                },
+              },
             },
-          },
-          requisition: {
-            select: {
-              id: true,
-              title: true,
+            orderBy,
+          })
+        : await database.interviewProposal.findMany({
+            where: baseWhere,
+            include: {
+              submission: {
+                select: {
+                  id: true,
+                  candidateId: true,
+                  clientId: true,
+                  status: true,
+                  candidate: { select: { candidateCode: true } },
+                  client: { select: { name: true } },
+                },
+              },
+              requisition: {
+                select: {
+                  id: true,
+                  title: true,
+                },
+              },
             },
-          },
-        },
-        orderBy,
-      });
+            orderBy,
+          });
+
+      const getProposalCandidateRef = (p: (typeof proposals)[number]): string => {
+        if (isClientRole) {
+          return maskClientSubmissionRef(p.submissionId);
+        }
+        const cand = p.submission.candidate as { candidateCode?: string } | null;
+        return cand?.candidateCode ?? 'Candidate';
+      };
 
       let upcomingCount = 0;
       let pendingActionCount = 0;
@@ -4165,7 +4334,7 @@ export function createWorkflowRepository(
       if (options.search && options.search.trim().length > 0) {
         const query = options.search.trim().toLowerCase();
         filtered = filtered.filter((p) => {
-          if (p.submission.candidate?.candidateCode.toLowerCase().includes(query)) return true;
+          if (getProposalCandidateRef(p).toLowerCase().includes(query)) return true;
           if (p.requisition.title.toLowerCase().includes(query)) return true;
           if (p.submission.client?.name.toLowerCase().includes(query)) return true;
           return false;
@@ -4228,7 +4397,7 @@ export function createWorkflowRepository(
           clientId: p.submission.clientId,
           clientName: p.submission.client?.name ?? 'Client',
           candidateId: p.submission.candidateId,
-          candidateCode: p.submission.candidate?.candidateCode ?? 'Candidate',
+          candidateCode: getProposalCandidateRef(p),
           proposerUserId: p.proposerUserId,
           proposerRole: p.proposerRole,
           startAt: p.startAt.toISOString(),
@@ -4497,8 +4666,8 @@ export function createWorkflowRepository(
         canComplete: true,
       }));
 
-      const recentActivity: DashboardActivityItemDto[] = recentLogsRaw.map(
-        formatAuditLogToActivityItem,
+      const recentActivity: DashboardActivityItemDto[] = recentLogsRaw.map((log) =>
+        formatAuditLogToActivityItem(log),
       );
 
       return {
@@ -4607,13 +4776,14 @@ export function createWorkflowRepository(
       ] = await Promise.all([
         database.candidateSubmission.findMany({
           where: {
+            organizationId: authenticatedUser.organizationId,
             clientId: { in: authorizedClientIds },
             status: 'SUBMITTED',
+            candidate: { recordStatus: 'ACTIVE' },
           },
           orderBy: { submittedAt: 'desc' },
           take: 10,
           include: {
-            candidate: { select: { candidateCode: true } },
             requisition: { select: { id: true, title: true } },
             client: { select: { id: true, name: true } },
             assessment: {
@@ -4626,9 +4796,12 @@ export function createWorkflowRepository(
         }),
         database.interviewProposal.findMany({
           where: {
+            organizationId: authenticatedUser.organizationId,
             submission: {
+              organizationId: authenticatedUser.organizationId,
               clientId: { in: authorizedClientIds },
               status: { not: 'WITHDRAWN' },
+              candidate: { recordStatus: 'ACTIVE' },
             },
             status: 'ACCEPTED',
             startAt: { gte: now },
@@ -4638,7 +4811,6 @@ export function createWorkflowRepository(
           include: {
             submission: {
               include: {
-                candidate: { select: { candidateCode: true } },
                 requisition: {
                   include: {
                     client: { select: { id: true, name: true } },
@@ -4650,14 +4822,19 @@ export function createWorkflowRepository(
         }),
         database.clientDecision.findMany({
           where: {
+            organizationId: authenticatedUser.organizationId,
             clientId: { in: authorizedClientIds },
+            submission: {
+              organizationId: authenticatedUser.organizationId,
+              status: { not: 'WITHDRAWN' },
+              candidate: { recordStatus: 'ACTIVE' },
+            },
           },
           orderBy: { createdAt: 'desc' },
           take: 5,
           include: {
             submission: {
               include: {
-                candidate: { select: { candidateCode: true } },
                 requisition: { select: { title: true } },
               },
             },
@@ -4665,6 +4842,7 @@ export function createWorkflowRepository(
         }),
         database.requisition.findMany({
           where: {
+            organizationId: authenticatedUser.organizationId,
             clientId: { in: authorizedClientIds },
             status: 'OPEN',
           },
@@ -4675,11 +4853,20 @@ export function createWorkflowRepository(
             client: { select: { name: true } },
             status: true,
             submissions: {
-              where: { status: { not: 'WITHDRAWN' } },
+              where: {
+                status: { not: 'WITHDRAWN' },
+                candidate: { recordStatus: 'ACTIVE' },
+              },
               select: { id: true },
             },
             interviewProposals: {
-              where: { status: { in: ['PROPOSED', 'ACCEPTED'] } },
+              where: {
+                status: { in: ['PROPOSED', 'ACCEPTED'] },
+                submission: {
+                  status: { not: 'WITHDRAWN' },
+                  candidate: { recordStatus: 'ACTIVE' },
+                },
+              },
               select: { id: true },
             },
           },
@@ -4688,6 +4875,7 @@ export function createWorkflowRepository(
         }),
         database.auditLog.findMany({
           where: {
+            organizationId: authenticatedUser.organizationId,
             clientId: { in: authorizedClientIds },
             action: {
               in: [
@@ -4703,9 +4891,8 @@ export function createWorkflowRepository(
           orderBy: { createdAt: 'desc' },
           take: 10,
           include: {
-            candidate: { select: { candidateCode: true } },
             requisition: { select: { title: true } },
-            actor: { select: { email: true, role: true } },
+            actor: { select: { role: true } },
             client: { select: { name: true } },
           },
         }),
@@ -4713,7 +4900,7 @@ export function createWorkflowRepository(
 
       const pendingReviews: ClientCandidateReviewItemDto[] = pendingSubmissionsRaw.map((s) => ({
         submissionId: s.id,
-        candidateCode: s.candidate.candidateCode,
+        candidateCode: maskClientSubmissionRef(s.id),
         requisitionId: s.requisitionId,
         requisitionTitle: s.requisition.title,
         clientId: s.clientId,
@@ -4735,7 +4922,7 @@ export function createWorkflowRepository(
         clientId: p.submission.requisition?.client?.id ?? '',
         clientName: p.submission.requisition?.client?.name ?? 'Client',
         candidateId: p.submission.candidateId,
-        candidateCode: p.submission.candidate?.candidateCode ?? 'Candidate',
+        candidateCode: maskClientSubmissionRef(p.submissionId),
         proposerUserId: p.proposerUserId,
         proposerRole: p.proposerRole,
         startAt: p.startAt.toISOString(),
@@ -4757,7 +4944,7 @@ export function createWorkflowRepository(
         id: d.id,
         decision: d.decision as ClientRecentDecisionItemDto['decision'],
         reason: d.reason,
-        candidateCode: d.submission.candidate?.candidateCode ?? 'Candidate',
+        candidateCode: maskClientSubmissionRef(d.submissionId),
         requisitionTitle: d.submission.requisition?.title ?? 'Requisition',
         createdAt: d.createdAt.toISOString(),
       }));
@@ -4772,8 +4959,8 @@ export function createWorkflowRepository(
         interviewsCount: r.interviewProposals.length,
       }));
 
-      const recentActivity: DashboardActivityItemDto[] = recentLogsRaw.map(
-        formatAuditLogToActivityItem,
+      const recentActivity: DashboardActivityItemDto[] = recentLogsRaw.map((log) =>
+        formatAuditLogToActivityItem(log, { maskCandidate: true }),
       );
 
       return {

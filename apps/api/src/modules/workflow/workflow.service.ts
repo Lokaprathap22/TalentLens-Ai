@@ -294,6 +294,10 @@ export function createWorkflowService(
           resumeDocumentId: i.resumeDocumentId,
           resumeFileName: i.resumeFileName,
           parseStatus: i.parseStatus,
+          consentStatus: i.consentStatus ?? 'NOT_GRANTED',
+          consentInvitation: i.consentInvitation ?? null,
+          isHeldForConsent:
+            i.isHeldForConsent ?? (i.parseStatus === 'PENDING' && i.consentStatus !== 'ACTIVE'),
           assessmentId: i.assessment?.id ?? null,
           assessmentStatus: i.assessment?.status ?? null,
           overallScore: i.assessment?.score ?? null,
@@ -358,6 +362,7 @@ export function createWorkflowService(
               capturedAt: detail.consent.capturedAt.toISOString(),
             }
           : null,
+        consentInvitation: detail.consentInvitation ?? null,
         assessment: detail.assessment
           ? {
               id: detail.assessment.id,

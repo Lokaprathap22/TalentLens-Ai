@@ -91,6 +91,13 @@ export class ScorecardCriterionScopeError extends Error {
   }
 }
 
+export class ScorecardCriterionKeyConflictError extends Error {
+  constructor() {
+    super('Criterion key conflicts with an existing criterion on this scorecard');
+    this.name = 'ScorecardCriterionKeyConflictError';
+  }
+}
+
 type DatabaseScorecardClient = PrismaClient;
 
 const criterionSelect = {
@@ -549,65 +556,104 @@ export function createScorecardRepository(
           const existingById = new Map(
             existingCriteria.map((criterion) => [criterion.id, criterion]),
           );
-          const existingKeys = new Set(
-            existingCriteria.map((criterion) => criterion.key.toLowerCase()),
+          const seenIncomingIds = new Set<string>();
+          for (const criterion of input.criteria) {
+            if (criterion.id !== undefined) {
+              if (!existingById.has(criterion.id)) {
+                throw new ScorecardCriterionScopeError();
+              }
+              if (seenIncomingIds.has(criterion.id)) {
+                throw new ScorecardCriterionKeyConflictError();
+              }
+              seenIncomingIds.add(criterion.id);
+            }
+          }
+
+          const reservedKeys = new Set(
+            existingCriteria
+              .filter((criterion) => !seenIncomingIds.has(criterion.id))
+              .map((criterion) => criterion.key.toLowerCase()),
           );
+
+          const resolvedKeys = input.criteria.map((criterion) => {
+            const explicitKey = criterion.key?.trim();
+            if (explicitKey) {
+              return explicitKey;
+            }
+            if (criterion.id !== undefined) {
+              return existingById.get(criterion.id)!.key;
+            }
+            return null;
+          });
+
+          for (const key of resolvedKeys) {
+            if (key === null) continue;
+            const normalized = key.toLowerCase();
+            if (reservedKeys.has(normalized)) {
+              throw new ScorecardCriterionKeyConflictError();
+            }
+            reservedKeys.add(normalized);
+          }
+
           let manualKeyCounter = 1;
           const allocateUniqueManualKey = (): string => {
-            while (existingKeys.has(`manual-${manualKeyCounter}`)) {
+            while (reservedKeys.has(`manual-${manualKeyCounter}`)) {
               manualKeyCounter += 1;
             }
             const key = `manual-${manualKeyCounter}`;
-            existingKeys.add(key.toLowerCase());
+            reservedKeys.add(key.toLowerCase());
             return key;
           };
 
-          for (const criterion of input.criteria) {
-            if (criterion.id !== undefined && !existingById.has(criterion.id)) {
-              throw new ScorecardCriterionScopeError();
-            }
-            const assignedKey = criterion.key
-              ? (existingKeys.add(criterion.key.toLowerCase()), criterion.key)
-              : allocateUniqueManualKey();
+          try {
+            for (let index = 0; index < input.criteria.length; index += 1) {
+              const criterion = input.criteria[index]!;
+              const assignedKey = resolvedKeys[index] ?? allocateUniqueManualKey();
 
-            if (criterion.id !== undefined) {
-              const existing = existingById.get(criterion.id);
-              const existingRule = existing ? jsonRecord(existing.ruleJson) : {};
-              await transaction.scorecardCriterion.updateMany({
-                where: { id: criterion.id, scorecardVersionId: scorecardId },
-                data: {
-                  key: assignedKey,
-                  label: criterion.label,
-                  category: criterion.category,
-                  requirementType: criterion.requirementType,
-                  weight: criterion.weight,
-                  ruleJson: jsonInput({
-                    ...existingRule,
-                    description: criterion.description,
-                    ...(criterion.evidence ? { evidence: criterion.evidence } : {}),
-                  }),
-                  active: criterion.active,
-                  displayOrder: criterion.displayOrder,
-                },
-              });
-            } else {
-              await transaction.scorecardCriterion.create({
-                data: {
-                  scorecardVersionId: scorecardId,
-                  key: assignedKey,
-                  label: criterion.label,
-                  category: criterion.category,
-                  requirementType: criterion.requirementType,
-                  weight: criterion.weight,
-                  ruleJson: jsonInput({
-                    description: criterion.description,
-                    ...(criterion.evidence ? { evidence: criterion.evidence } : {}),
-                  }),
-                  active: criterion.active,
-                  displayOrder: criterion.displayOrder,
-                },
-              });
+              if (criterion.id !== undefined) {
+                const existing = existingById.get(criterion.id);
+                const existingRule = existing ? jsonRecord(existing.ruleJson) : {};
+                await transaction.scorecardCriterion.updateMany({
+                  where: { id: criterion.id, scorecardVersionId: scorecardId },
+                  data: {
+                    key: assignedKey,
+                    label: criterion.label,
+                    category: criterion.category,
+                    requirementType: criterion.requirementType,
+                    weight: criterion.weight,
+                    ruleJson: jsonInput({
+                      ...existingRule,
+                      description: criterion.description,
+                      ...(criterion.evidence ? { evidence: criterion.evidence } : {}),
+                    }),
+                    active: criterion.active,
+                    displayOrder: criterion.displayOrder,
+                  },
+                });
+              } else {
+                await transaction.scorecardCriterion.create({
+                  data: {
+                    scorecardVersionId: scorecardId,
+                    key: assignedKey,
+                    label: criterion.label,
+                    category: criterion.category,
+                    requirementType: criterion.requirementType,
+                    weight: criterion.weight,
+                    ruleJson: jsonInput({
+                      description: criterion.description,
+                      ...(criterion.evidence ? { evidence: criterion.evidence } : {}),
+                    }),
+                    active: criterion.active,
+                    displayOrder: criterion.displayOrder,
+                  },
+                });
+              }
             }
+          } catch (error) {
+            if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+              throw new ScorecardCriterionKeyConflictError();
+            }
+            throw error;
           }
         }
 

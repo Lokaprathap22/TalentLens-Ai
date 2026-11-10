@@ -668,5 +668,40 @@ describe('scorecard service', () => {
       ).rejects.toThrow('Scorecard not found');
       expect(provider.extract).not.toHaveBeenCalled();
     });
+
+    it('allows updating existing criteria with omitted keys alongside an explicit manual-1 criterion', async () => {
+      const repo = repository({
+        updateDraft: vi.fn(async () => record('DRAFT')),
+      });
+      const provider = { extract: vi.fn(async () => extraction) };
+      const service = createScorecardService({ repository: repo, extractionProvider: provider });
+
+      await service.update(principal, 'requisition-a', 'scorecard-a', {
+        criteria: [
+          {
+            id: 'criterion-a',
+            label: 'Java',
+            description: 'Java experience',
+            category: 'SKILL',
+            requirementType: 'MUST_HAVE',
+            weight: 60,
+            displayOrder: 0,
+            active: true,
+          },
+          {
+            key: 'manual-1',
+            label: 'Extra Skill',
+            description: 'Extra',
+            category: 'SKILL',
+            requirementType: 'PREFERRED',
+            weight: 40,
+            displayOrder: 1,
+            active: true,
+          },
+        ],
+      });
+
+      expect(repo.updateDraft).toHaveBeenCalledTimes(1);
+    });
   });
 });

@@ -1,13 +1,21 @@
-import 'dotenv/config';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
 import { disconnectDatabase, getDatabaseClient } from '@talentlens/database';
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../');
+dotenv.config({ path: path.resolve(repositoryRoot, '.env'), override: false });
+dotenv.config({ override: false });
 import { WorkerJobProcessor } from './processor.js';
 import { WorkerEmailDispatcher } from './email-dispatcher.js';
 import {
   clearWorkerReadinessState,
   getWorkerReadinessFilePath,
   sanitizeWorkerErrorMessage,
+  startWorkerHeartbeatRefresher,
   verifyWorkerStartupDependencies,
   writeWorkerReadinessState,
+  type WorkerHeartbeatRefresherHandle,
   type WorkerReadinessState,
 } from './readiness.js';
 
@@ -15,6 +23,7 @@ const readinessFilePath = getWorkerReadinessFilePath(process.env);
 const startedAt = new Date().toISOString();
 let running = true;
 let pollTimer: NodeJS.Timeout | null = null;
+let heartbeatRefresher: WorkerHeartbeatRefresherHandle | null = null;
 let pollCount = 0;
 
 let currentState: WorkerReadinessState = {
@@ -59,6 +68,15 @@ async function main(): Promise<void> {
 
   const processor = new WorkerJobProcessor();
   const emailDispatcher = new WorkerEmailDispatcher();
+
+  heartbeatRefresher = startWorkerHeartbeatRefresher({
+    filePath: readinessFilePath,
+    getState: () => currentState,
+    isActive: () => running,
+    onStateUpdated: (nextState) => {
+      currentState = nextState;
+    },
+  });
 
   while (running) {
     try {
@@ -118,6 +136,8 @@ async function main(): Promise<void> {
 }
 
 void main().catch(async (err) => {
+  heartbeatRefresher?.stop();
+  heartbeatRefresher = null;
   const safeMessage = sanitizeWorkerErrorMessage(err);
   console.error('Worker failed startup initialization:', safeMessage);
   persistState({
@@ -133,6 +153,8 @@ async function shutdown(signal: string): Promise<void> {
   if (!running) return;
   running = false;
   if (pollTimer) clearTimeout(pollTimer);
+  heartbeatRefresher?.stop();
+  heartbeatRefresher = null;
 
   console.log(`Received ${signal}; shutting down worker gracefully...`);
   persistState({ status: 'shutting_down' });

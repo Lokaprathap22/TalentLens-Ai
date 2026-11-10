@@ -538,17 +538,29 @@ export function createAssessmentRepository(
           let assessmentText = await tx.assessmentText.findFirst({
             where: {
               resumeDocumentId: params.resumeDocumentId,
-              version: 1,
+              organizationId: params.organizationId,
+              documentExtractionId: params.documentExtractionId,
             },
+            orderBy: { version: 'desc' },
           });
 
           if (!assessmentText) {
+            const latestVersionRecord = await tx.assessmentText.findFirst({
+              where: {
+                resumeDocumentId: params.resumeDocumentId,
+                organizationId: params.organizationId,
+              },
+              orderBy: { version: 'desc' },
+              select: { version: true },
+            });
+            const nextVersion = (latestVersionRecord?.version ?? 0) + 1;
+
             assessmentText = await tx.assessmentText.create({
               data: {
                 organizationId: params.organizationId,
                 documentExtractionId: params.documentExtractionId,
                 resumeDocumentId: params.resumeDocumentId,
-                version: 1,
+                version: nextVersion,
                 redactedText: params.redactedText,
                 pageMapJson: params.pageMapJson as Prisma.InputJsonValue,
                 redactionMapJson: params.redactionMapJson as Prisma.InputJsonValue,

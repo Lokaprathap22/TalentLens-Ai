@@ -249,6 +249,7 @@ export class SmtpClient {
             const tlsSocket = tls.connect({
               socket: socket as net.Socket,
               host: this.host,
+              ...(net.isIP(this.host) === 0 ? { servername: this.host } : {}),
               rejectUnauthorized: this.rejectUnauthorized,
             });
             tlsSocket.once('secureConnect', () => resolve(tlsSocket));
@@ -426,6 +427,7 @@ export class SmtpClient {
         sock = tls.connect({
           host: this.host,
           port: this.port,
+          ...(net.isIP(this.host) === 0 ? { servername: this.host } : {}),
           rejectUnauthorized: this.rejectUnauthorized,
         });
         (sock as tls.TLSSocket).once('secureConnect', () => {
