@@ -634,16 +634,16 @@ function printRollbackGuidance({
   if (previousTags.length > 0) {
     stdout(`  ${step}. Previous image tags captured: ${previousTags.join(', ')}`);
     stdout(
-      `     Container rollback: for svc in web api worker; do docker tag "${options.projectName}-$svc:previous" "${options.projectName}-$svc:latest"; done && ${composeStr} up -d --no-build --no-deps api worker web`,
+      `     Container rollback: for svc in web api worker; do sudo docker tag "${options.projectName}-$svc:previous" "${options.projectName}-$svc:latest"; done && sudo ${composeStr} up -d --no-build --no-deps api worker web`,
     );
   } else {
     stdout(
-      `  ${step}. Container rollback: inspect \`docker images --filter "reference=${options.projectName}*"\` for :previous tags before recreating containers.`,
+      `  ${step}. Container rollback: inspect \`sudo docker images --filter "reference=${options.projectName}*"\` for :previous tags before recreating containers.`,
     );
   }
   step += 1;
   stdout(
-    `  ${step}. Restore DB archive: ${composeStr} stop api worker && sudo bash ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing ${backupArchive || '<backup_archive.dump>'} <target_db>`,
+    `  ${step}. Restore DB archive: sudo ${composeStr} stop api worker && sudo bash ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing ${backupArchive || '<backup_archive.dump>'} <target_db>`,
   );
 }
 
@@ -1223,7 +1223,7 @@ function executeSshProductionDeploy({
     );
     const tagPreviousCmd = [
       `cd ${shellQuotePosix(effectiveOptions.remoteDir)}`,
-      `for svc in web api worker; do img=$(${composePrefixStr} images -q "$svc" 2>/dev/null | head -n 1 || true); if [ -z "$img" ]; then cid=$(${composePrefixStr} ps -q "$svc" 2>/dev/null | head -n 1 || true); if [ -n "$cid" ]; then img=$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true); fi; fi; if [ -n "$img" ]; then docker tag "$img" "${effectiveOptions.projectName}-$svc:previous" && echo "${effectiveOptions.projectName}-$svc:previous"; fi; done`,
+      `for svc in web api worker; do img=$(sudo -n ${composePrefixStr} images -q "$svc" 2>/dev/null | head -n 1 || true); if [ -z "$img" ]; then cid=$(sudo -n ${composePrefixStr} ps -q "$svc" 2>/dev/null | head -n 1 || true); if [ -n "$cid" ]; then img=$(sudo -n docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true); fi; fi; if [ -n "$img" ]; then sudo -n docker tag "$img" "${effectiveOptions.projectName}-$svc:previous" && echo "${effectiveOptions.projectName}-$svc:previous"; fi; done`,
     ].join(' && ');
     const tagRes = execFn(
       'ssh',
@@ -1244,7 +1244,7 @@ function executeSshProductionDeploy({
 
     const deployCmd = [
       `cd ${shellQuotePosix(effectiveOptions.remoteDir)}`,
-      `COMPOSE_FILE=${shellQuotePosix(effectiveOptions.composeFile)} ENV_FILE=${shellQuotePosix(effectiveOptions.envFile)} COMPOSE_PROJECT_NAME=${shellQuotePosix(effectiveOptions.projectName)} bash deploy.sh`,
+      `sudo -n env COMPOSE_FILE=${shellQuotePosix(effectiveOptions.composeFile)} ENV_FILE=${shellQuotePosix(effectiveOptions.envFile)} COMPOSE_PROJECT_NAME=${shellQuotePosix(effectiveOptions.projectName)} bash ./deploy.sh`,
     ].join(' && ');
     const deployRes = execFn('ssh', [...buildRemoteSshArgs(effectiveOptions.sshHost), deployCmd], {
       cwd,
@@ -1547,13 +1547,13 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   stdout('\nOCI Ubuntu 24.04 Production Deploy & Rollback Commands:');
   const projectDirPart = hasExternalComposeDir(options.composeFile) ? ' --project-directory .' : '';
   stdout(
-    `  Deploy:   COMPOSE_FILE=${options.composeFile} ENV_FILE=${options.envFile} COMPOSE_PROJECT_NAME=${options.projectName} bash deploy.sh`,
+    `  Deploy:   sudo env COMPOSE_FILE=${options.composeFile} ENV_FILE=${options.envFile} COMPOSE_PROJECT_NAME=${options.projectName} bash ./deploy.sh`,
   );
   stdout(
     `  Backup:   sudo bash ./scripts/backup.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --format custom`,
   );
   stdout(
-    `  Rollback: docker compose${projectDirPart} -p ${options.projectName} --env-file ${options.envFile} -f ${options.composeFile} stop api worker && sudo bash ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing <archive.dump> <db>`,
+    `  Rollback: sudo docker compose${projectDirPart} -p ${options.projectName} --env-file ${options.envFile} -f ${options.composeFile} stop api worker && sudo bash ./scripts/restore.sh -f ${options.composeFile} --env-file ${options.envFile} -p ${options.projectName} --confirm-replace-existing <archive.dump> <db>`,
   );
 
   if (guard.dryRun) {
