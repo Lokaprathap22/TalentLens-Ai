@@ -1072,7 +1072,7 @@ test('14. CLI real subprocess: deploy-local --dry-run succeeds for valid fixture
     );
     const localOut = execFileSync(
       process.execPath,
-      ['scripts/deploy-local.mjs', '--dry-run', '--env-file', localEnv],
+      ['--', 'scripts/deploy-local.mjs', '--dry-run', '--env-file', localEnv],
       { encoding: 'utf8' },
     );
     assert.match(localOut, /\[DRY RUN COMPLETE\]/);
@@ -1087,7 +1087,7 @@ test('14. CLI real subprocess: deploy-local --dry-run succeeds for valid fixture
       () =>
         execFileSync(
           process.execPath,
-          ['scripts/deploy-local.mjs', '--dry-run', '--env-file', prodLocalEnv],
+          ['--', 'scripts/deploy-local.mjs', '--dry-run', '--env-file', prodLocalEnv],
           { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
         ),
       (err) => err.status !== 0,
@@ -1108,7 +1108,7 @@ test('15. CLI real subprocess: deploy-production dry-run succeeds cleanly and re
     );
     const prodOut = execFileSync(
       process.execPath,
-      ['scripts/deploy-production.mjs', '--env-file', validProdEnv],
+      ['--', 'scripts/deploy-production.mjs', '--env-file', validProdEnv],
       { encoding: 'utf8' },
     );
     assert.match(prodOut, /\[DRY RUN COMPLETE\]/);
@@ -1121,16 +1121,20 @@ test('15. CLI real subprocess: deploy-production dry-run succeeds cleanly and re
     );
     assert.throws(
       () =>
-        execFileSync(process.execPath, ['scripts/deploy-production.mjs', '--env-file', localEnv], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        }),
+        execFileSync(
+          process.execPath,
+          ['--', 'scripts/deploy-production.mjs', '--env-file', localEnv],
+          {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        ),
       (err) => err.status !== 0,
     );
 
     assert.throws(
       () =>
-        execFileSync(process.execPath, ['scripts/deploy-production.mjs', '--execute'], {
+        execFileSync(process.execPath, ['--', 'scripts/deploy-production.mjs', '--execute'], {
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
         }),
@@ -1777,405 +1781,205 @@ test('22. Rejects unsafe root/system --remote-dir targets and preserves --projec
   }
 });
 
-function extractSingleQuotedArgsAfterNodeE(commandStr) {
-  const marker = 'node -e ';
-  const idx = commandStr.indexOf(marker);
-  assert.notEqual(idx, -1, `Expected "${marker}" inside generated command`);
-  let rest = commandStr.slice(idx + marker.length);
-  const tokens = [];
-  while (rest.length > 0) {
-    rest = rest.trimStart();
-    if (!rest.startsWith("'")) break;
-    let i = 1;
-    let value = '';
-    while (i < rest.length) {
-      if (rest.startsWith("'\"'\"'", i)) {
-        value += "'";
-        i += 5;
-        continue;
-      }
-      if (rest[i] === "'") {
-        i += 1;
-        break;
-      }
-      value += rest[i];
-      i += 1;
-    }
-    tokens.push(value);
-    rest = rest.slice(i);
-  }
-  return tokens;
-}
+test('23. CLI regression: remote-only ../.env.candidate dry-run succeeds via npm run and direct node --remote-env-file on Windows without Node intercepting --env-file', () => {
+  const pkgJson = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8'));
+  assert.match(pkgJson.scripts['deploy:production'], /^node -- scripts\/deploy-production\.mjs$/);
+  assert.match(pkgJson.scripts['deploy:local'], /^node -- scripts\/deploy-local\.mjs$/);
 
-test('19. preflight-env runs standalone without node_modules, parses .env faithfully, rejects symlinks, and enforces --strict-perms', () => {
-  const isolatedRoot = makeTempDir('tl-isolated-preflight-');
-  try {
-    const isolatedScript = path.join(isolatedRoot, 'scripts', 'preflight-env.mjs');
-    fs.mkdirSync(path.dirname(isolatedScript), { recursive: true });
-    fs.copyFileSync(path.resolve('scripts/preflight-env.mjs'), isolatedScript);
+  const npmArgs = [
+    'run',
+    'deploy:production',
+    '--',
+    '--ssh-host',
+    'ubuntu@140.245.226.85',
+    '--remote-dir',
+    '/home/ubuntu/talentlens-release-staging-20261110/source',
+    '--compose-file',
+    'docker-compose.oci.yml',
+    '--env-file',
+    '../.env.candidate',
+    '--project-name',
+    'talentlens',
+  ];
+  const npmOut =
+    process.platform === 'win32'
+      ? execFileSync('cmd.exe', ['/d', '/c', 'npm.cmd', ...npmArgs], { encoding: 'utf8' })
+      : execFileSync('npm', npmArgs, { encoding: 'utf8' });
+  assert.match(npmOut, /Deploy Target:\s+Remote OCI host via SSH \(ubuntu@140\.245\.226\.85\)/);
+  assert.match(npmOut, /Remote Env File:\s+\.\.\/\.env\.candidate \(protected on OCI host/);
+  assert.match(npmOut, /Local Env File:\s+not used for remote OCI rollout/);
+  assert.match(npmOut, /were NOT executed \(pass --execute --confirm-production/);
+  assert.equal(/\[PASS\]/.test(npmOut), false, 'Dry-run must not claim remote checks passed');
+  assert.match(npmOut, /\[DRY RUN COMPLETE\]/);
 
-    const envFile = path.join(isolatedRoot, '.env.candidate');
-    fs.writeFileSync(
-      envFile,
-      createProdFixtureEnv({ GEMINI_API_KEY: 'AIzaSyFixtureValidGeminiKey1234567890' }),
-      'utf8',
-    );
+  const directNodeOut = execFileSync(
+    process.execPath,
+    [
+      'scripts/deploy-production.mjs',
+      '--ssh-host',
+      'ubuntu@140.245.226.85',
+      '--remote-dir',
+      '/home/ubuntu/talentlens-release-staging-20261110/source',
+      '--compose-file',
+      'docker-compose.oci.yml',
+      '--remote-env-file',
+      '../.env.candidate',
+      '--project-name',
+      'talentlens',
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.match(directNodeOut, /Remote Env File:\s+\.\.\/\.env\.candidate/);
+  assert.match(directNodeOut, /ENV_FILE=\.\.\/\.env\.candidate/);
+  assert.match(directNodeOut, /\[DRY RUN COMPLETE\]/);
 
-    const out = execFileSync(process.execPath, [isolatedScript, envFile], {
-      cwd: isolatedRoot,
-      encoding: 'utf8',
-    });
-    assert.match(out, /PREFLIGHT VERDICT: \[PASS\]/);
-
-    const parsed = parseDotEnvContent(
-      [
-        '# comment',
-        'export APP_ORIGIN="https://talentlens.example.com" # inline',
-        "SINGLE_QUOTED='value with # not comment'",
-        'DOUBLE_ESCAPED="line1\\nline2"',
-        'UNQUOTED=abc # trailing comment',
-      ].join('\n'),
-    );
-    assert.equal(parsed.APP_ORIGIN, 'https://talentlens.example.com');
-    assert.equal(parsed.SINGLE_QUOTED, 'value with # not comment');
-    assert.equal(parsed.DOUBLE_ESCAPED, 'line1\nline2');
-    assert.equal(parsed.UNQUOTED, 'abc');
-
-    const symlinkStreams = createBufferedStreams();
-    const symlinkExit = runPreflightEnv([envFile], {
-      cwd: isolatedRoot,
-      platform: 'linux',
-      stdout: symlinkStreams.stdout,
-      stderr: symlinkStreams.stderr,
-      fsImpl: {
-        existsSync: () => true,
-        lstatSync: () => ({ isSymbolicLink: () => true, isFile: () => false, mode: 0o120777 }),
-        readFileSync: () => fs.readFileSync(envFile, 'utf8'),
-      },
-    });
-    assert.equal(symlinkExit, 1);
-    assert.match(symlinkStreams.allOutput(), /regular non-symlink file/);
-
-    const loosePermsStreams = createBufferedStreams();
-    const looseFailExit = runPreflightEnv([envFile, '--strict-perms'], {
-      cwd: isolatedRoot,
-      platform: 'linux',
-      stdout: loosePermsStreams.stdout,
-      stderr: loosePermsStreams.stderr,
-      fsImpl: {
-        existsSync: () => true,
-        lstatSync: () => ({ isSymbolicLink: () => false, isFile: () => true, mode: 0o100644 }),
-        readFileSync: () => fs.readFileSync(envFile, 'utf8'),
-      },
-    });
-    assert.equal(looseFailExit, 1);
-    assert.match(loosePermsStreams.allOutput(), /ENV_FILE_PERMISSIONS.*chmod 600/);
-
-    const tightStreams = createBufferedStreams();
-    const tightPassExit = runPreflightEnv([envFile, '--strict-perms'], {
-      cwd: isolatedRoot,
-      platform: 'linux',
-      stdout: tightStreams.stdout,
-      stderr: tightStreams.stderr,
-      fsImpl: {
-        existsSync: () => true,
-        lstatSync: () => ({ isSymbolicLink: () => false, isFile: () => true, mode: 0o100600 }),
-        readFileSync: () => fs.readFileSync(envFile, 'utf8'),
-      },
-    });
-    assert.equal(tightPassExit, 0);
-    assert.match(tightStreams.allOutput(), /PASS.*ENV_FILE_PERMISSIONS/);
-  } finally {
-    fs.rmSync(isolatedRoot, { recursive: true, force: true });
-  }
+  // Explicit --env-file=../.env.candidate behind node -- must also reach script argv untouched
+  const eqOut = execFileSync(
+    process.execPath,
+    [
+      '--',
+      'scripts/deploy-production.mjs',
+      '--ssh-host',
+      'ubuntu@140.245.226.85',
+      '--remote-dir',
+      '/home/ubuntu/talentlens-release-staging-20261110/source',
+      '--compose-file',
+      'docker-compose.oci.yml',
+      '--env-file=../.env.candidate',
+      '--project-name',
+      'talentlens',
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.match(eqOut, /Remote Env File:\s+\.\.\/\.env\.candidate/);
+  assert.match(eqOut, /\[DRY RUN COMPLETE\]/);
 });
 
-test('20. Stage 7 remote sync removes stale files, preserves OCI overlay/.env/node_modules, creates non-secret snapshot, and supports clean snapshot restore', () => {
-  const baseDir = makeTempDir('tl-sync-snapshot-');
+test('24. Remote env targeting stays isolated from local .env, preserves fail-closed local checks, and forwards --remote-env-file to OCI Stages 5-9', () => {
+  const dir = makeTempDir('tl-remote-env-iso-');
   try {
-    const remoteDir = path.join(baseDir, 'source');
-    const stagingDir = path.join(baseDir, '.release-staging');
-    const timestampTag = '20261110T180000Z';
-    const shortSha = 'abcdef123456';
-    const suffix = `${timestampTag}-${shortSha}`;
-    const unpackDir = path.join(stagingDir, `unpacked-${suffix}`);
-    const snapshotDir = path.join(baseDir, '.release-previous', suffix);
+    createFakeWorkspaceForDeploy(dir, {
+      includeEnv: true,
+      envContent: 'NODE_ENV=development\nLOCAL_WORKSTATION_ONLY=must_never_leak_to_prod\n',
+    });
 
-    const write = (abs, content) => {
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, content, 'utf8');
+    // Even with local .env present and --strict passed, remote dry-run never reads local .env or ../ .env.candidate
+    const localReads = [];
+    const spyingFs = {
+      ...fs,
+      existsSync: (p) => fs.existsSync(p),
+      readFileSync: (p, enc) => {
+        localReads.push(String(p));
+        return fs.readFileSync(p, enc);
+      },
     };
-
-    // Old source tree on server (includes stale deleted files + preserved host-only files)
-    write(path.join(remoteDir, 'package.json'), '{"version":"1.0.0"}\n');
-    write(path.join(remoteDir, 'apps/api/src/obsolete-removed.ts'), 'export const old = 1;\n');
-    write(
-      path.join(remoteDir, 'prisma/migrations/999_obsolete/migration.sql'),
-      '-- obsolete migration\n',
+    const dryStreams = createBufferedStreams();
+    const dryExit = runDeployProductionMain(
+      [
+        '--ssh-host',
+        'ubuntu@140.245.226.85',
+        '--remote-dir',
+        '/home/ubuntu/talentlens-release-staging-20261110/source',
+        '--compose-file',
+        'docker-compose.oci.yml',
+        '--remote-env-file',
+        '../.env.candidate',
+        '--project-name',
+        'talentlens',
+        '--strict',
+      ],
+      { cwd: dir, fsImpl: spyingFs, stdout: dryStreams.stdout, stderr: dryStreams.stderr },
     );
-    write(path.join(remoteDir, 'old-root-helper.sh'), '#!/bin/sh\necho old\n');
-    write(path.join(remoteDir, 'docker-compose.oci.yml'), 'services:\n  api:\n    ports: []\n');
-    write(path.join(remoteDir, '.current-release.json'), '{"shortSha":"prior000"}\n');
-    write(path.join(remoteDir, '.env'), 'SECRET=keep_untouched\n');
-    write(path.join(remoteDir, '.env.local'), 'LOCAL_SECRET=keep_untouched\n');
-    write(path.join(remoteDir, 'node_modules/dotenv/index.js'), 'module.exports = {};\n');
-    write(path.join(remoteDir, 'backups/existing.dump'), 'PGDMP_KEEP');
-    write(path.join(stagingDir, `talentlens-release-${shortSha}.tar.gz`), 'tarbytes');
-
-    // Newly unpacked release tree
-    write(path.join(unpackDir, 'package.json'), '{"version":"2.0.0"}\n');
-    write(
-      path.join(unpackDir, 'packages/assessment-engine/src/ai-failover.ts'),
-      'export const failover = true;\n',
-    );
-    write(
-      path.join(unpackDir, 'packages/assessment-engine/src/groq-client.ts'),
-      'export const groq = true;\n',
-    );
-    write(path.join(unpackDir, 'deploy.sh'), '#!/usr/bin/env bash\necho v2\n');
-
-    const syncCmd = buildRemoteSyncCommand({
-      remoteDir: remoteDir.replace(/\\/g, '/'),
-      remoteStagingDir: stagingDir.replace(/\\/g, '/'),
-      tarballName: `talentlens-release-${shortSha}.tar.gz`,
-      shortSha,
-      timestampTag,
-      composeFile: 'docker-compose.oci.yml',
-    });
-    const syncNodeTokens = extractSingleQuotedArgsAfterNodeE(syncCmd);
-    const syncOut = execFileSync(process.execPath, ['-e', ...syncNodeTokens], {
-      encoding: 'utf8',
-    });
-    assert.match(syncOut, /SYNC_OK SNAPSHOT=.*REMOVED=3/);
-
-    // Stale files & empty obsolete dirs removed
-    assert.equal(fs.existsSync(path.join(remoteDir, 'apps/api/src/obsolete-removed.ts')), false);
-    assert.equal(fs.existsSync(path.join(remoteDir, 'prisma/migrations/999_obsolete')), false);
-    assert.equal(fs.existsSync(path.join(remoteDir, 'old-root-helper.sh')), false);
-
-    // New files synced
-    assert.equal(fs.readFileSync(path.join(remoteDir, 'package.json'), 'utf8'), '{"version":"2.0.0"}\n');
+    assert.equal(dryExit, 0);
     assert.equal(
-      fs.existsSync(path.join(remoteDir, 'packages/assessment-engine/src/ai-failover.ts')),
-      true,
-    );
-    assert.equal(
-      fs.existsSync(path.join(remoteDir, 'packages/assessment-engine/src/groq-client.ts')),
-      true,
-    );
-    assert.equal(fs.existsSync(unpackDir), false, 'unpackDir should be cleaned up');
-
-    // Preserved host-only & secret files untouched
-    assert.equal(
-      fs.readFileSync(path.join(remoteDir, 'docker-compose.oci.yml'), 'utf8'),
-      'services:\n  api:\n    ports: []\n',
-    );
-    assert.equal(
-      fs.readFileSync(path.join(remoteDir, '.current-release.json'), 'utf8'),
-      '{"shortSha":"prior000"}\n',
-    );
-    assert.equal(fs.readFileSync(path.join(remoteDir, '.env'), 'utf8'), 'SECRET=keep_untouched\n');
-    assert.equal(
-      fs.readFileSync(path.join(remoteDir, '.env.local'), 'utf8'),
-      'LOCAL_SECRET=keep_untouched\n',
-    );
-    assert.equal(fs.existsSync(path.join(remoteDir, 'node_modules/dotenv/index.js')), true);
-    assert.equal(fs.existsSync(path.join(remoteDir, 'backups/existing.dump')), true);
-
-    // Snapshot captures old source + OCI overlay WITHOUT leaking .env*, node_modules, or backups
-    assert.equal(fs.existsSync(path.join(snapshotDir, 'apps/api/src/obsolete-removed.ts')), true);
-    assert.equal(fs.existsSync(path.join(snapshotDir, 'docker-compose.oci.yml')), true);
-    assert.equal(fs.existsSync(path.join(snapshotDir, '.current-release.json')), true);
-    assert.equal(fs.existsSync(path.join(snapshotDir, '.env')), false);
-    assert.equal(fs.existsSync(path.join(snapshotDir, '.env.local')), false);
-    assert.equal(fs.existsSync(path.join(snapshotDir, 'node_modules')), false);
-    assert.equal(fs.existsSync(path.join(snapshotDir, 'backups')), false);
-
-    // Execute snapshot restore and verify pre-rollout tree returns cleanly
-    const restoreCmd = buildRemoteRestoreSnapshotCommand({
-      remoteDir: remoteDir.replace(/\\/g, '/'),
-      snapshotDir: snapshotDir.replace(/\\/g, '/'),
-      composeFile: 'docker-compose.oci.yml',
-    });
-    const restoreTokens = extractSingleQuotedArgsAfterNodeE(restoreCmd);
-    const restoreOut = execFileSync(process.execPath, ['-e', ...restoreTokens], {
-      encoding: 'utf8',
-    });
-    assert.match(restoreOut, /RESTORE_SNAPSHOT_OK/);
-
-    assert.equal(fs.readFileSync(path.join(remoteDir, 'package.json'), 'utf8'), '{"version":"1.0.0"}\n');
-    assert.equal(fs.existsSync(path.join(remoteDir, 'apps/api/src/obsolete-removed.ts')), true);
-    assert.equal(
-      fs.existsSync(path.join(remoteDir, 'packages/assessment-engine/src/ai-failover.ts')),
+      localReads.some((p) => p.endsWith('.env') || p.includes('.env.candidate')),
       false,
+      'Remote target mode must never read local .env or local .env.candidate',
     );
-    assert.equal(fs.readFileSync(path.join(remoteDir, '.env'), 'utf8'), 'SECRET=keep_untouched\n');
-    assert.equal(fs.existsSync(path.join(remoteDir, 'node_modules/dotenv/index.js')), true);
-  } finally {
-    fs.rmSync(baseDir, { recursive: true, force: true });
-  }
-});
+    const dryOut = dryStreams.allOutput();
+    assert.equal(dryOut.includes('must_never_leak_to_prod'), false);
+    assert.match(dryOut, /--strict local env validation does not apply to remote-only file/);
+    assert.equal(/\[PASS\]/.test(dryOut), false);
 
-test('21. deploy-production auto-restores snapshot on Stage 7/8 failures, enforces --strict-perms, and prints snapshot+container+DB rollback on Stage 9 failure', () => {
-  const dir = makeTempDir('tl-prod-snapshot-rollback-');
-  try {
-    createFakeWorkspaceForDeploy(dir, { includeEnv: false });
-    const snapshotPath =
-      '/home/ubuntu/talentlens-release-staging-20261110/.release-previous/20261110T180000Z-abcdef123456';
+    // Reject specifying both --env-file and --remote-env-file explicitly
+    const conflictGuard = validateExecutionGuard(
+      parseDeployProductionArgs(['--env-file', '.env', '--remote-env-file', '../.env.candidate']),
+    );
+    assert.equal(conflictGuard.allowed, false);
+    assert.match(conflictGuard.reason, /Specify either --env-file or --remote-env-file, not both/);
 
-    // Stage 7 preflight failure auto-restores snapshot
-    const preflightMock = createSshRolloutMock({ remotePreflightFail: true, snapshotPath });
-    const s1 = createBufferedStreams();
-    const exit1 = runDeployProductionMain(
-      [
-        '--execute',
-        '--confirm-production',
-        '--ssh-host',
-        'ubuntu@talentlens-demo-01',
-        '--remote-dir',
-        '/home/ubuntu/talentlens-release-staging-20261110/source',
-        '--compose-file',
-        'docker-compose.oci.yml',
-        '--env-file',
-        '../.env.candidate',
-      ],
-      { cwd: dir, execFn: preflightMock.execFn, stdout: s1.stdout, stderr: s1.stderr },
+    // Keep --execute --confirm-production gating intact and disallow --remote-env-file execute without --ssh-host
+    const missingConfirmGuard = validateExecutionGuard(
+      parseDeployProductionArgs(['--remote-env-file', '../.env.candidate', '--execute']),
     );
-    assert.equal(exit1, 1);
-    assert.equal(
-      preflightMock.sshCommands.some(
-        (c) => c.includes('preflight-env.mjs') && c.includes('--strict-perms'),
-      ),
-      true,
-    );
-    assert.equal(
-      preflightMock.sshCommands.some(
-        (c) => c.includes('RESTORE_SNAPSHOT_OK') && c.includes(snapshotPath),
-      ),
-      true,
-      'Expected automatic snapshot restore on Stage 7 preflight failure',
-    );
-    assert.match(s1.allOutput(), /\[ROLLBACK\] Automatically restored/);
+    assert.equal(missingConfirmGuard.allowed, false);
+    assert.match(missingConfirmGuard.reason, /--confirm-production is required/);
 
-    // Stage 8 backup failure auto-restores snapshot before deploy.sh ever runs
-    const backupMock = createSshRolloutMock({ backupFail: true, snapshotPath });
-    const s2 = createBufferedStreams();
-    const exit2 = runDeployProductionMain(
-      [
-        '--execute',
-        '--confirm-production',
-        '--ssh-host',
-        'ubuntu@talentlens-demo-01',
-        '--remote-dir',
-        '/home/ubuntu/talentlens-release-staging-20261110/source',
-        '--compose-file',
-        'docker-compose.oci.yml',
-        '--env-file',
-        '../.env.candidate',
-      ],
-      { cwd: dir, execFn: backupMock.execFn, stdout: s2.stdout, stderr: s2.stderr },
-    );
-    assert.equal(exit2, 1);
-    assert.equal(
-      backupMock.sshCommands.some(
-        (c) => c.includes('RESTORE_SNAPSHOT_OK') && c.includes(snapshotPath),
-      ),
-      true,
-      'Expected automatic snapshot restore on Stage 8 backup failure',
-    );
-
-    // Stage 9 deploy failure prints full 3-part rollback (snapshot + :previous images + .dump) without silently reverting migrated state
-    const deployFailMock = createSshRolloutMock({ deployFail: true, snapshotPath });
-    const s3 = createBufferedStreams();
-    const exit3 = runDeployProductionMain(
-      [
-        '--execute',
-        '--confirm-production',
-        '--ssh-host',
-        'ubuntu@talentlens-demo-01',
-        '--remote-dir',
-        '/home/ubuntu/talentlens-release-staging-20261110/source',
-        '--compose-file',
-        'docker-compose.oci.yml',
-        '--env-file',
-        '../.env.candidate',
-      ],
-      { cwd: dir, execFn: deployFailMock.execFn, stdout: s3.stdout, stderr: s3.stderr },
-    );
-    assert.equal(exit3, 1);
-    assert.equal(
-      deployFailMock.sshCommands.some((c) => c.includes('RESTORE_SNAPSHOT_OK')),
-      false,
-    );
-    const out3 = s3.allOutput();
-    assert.match(out3, /Previous source & Compose snapshot captured:/);
-    assert.match(out3, new RegExp(snapshotPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.match(out3, /Container rollback: for svc in web api worker/);
-    assert.match(out3, /Restore DB archive:/);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('22. Rejects unsafe root/system --remote-dir targets and preserves --project-directory for external OCI compose overlays', () => {
-  for (const unsafeDir of ['/', '/etc', '/etc/ssh', '/home', '/var', '/home/ubuntu//source', '/home/ubuntu/./source']) {
-    const res = validateExecutionGuard(
+    const missingHostGuard = validateExecutionGuard(
       parseDeployProductionArgs([
+        '--remote-env-file',
+        '../.env.candidate',
         '--execute',
         '--confirm-production',
-        '--ssh-host',
-        'ubuntu@talentlens-demo-01',
-        '--remote-dir',
-        unsafeDir,
       ]),
     );
-    assert.equal(res.allowed, false, `Expected --remote-dir "${unsafeDir}" to be rejected`);
-    assert.match(res.reason, /Unsafe or invalid --remote-dir/);
-  }
+    assert.equal(missingHostGuard.allowed, false);
+    assert.match(missingHostGuard.reason, /requires --ssh-host/);
 
-  const dir = makeTempDir('tl-prod-ext-compose-');
-  try {
-    createFakeWorkspaceForDeploy(dir, { includeEnv: false });
-    const mock = createSshRolloutMock();
-    const streams = createBufferedStreams();
-    const exit = runDeployProductionMain(
+    // Local-host mode (no --ssh-host and no --remote-env-file) still fails closed on missing --env-file or --strict
+    const localFailStreams = createBufferedStreams();
+    const localFailExit = runDeployProductionMain(['--env-file', '../.env.nonexistent'], {
+      cwd: dir,
+      stdout: localFailStreams.stdout,
+      stderr: localFailStreams.stderr,
+    });
+    assert.equal(localFailExit, 1);
+    assert.match(localFailStreams.allOutput(), /Target environment file not found/);
+
+    // Execute full mock-SSH rollout using --remote-env-file ../.env.candidate
+    const sshMock = createSshRolloutMock();
+    const execStreams = createBufferedStreams();
+    const execExit = runDeployProductionMain(
       [
         '--execute',
         '--confirm-production',
         '--ssh-host',
-        'ubuntu@talentlens-demo-01',
+        'ubuntu@140.245.226.85',
         '--remote-dir',
-        '/home/ubuntu/talentlens-release-staging-20261111/source',
+        '/home/ubuntu/talentlens-release-staging-20261110/source',
         '--compose-file',
-        '/home/ubuntu/talentlens-release-staging-20261110/source/docker-compose.oci.yml',
-        '--env-file',
-        '/home/ubuntu/talentlens-release-staging-20261110/.env.candidate',
+        'docker-compose.oci.yml',
+        '--remote-env-file',
+        '../.env.candidate',
         '--project-name',
         'talentlens',
       ],
-      { cwd: dir, execFn: mock.execFn, stdout: streams.stdout, stderr: streams.stderr },
+      { cwd: dir, execFn: sshMock.execFn, stdout: execStreams.stdout, stderr: execStreams.stderr },
     );
-    assert.equal(exit, 0);
-
-    const idemCmd = mock.sshCommands.find((c) => c.includes('IDEMPOTENT_SKIP'));
-    assert.ok(idemCmd?.includes('--project-directory .'));
-
-    const stage7Compose = mock.sshCommands.find((c) => c.includes('config --quiet'));
-    assert.ok(stage7Compose?.includes('docker compose --project-directory .'));
-
-    const deployCmd = mock.sshCommands.find((c) => c.includes('bash deploy.sh'));
+    assert.equal(execExit, 0);
     assert.ok(
-      deployCmd?.includes(
-        "COMPOSE_FILE='/home/ubuntu/talentlens-release-staging-20261110/source/docker-compose.oci.yml'",
+      sshMock.sshCommands.some(
+        (c) =>
+          c.includes('scripts/preflight-env.mjs') &&
+          c.includes("'../.env.candidate'") &&
+          c.includes('--strict-perms'),
       ),
     );
     assert.ok(
-      deployCmd?.includes("ENV_FILE='/home/ubuntu/talentlens-release-staging-20261110/.env.candidate'"),
+      sshMock.sshCommands.some(
+        (c) => c.includes('config --quiet') && c.includes("--env-file '../.env.candidate'"),
+      ),
     );
-
-    const realDeploySh = fs.readFileSync(path.resolve('deploy.sh'), 'utf8');
-    assert.match(realDeploySh, /COMPOSE_PROJECT_DIR_ARGS=\(--project-directory "\$\(pwd\)"\)/);
-    assert.match(realDeploySh, /if \[ -L "\$\{ENV_FILE\}" \]; then/);
+    assert.ok(
+      sshMock.sshCommands.some(
+        (c) => c.includes('scripts/backup.sh') && c.includes("--env-file '../.env.candidate'"),
+      ),
+    );
+    assert.ok(
+      sshMock.sshCommands.some(
+        (c) => c.includes('bash deploy.sh') && c.includes("ENV_FILE='../.env.candidate'"),
+      ),
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

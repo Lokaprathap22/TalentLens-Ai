@@ -191,8 +191,8 @@ node --test scripts/deploy-scripts.test.mjs
 
 - **Local setup & check (`scripts/deploy-local.mjs`):** Run `npm run deploy:local -- --dry-run` to preview checks without mutating Docker or files, or `npm run deploy:local` to inspect `.env` safely (fail-closed on `NODE_ENV=production` or remote non-local DB hosts, flagging placeholder AI keys unless `--skip-preflight`), auto-detect `docker compose` / `docker-compose`, start PostgreSQL (`db`) and poll `pg_isready`, run SHA-256 fingerprint-cached sequential library builds (`--force` to rebuild unchanged packages), and check migration status (`npx prisma migrate status`, or `--apply-migrations` / `--start`).
 - **Live provider diagnostics (opt-in):** Run `npm run test:gemini`, `npm run test:groq`, or `npm run diagnose:jd -- --provider=auto`.
-- **Production preflight & 10-stage OCI SSH controller (`scripts/deploy-production.mjs`):** Run `npm run deploy:production` (defaults strictly to safe dry-run mode; pass `-- --env-file <prod.env>` or `-- --strict` to enforce fail-closed preflight and Compose validation). With `-- --execute --confirm-production --ssh-host <user@host> --remote-dir <path>`, executes the 10-stage OCI rollout (sanitized tarball + `.sha256`, SSH probe & server-only `docker-compose.oci.yml` auto-reuse, `.current-release.json` source/compose/env fingerprint + container/HTTP/HTTPS idempotency skip unless `--force`, `scp` + remote `sha256sum -c` before unpack, pre-rollout `.release-previous/` source/Compose snapshot + stale-file clean sync preserving `docker-compose.oci.yml`/`.env*`/`node_modules`, zero-dependency remote `preflight-env --strict-perms` + Compose validation with automatic snapshot restore if preflight/compose/backup fail, mandatory pre-rollout `--format custom` `.dump` backup where `--skip-backup` fails closed, `:previous` image tagging, `deploy.sh`, HTTPS check, and deterministic snapshot + container + DB rollback command output).
-- **Deploy automation tests:** Run `node --test scripts/deploy-scripts.test.mjs` (22 deterministic unit, tarball, stale-file clean-sync/snapshot-restore, OCI overlay/idempotency/rollback, mock-SSH pipeline, and CLI tests).
+- **Production preflight & 10-stage OCI SSH controller (`scripts/deploy-production.mjs`):** Run `npm run deploy:production` (defaults strictly to safe dry-run mode). For local on-host validation, pass `-- --env-file <prod.env>` or `-- --strict`; for remote OCI rollouts from Windows/workstations where `../.env.candidate` only exists on the VM, pass `-- --ssh-host <user@host> --env-file ../.env.candidate` (protected from Node's native `--env-file` parser by `node --` in `package.json`) or `--remote-env-file ../.env.candidate` (also safe when invoking `node scripts/deploy-production.mjs` directly). Remote dry-runs never read local `.env` or require the remote file locally and explicitly state remote Stage 7–9 checks were not run. With `-- --execute --confirm-production --ssh-host <user@host> --remote-dir <path>`, executes the 10-stage OCI rollout (sanitized tarball + `.sha256`, SSH probe & server-only `docker-compose.oci.yml` auto-reuse, `.current-release.json` source/compose/env fingerprint + container/HTTP/HTTPS idempotency skip unless `--force`, `scp` + remote `sha256sum -c` before unpack, pre-rollout `.release-previous/` source/Compose snapshot + stale-file clean sync preserving `docker-compose.oci.yml`/`.env*`/`node_modules`, zero-dependency remote `preflight-env --strict-perms` + Compose validation using the remote env file with automatic snapshot restore if preflight/compose/backup fail, mandatory pre-rollout `--format custom` `.dump` backup where `--skip-backup` fails closed, `:previous` image tagging, `deploy.sh`, HTTPS check, and deterministic snapshot + container + DB rollback command output).
+- **Deploy automation tests:** Run `node --test scripts/deploy-scripts.test.mjs` (24 deterministic unit, tarball, stale-file clean-sync/snapshot-restore, remote env-file Windows regression, OCI overlay/idempotency/rollback, mock-SSH pipeline, and CLI tests).
 
 > [!TIP]
 > Avoid running `npm run build`, `npm run typecheck`, and `npm test` concurrently against the same working tree because `packages/*` share `dist/` artifacts. Run them sequentially.
@@ -437,12 +437,21 @@ Never deploy production by blindly running `git pull` inside the active director
    ```bash
    chmod 600 ../.env.candidate
    ```
-7. **Run fail-closed environment preflight (or safe dry-run production controller):**
+7. **Run fail-closed environment preflight (on OCI host) or safe remote dry-run (from Windows/workstation):**
    ```bash
+   # On the OCI host (validates ../.env.candidate and docker-compose.oci.yml locally on VM):
    node scripts/preflight-env.mjs ../.env.candidate
-   # Or run the unified dry-run & compose validator:
    npm run deploy:production -- --compose-file docker-compose.oci.yml --env-file ../.env.candidate
+
+   # From Windows / workstation (default safe dry-run targeting OCI; never reads/requires ../.env.candidate locally):
+   npm run deploy:production -- \
+     --ssh-host ubuntu@<oci-host> \
+     --remote-dir /home/ubuntu/talentlens-release-staging-20261110/source \
+     --compose-file docker-compose.oci.yml \
+     --remote-env-file ../.env.candidate \
+     --project-name talentlens
    ```
+   _(Note: `--env-file ../.env.candidate` also works via `npm run deploy:production -- ...` because `package.json` uses `node -- scripts/deploy-production.mjs`, and passing `--ssh-host` tells the controller that `../.env.candidate` is a remote OCI file. Prefer `--remote-env-file` when invoking `node scripts/deploy-production.mjs` directly so Node.js cannot intercept `--env-file` as a Node CLI flag.)_
    Abort immediately if any `[FAIL]` check appears.
 8. **Validate Compose configuration without exposing secrets:**
    ```bash
@@ -464,12 +473,20 @@ Never deploy production by blindly running `git pull` inside the active director
     ```
 12. **Run controlled deployment via [deploy.sh](./deploy.sh) (or orchestrate Steps 2–14 remotely from a verified release commit via `npm run deploy:production`):**
     ```bash
-    # Option A: Automated 10-stage OCI SSH controller from clean reviewed main commit:
+    # Option A (Dry-run first from Windows/workstation): Preview OCI rollout cleanly without local ../.env.candidate:
+    npm run deploy:production -- \
+      --ssh-host ubuntu@<oci-host> \
+      --remote-dir /home/ubuntu/talentlens-release-staging-20261110/source \
+      --compose-file docker-compose.oci.yml \
+      --remote-env-file ../.env.candidate \
+      --project-name talentlens
+
+    # Option A (Live 10-stage OCI SSH rollout from clean reviewed main commit — add --execute --confirm-production):
     npm run deploy:production -- --execute --confirm-production \
       --ssh-host ubuntu@<oci-host> \
       --remote-dir /home/ubuntu/talentlens-release-staging-20261110/source \
       --compose-file docker-compose.oci.yml \
-      --env-file ../.env.candidate \
+      --remote-env-file ../.env.candidate \
       --project-name talentlens
 
     # Option B: Direct on-host execution on the OCI VM:
@@ -478,7 +495,7 @@ Never deploy production by blindly running `git pull` inside the active director
     COMPOSE_PROJECT_NAME=talentlens \
     ./deploy.sh
     ```
-    Both [deploy.sh](./deploy.sh) and `deploy:production` enforce fail-closed preflight (`--strict-perms` on remote POSIX hosts) -> checksum/backup guards -> pre-rollout source/Compose snapshot + clean stale-file sync -> container image build -> `postgres` health wait -> one-shot `migration` (`prisma migrate deploy`) -> `clamav` health wait -> `up -d api worker web` -> internal HTTP readiness -> worker heartbeat readiness -> non-destructive `caddy validate` + `systemctl reload caddy` -> strict HTTPS probe (`APP_ORIGIN/api/v1/health/ready`, `-k` forbidden). Pass `--force` to bypass unchanged-release idempotency skip; live `--execute` rollouts enforce mandatory pre-rollout `--format custom` backups and reject `--skip-backup`. When targeting a new isolated `--remote-dir`, copy `docker-compose.oci.yml` into the new directory (or pass its explicit path — `deploy-production` and `deploy.sh` add `--project-directory .` automatically so Docker builds use the new directory) and pass an absolute `--env-file /home/ubuntu/talentlens-release-staging-20261110/.env.candidate` if the env file sits outside its parent directory.
+    Both [deploy.sh](./deploy.sh) and `deploy:production` enforce fail-closed preflight (`--strict-perms` on remote POSIX hosts) -> checksum/backup guards -> pre-rollout source/Compose snapshot + clean stale-file sync -> container image build -> `postgres` health wait -> one-shot `migration` (`prisma migrate deploy`) -> `clamav` health wait -> `up -d api worker web` -> internal HTTP readiness -> worker heartbeat readiness -> non-destructive `caddy validate` + `systemctl reload caddy` -> strict HTTPS probe (`APP_ORIGIN/api/v1/health/ready`, `-k` forbidden). Remote `--remote-env-file` (or `--env-file` when paired with `--ssh-host`) is never read locally on Windows and is evaluated on the OCI VM during Stage 5 idempotency, Stage 7 `preflight-env.mjs --strict-perms` and Compose validation, Stage 8 `.dump` backup, and Stage 9 `deploy.sh` rollout. Pass `--force` to bypass unchanged-release idempotency skip; live `--execute` rollouts enforce mandatory pre-rollout `--format custom` backups and reject `--skip-backup`. When targeting a new isolated `--remote-dir`, copy `docker-compose.oci.yml` into the new directory (or pass its explicit path — `deploy-production` and `deploy.sh` add `--project-directory .` automatically so Docker builds use the new directory) and pass an absolute `--remote-env-file /home/ubuntu/talentlens-release-staging-20261110/.env.candidate` (or `--env-file` via `npm run deploy:production --`) if the env file sits outside its parent directory.
 13. **Verify container health & readiness state:**
     ```bash
     docker compose -p talentlens --env-file ../.env.candidate -f docker-compose.oci.yml ps

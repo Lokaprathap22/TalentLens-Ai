@@ -56,6 +56,8 @@ export function shellQuotePosix(value) {
 export function parseDeployProductionArgs(argv) {
   let envFile = '.env';
   let envFileExplicit = false;
+  let remoteEnvFileExplicit = false;
+  let conflictingEnvFlags = false;
   let composeFile = 'docker-compose.prod.yml';
   let composeFileExplicit = false;
   let projectName = 'talentlens';
@@ -81,9 +83,20 @@ export function parseDeployProductionArgs(argv) {
     if (arg.startsWith('--env-file=')) {
       envFile = arg.slice('--env-file='.length).trim();
       envFileExplicit = true;
+      if (remoteEnvFileExplicit) conflictingEnvFlags = true;
     } else if (arg === '--env-file') {
       envFile = readFlagValue('--env-file', i);
       envFileExplicit = true;
+      if (remoteEnvFileExplicit) conflictingEnvFlags = true;
+      i += 1;
+    } else if (arg.startsWith('--remote-env-file=')) {
+      envFile = arg.slice('--remote-env-file='.length).trim();
+      remoteEnvFileExplicit = true;
+      if (envFileExplicit) conflictingEnvFlags = true;
+    } else if (arg === '--remote-env-file') {
+      envFile = readFlagValue('--remote-env-file', i);
+      remoteEnvFileExplicit = true;
+      if (envFileExplicit) conflictingEnvFlags = true;
       i += 1;
     } else if (arg.startsWith('--compose-file=')) {
       composeFile = arg.slice('--compose-file='.length).trim();
@@ -123,7 +136,7 @@ export function parseDeployProductionArgs(argv) {
       return { help: true };
     } else {
       throw new Error(
-        `Unknown flag "${arg}". Supported: --env-file <path> --compose-file <path> --project-name <name> --ssh-host <user@host> --remote-dir <path> --strict --allow-dirty --force --execute --confirm-production`,
+        `Unknown flag "${arg}". Supported: --env-file <path> --remote-env-file <path> --compose-file <path> --project-name <name> --ssh-host <user@host> --remote-dir <path> --strict --allow-dirty --force --execute --confirm-production`,
       );
     }
   }
@@ -132,6 +145,8 @@ export function parseDeployProductionArgs(argv) {
     help: false,
     envFile,
     envFileExplicit,
+    remoteEnvFileExplicit,
+    conflictingEnvFlags,
     composeFile,
     composeFileExplicit,
     projectName,
@@ -204,16 +219,35 @@ export function validateSafeInputs(options) {
       };
     }
   }
-  if (!options.composeFile || UNSAFE_ARG_CHARS_RE.test(options.composeFile)) {
+  if (options.conflictingEnvFlags) {
     return {
       valid: false,
-      reason: `Invalid --compose-file "${options.composeFile}". Must be non-empty without whitespace or shell metacharacters.`,
+      reason: 'Specify either --env-file or --remote-env-file, not both.',
     };
   }
-  if (options.sshHost && UNSAFE_ARG_CHARS_RE.test(options.envFile)) {
+  if (!options.envFile || options.envFile.startsWith('-')) {
     return {
       valid: false,
-      reason: `Invalid --env-file "${options.envFile}" for SSH execution. Must not contain whitespace or shell metacharacters.`,
+      reason: `Invalid ${options.remoteEnvFileExplicit ? '--remote-env-file' : '--env-file'} "${options.envFile}". Must be non-empty and must not start with "-".`,
+    };
+  }
+  if (
+    !options.composeFile ||
+    options.composeFile.startsWith('-') ||
+    UNSAFE_ARG_CHARS_RE.test(options.composeFile)
+  ) {
+    return {
+      valid: false,
+      reason: `Invalid --compose-file "${options.composeFile}". Must be non-empty, not start with "-", and contain no whitespace or shell metacharacters.`,
+    };
+  }
+  if (
+    (options.sshHost || options.remoteEnvFileExplicit) &&
+    UNSAFE_ARG_CHARS_RE.test(options.envFile)
+  ) {
+    return {
+      valid: false,
+      reason: `Invalid remote env file "${options.envFile}" for SSH execution. Must not contain whitespace or shell metacharacters.`,
     };
   }
   return { valid: true };
@@ -249,6 +283,14 @@ export function validateExecutionGuard(options) {
       dryRun: false,
       reason:
         'Refusing live production execution with --skip-backup: mandatory pre-rollout PostgreSQL backup cannot be bypassed.',
+    };
+  }
+  if (options.remoteEnvFileExplicit && !options.sshHost) {
+    return {
+      allowed: false,
+      dryRun: false,
+      reason:
+        'Refusing live production execution: --remote-env-file targets a remote OCI environment file and requires --ssh-host <user@host> --remote-dir <path>.',
     };
   }
   return { allowed: true, dryRun: false };
@@ -1318,7 +1360,7 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   const options = parseDeployProductionArgs(argv);
   if (options.help) {
     stdout(
-      'Usage: node scripts/deploy-production.mjs [--env-file <path>] [--compose-file <path>] [--project-name <name>] [--strict] [--force] [--allow-dirty] [--execute --confirm-production [--ssh-host <user@host> --remote-dir <path>]]',
+      'Usage: node -- scripts/deploy-production.mjs [--env-file <path> | --remote-env-file <path>] [--compose-file <path>] [--project-name <name>] [--strict] [--force] [--allow-dirty] [--execute --confirm-production [--ssh-host <user@host> --remote-dir <path>]]',
     );
     return 0;
   }
@@ -1336,15 +1378,16 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     return 1;
   }
 
-  const resolvedEnvPath = path.resolve(cwd, options.envFile);
+  const isRemoteTarget = Boolean(options.sshHost || options.remoteEnvFileExplicit);
+  const resolvedEnvPath = isRemoteTarget ? null : path.resolve(cwd, options.envFile);
   const resolvedComposePath = path.resolve(cwd, options.composeFile);
   const canonicalComposePath = path.resolve(cwd, 'docker-compose.prod.yml');
   const gitState = inspectGitState(cwd, execFn);
-  const envMode = readSafeEnvMode(resolvedEnvPath, fsImpl);
+  const envMode = isRemoteTarget
+    ? { exists: false, nodeEnv: null, remoteOnly: true }
+    : readSafeEnvMode(resolvedEnvPath, fsImpl);
   const mustFailClosedLocalPreflight =
-    (!options.sshHost && options.execute) ||
-    options.strict ||
-    (!options.sshHost && options.envFileExplicit);
+    !isRemoteTarget && (options.execute || options.strict || options.envFileExplicit);
 
   stdout('================================================================================');
   stdout('TALENTLENS AI — PRODUCTION DEPLOYMENT & PREFLIGHT CONTROLLER');
@@ -1353,17 +1396,30 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     `Mode:                ${guard.dryRun ? 'SAFE DRY-RUN / PREFLIGHT (default)' : guard.allowed ? 'LIVE PRODUCTION EXECUTION' : 'BLOCKED'}`,
   );
   stdout(
+    `Deploy Target:       ${isRemoteTarget ? `Remote OCI host via SSH (${options.sshHost || 'pending --ssh-host'})` : 'Local host controller'}`,
+  );
+  stdout(
     `Git Branch:          ${gitState.branch} (${gitState.isClean ? 'clean' : `${gitState.dirtyCount} uncommitted change(s)`})`,
   );
-  stdout(
-    `Env File Target:     ${options.sshHost ? options.envFile : resolvedEnvPath} (${envMode.exists ? `exists locally, NODE_ENV=${envMode.nodeEnv ?? 'unset'}` : options.sshHost ? 'remote-only or missing locally' : 'missing'})`,
-  );
-  stdout(
-    `Compose File Target: ${options.sshHost ? options.composeFile : resolvedComposePath} (${fsImpl.existsSync(resolvedComposePath) ? 'exists locally' : options.sshHost ? 'remote overlay / checked against canonical prod compose' : 'missing'})`,
-  );
+  if (isRemoteTarget) {
+    stdout(
+      `Remote Env File:     ${options.envFile} (protected on OCI host; never copied to or read locally)`,
+    );
+    stdout('Local Env File:      not used for remote OCI rollout (workstation env untouched)');
+    stdout(
+      `Compose File Target: ${options.composeFile} (${fsImpl.existsSync(resolvedComposePath) ? 'present locally' : 'remote OCI overlay / validated on remote host'})`,
+    );
+  } else {
+    stdout(
+      `Env File Target:     ${resolvedEnvPath} (${envMode.exists ? `exists locally, NODE_ENV=${envMode.nodeEnv ?? 'unset'}` : 'missing locally'})`,
+    );
+    stdout(
+      `Compose File Target: ${resolvedComposePath} (${fsImpl.existsSync(resolvedComposePath) ? 'exists locally' : 'missing'})`,
+    );
+  }
   stdout(`Project Name:        ${options.projectName}`);
 
-  if (options.sshHost) {
+  if (isRemoteTarget) {
     if (!fsImpl.existsSync(canonicalComposePath) && !fsImpl.existsSync(resolvedComposePath)) {
       stderr(`\n[FAIL] Missing canonical production compose file: ${canonicalComposePath}`);
       stdout('================================================================================');
@@ -1394,14 +1450,37 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   }
 
   let preflightPassed = false;
-  if (!envMode.exists) {
+  if (isRemoteTarget) {
+    stdout(
+      `  [INFO] Remote OCI env target "${options.envFile}" resides on ${options.sshHost || 'the remote OCI host'}; skipping local filesystem read and local env preflight.`,
+    );
+    if (guard.dryRun) {
+      stdout(
+        '  [INFO] Dry-run scope: remote SSH connectivity, remote preflight-env.mjs --strict-perms, remote Docker Compose validation, mandatory PostgreSQL backup, and live HTTPS checks were NOT executed (pass --execute --confirm-production to run them).',
+      );
+      if (options.remoteEnvFileExplicit && !options.sshHost) {
+        stdout(
+          `  [WARN] --ssh-host <user@host>${options.remoteDir ? '' : ' and --remote-dir <path>'} required before running --execute --confirm-production with --remote-env-file.`,
+        );
+      } else if (options.sshHost && !options.remoteDir) {
+        stdout(
+          '  [WARN] --remote-dir <path> is required alongside --ssh-host before executing --execute --confirm-production.',
+        );
+      }
+      if (options.strict) {
+        stdout(
+          `  [INFO] --strict local env validation does not apply to remote-only file "${options.envFile}"; Stage 7 runs preflight-env.mjs --strict-perms on the OCI host during --execute.`,
+        );
+      }
+    }
+  } else if (!envMode.exists) {
     if (mustFailClosedLocalPreflight) {
       stderr(`\n[FAIL] Target environment file not found: ${resolvedEnvPath}`);
       stdout('================================================================================');
       return 1;
     }
     stdout(
-      '  [INFO] No local production env file present; skipping local preflight during default dry-run (remote host preflight still executes fail-closed before rollout).',
+      '  [INFO] No local production env file present; skipping local preflight during default dry-run (pass --env-file <prod.env> or --strict for local validation).',
     );
   } else if (envMode.nodeEnv !== 'production' && !mustFailClosedLocalPreflight) {
     stdout(
@@ -1421,7 +1500,7 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     preflightPassed = true;
   }
 
-  if (preflightPassed && fsImpl.existsSync(resolvedComposePath)) {
+  if (!isRemoteTarget && preflightPassed && fsImpl.existsSync(resolvedComposePath)) {
     const compose = detectComposeCommand(execFn, { cwd, env });
     if (compose) {
       stdout(

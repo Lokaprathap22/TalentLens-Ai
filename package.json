@@ -34,8 +34,8 @@
     "test:gemini": "node scripts/test-gemini-live.mjs",
     "test:groq": "node scripts/test-groq-live.mjs",
     "diagnose:jd": "node scripts/diagnose-jd-extraction.mjs",
-    "deploy:local": "node scripts/deploy-local.mjs",
-    "deploy:production": "node scripts/deploy-production.mjs"
+    "deploy:local": "node -- scripts/deploy-local.mjs",
+    "deploy:production": "node -- scripts/deploy-production.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
